@@ -20,6 +20,7 @@ def main():
     contracts = [
         "scripts/test_libero_protocol_scheduler.py",
         "scripts/test_libero_wallclock.py",
+        "scripts/test_libero_supervisor.py",
         "coexecution/test_timeline.py",
         "coexecution/test_attribution.py",
     ]

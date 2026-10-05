@@ -7,7 +7,9 @@
       "path": "upstream",
       "submodule": "learning/Isaac-GR00T",
       "submodule_revision": "2a39d591a3af24c42bb1d1c9cd708a2dddac0600",
-      "patches": []
+      "patches": [
+        "patches/groot-reproduction-fixes.patch"
+      ]
     },
     "playground": {
       "url": "https://github.com/google-deepmind/mujoco_playground.git",
