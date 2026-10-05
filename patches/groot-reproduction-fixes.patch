@@ -1,0 +1,185 @@
+diff --git a/gr00t/data/dataset/sharded_single_step_dataset.py b/gr00t/data/dataset/sharded_single_step_dataset.py
+index deebd06..22f7f9f 100644
+--- a/gr00t/data/dataset/sharded_single_step_dataset.py
++++ b/gr00t/data/dataset/sharded_single_step_dataset.py
+@@ -247,6 +247,8 @@ class ShardedSingleStepDataset(ShardedDataset):
+     def get_effective_episode_length(self, episode_index: int) -> int:
+         """Get the effective episode length accounting for action horizon."""
+         original_length = self.episode_loader.get_episode_length(episode_index)
++        if self.allow_padding:
++            return original_length
+         return max(0, original_length - self.action_horizon + 1)
+
+     def __len__(self):
+diff --git a/gr00t/model/gr00t_n1d7/gr00t_n1d7.py b/gr00t/model/gr00t_n1d7/gr00t_n1d7.py
+index ff91c65..9023aac 100644
+--- a/gr00t/model/gr00t_n1d7/gr00t_n1d7.py
++++ b/gr00t/model/gr00t_n1d7/gr00t_n1d7.py
+@@ -169,35 +169,40 @@ class Gr00tN1d7ActionHead(nn.Module):
+         # Per-position τ for streaming (TEDI) flow training. Mirrors StreamingFlowPolicy
+         # regime mix: constant / linearly-increasing / random / chunk-wise / train-time RTC.
+         T = self.config.action_horizon
+-        weights = torch.tensor([
+-            self.config.streaming_constant_weight,
+-            self.config.streaming_linear_weight,
+-            self.config.streaming_random_weight,
+-            self.config.streaming_chunk_wise_weight,
+-            self.config.streaming_rtc_weight,
+-        ], dtype=torch.float32)
++        self._last_clean_prefix_length = 0
++        weights = torch.tensor(
++            [
++                self.config.streaming_constant_weight,
++                self.config.streaming_linear_weight,
++                self.config.streaming_random_weight,
++                self.config.streaming_chunk_wise_weight,
++                self.config.streaming_rtc_weight,
++            ],
++            dtype=torch.float32,
++        )
+         regime = torch.multinomial(weights, num_samples=1).item()
+
+-        eps = 0.0 # self.config.noise_s / self.config.num_timestep_buckets
++        eps = 0.0  # self.config.noise_s / self.config.num_timestep_buckets
+
+-        if regime == 0:                                                       # constant: same τ for all T
++        if regime == 0:  # constant: same τ for all T
+             t = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
+             t = (1 - t) * self.config.noise_s
+             return t.unsqueeze(1).expand(-1, T)
+-        if regime == 1:                                                       # linearly increasing along chunk
++        if regime == 1:  # linearly increasing along chunk
+             raise NotImplementedError("Linearly increasing along chunk is not implemented")
+-        if regime == 2:                                                       # random per position
++        if regime == 2:  # random per position
+             raise NotImplementedError("Random per position is not implemented")
+-        if regime == 4:                                                       # train-time RTC
++        if regime == 4:  # train-time RTC
+             # Per BATCH: pick d ∈ [0, rtc_d_max]. Front d positions at noise_s (clean clamp),
+             # rest at scalar τ sampled from the Beta distribution. Equivalent to flow training
+             # with random "front d clean actions as input" conditioning. Stacks with
+             # mask_clean_end=True so loss is masked at clamped positions.
+             d_max = max(self.config.streaming_rtc_d_max, 0)
+             d = int(torch.randint(0, d_max + 1, (1,)).item()) if d_max > 0 else 0
++            self._last_clean_prefix_length = d
+             t_scalar = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
+-            t_scalar = (1 - t_scalar) * self.config.noise_s                   # (B,)
+-            t = t_scalar.unsqueeze(1).expand(-1, T).contiguous().clone()      # (B, T)
++            t_scalar = (1 - t_scalar) * self.config.noise_s  # (B,)
++            t = t_scalar.unsqueeze(1).expand(-1, T).contiguous().clone()  # (B, T)
+             if d > 0:
+                 t[:, :d] = self.config.noise_s
+             return t.clamp(min=eps, max=self.config.noise_s)
+@@ -217,12 +222,14 @@ class Gr00tN1d7ActionHead(nn.Module):
+             if d_hi < d_lo:
+                 d_hi = d_lo
+             d = int(torch.randint(d_lo, d_hi + 1, (1,)).item())
+-            D_ramp = T - 2 * d                                                       # ramp width
+-            L = d                                                                    # clean prefix
++            self._last_clean_prefix_length = d
++            D_ramp = T - 2 * d  # ramp width
++            L = d  # clean prefix
+             p = torch.arange(T, device=device, dtype=dtype)
+             ramp_val = self.config.noise_s * (1.0 - (p - L + 0.5) / D_ramp)
+             tau_per_pos = torch.where(
+-                p < L, torch.tensor(self.config.noise_s, device=device, dtype=dtype),
++                p < L,
++                torch.tensor(self.config.noise_s, device=device, dtype=dtype),
+                 torch.where(p >= T - d, torch.tensor(0.0, device=device, dtype=dtype), ramp_val),
+             )
+             gap = self.config.noise_s / max(D_ramp, 1)
+@@ -245,8 +252,10 @@ class Gr00tN1d7ActionHead(nn.Module):
+         # Quarter-gap symj jitter (both v0 and v2).
+         delta = 0.25 * gap
+         u = torch.rand(batch_size, 1, device=device, dtype=dtype)
+-        shift = (2.0 * u - 1.0) * delta                                              # (B, 1)
+-        tau = (tau_per_pos.unsqueeze(0) - shift).clamp(0, self.config.noise_s)       # (B, T)
++        shift = (2.0 * u - 1.0) * delta  # (B, 1)
++        tau = (tau_per_pos.unsqueeze(0) - shift).clamp(0, self.config.noise_s)  # (B, T)
++        # Committed actions remain clean even when the ramp is jittered.
++        tau[:, :d] = self.config.noise_s
+         return tau.contiguous()
+
+     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
+@@ -314,6 +323,9 @@ class Gr00tN1d7ActionHead(nn.Module):
+                 actions.shape[0], device=actions.device, dtype=actions.dtype)
+             t_b = t_per_pos.unsqueeze(-1)                                           # (B, T, 1)
+             noisy_trajectory = (1 - t_b) * noise + t_b * actions
++            clean_prefix = self._last_clean_prefix_length
++            if clean_prefix > 0:
++                noisy_trajectory[:, :clean_prefix] = actions[:, :clean_prefix]
+             velocity = actions - noise
+             t_discretized = (t_per_pos * self.num_timestep_buckets).long()          # (B, T)
+         else:
+@@ -381,6 +393,8 @@ class Gr00tN1d7ActionHead(nn.Module):
+         if self.config.streaming and self.config.streaming_mask_clean_end and "t_per_pos" in locals():
+             eps_clean = self.config.noise_s / self.config.num_timestep_buckets
+             keep = (t_per_pos < self.config.noise_s - eps_clean).to(action_mask.dtype).unsqueeze(-1)
++            if self._last_clean_prefix_length > 0:
++                keep[:, :self._last_clean_prefix_length] = 0
+             action_mask = action_mask * keep
+         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+@@ -594,6 +608,14 @@ class Gr00tN1d7ActionHead(nn.Module):
+                 state_t = torch.zeros(batch_size, 1, dtype=action_ts.dtype, device=device)
+                 dit_ts = torch.cat([state_t, action_ts], dim=1)                     # (B, 1+T)
+                 timesteps_tensor = action_ts
++            elif self.config.streaming:
++                # Match the constant-time branch used to train streaming models:
++                # the current-state token always has time zero.
++                timesteps_tensor = torch.full(
++                    (batch_size, T_pos), t_discretized, device=device, dtype=torch.long
++                )
++                state_t = torch.zeros(batch_size, 1, device=device, dtype=torch.long)
++                dit_ts = torch.cat([state_t, timesteps_tensor], dim=1)
+             else:
+                 timesteps_tensor = torch.full(
+                     size=(batch_size,), fill_value=t_discretized, device=device,
+diff --git a/gr00t/model/gr00t_n1d7/setup.py b/gr00t/model/gr00t_n1d7/setup.py
+index 95cd78b..6ba0fd8 100644
+--- a/gr00t/model/gr00t_n1d7/setup.py
++++ b/gr00t/model/gr00t_n1d7/setup.py
+@@ -130,13 +130,16 @@ class Gr00tN1d7Pipeline(ModelPipeline):
+             # benign — the zero init means the model behaves identically to a
+             # no-delay-embedding setup at training start, then learns the embedding.
+             if any("delay_embedding" in key for key in missing_keys):
++                # HF initializes missing parameters after model construction,
++                # which can overwrite the constructor's zero initialization.
++                with torch.no_grad():
++                    model.action_head.delay_embedding.weight.zero_()
+                 logging.info("delay_embedding not in checkpoint - zero-initialized")
+
+             unexpected_keys = loading_info.get("unexpected_keys", [])
+             mismatched_keys = loading_info.get("mismatched_keys", [])
+             other_missing = [
+-                k for k in missing_keys
+-                if "mask_token" not in k and "delay_embedding" not in k
++                k for k in missing_keys if "mask_token" not in k and "delay_embedding" not in k
+             ]
+             errors = []
+             if other_missing:
+diff --git a/gr00t/policy/decoupled_policy.py b/gr00t/policy/decoupled_policy.py
+index 8b5d5b3..7bacb21 100644
+--- a/gr00t/policy/decoupled_policy.py
++++ b/gr00t/policy/decoupled_policy.py
+@@ -326,11 +326,17 @@ class DecoupledGr00tPolicy(Gr00tPolicy):
+             # force_nonstreaming=True routes through the full flow loop even on
+             # an sflow ckpt (sflow training mix includes the constant-τ regime).
+             model_pred = self.model.action_head.get_action(
+-                backbone_for_call, action_inputs,
+-                options={"num_inference_timesteps": nfe, "force_nonstreaming": True},
++                backbone_for_call,
++                action_inputs,
++                options={
++                    "num_inference_timesteps": nfe,
++                    "force_nonstreaming": True,
++                    "image_delay": 0,
++                },
+             )
+             self.model.action_head.seed_streaming_buffer(
+-                model_pred["action_pred"], slide_steps=slide_steps,
++                model_pred["action_pred"],
++                slide_steps=slide_steps,
+             )
+
+         action = self._decode_action(model_pred, batched_states)
