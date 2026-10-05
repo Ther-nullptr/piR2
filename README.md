@@ -6,7 +6,7 @@ This independently maintained repository builds on the official πR² implementa
 
 ## Scope / 范围
 
-- Leap GPU simulation reconstruction, with explicit differences from the paper's data and experts.
+- [Leap GPU simulation reconstruction](simulation/README.md), with explicit differences from the paper's data and experts.
 - LIBERO-Spatial adaptation of public GR00T task weights and real VLM closed-loop evaluation.
 - Separate fixed-delay algorithm comparisons and wall-clock deployment comparisons.
 - Single-GPU S1/S2 inference tools and a browser teaching simulator, reported separately from robot task success.
