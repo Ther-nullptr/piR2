@@ -13,6 +13,7 @@ This independently maintained repository studies **NVIDIA GR00T-N1.7-LIBERO** ta
 - Four-suite research targets are recorded in [the model-family manifest](configs/libero/model-family.json); the current implemented training/evaluation pipeline covers the complete Spatial suite.
 - [Leap reconstruction](simulation/README.md), SO100 profiling and browser teaching tools are auxiliary historical work, reported separately from the GR00T-LIBERO main line.
 - [Single-GPU execution tools](coexecution/README.md) support auxiliary SO100 replay profiling; their mechanisms require separate LIBERO validation before contributing main-line performance claims.
+- [Interactive timing tool](simulator/README.md) explains queueing and cache-age assumptions without predicting task success.
 
 Modules are introduced through focused pull requests. Model weights, datasets, environments and generated results are intentionally excluded from Git.
 

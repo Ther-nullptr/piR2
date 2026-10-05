@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>单卡反应式 VLA · 量化与排队实验台</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <a class="brand" href="#"
+        ><span class="brand-icon">π</span> REACTIVE LAB
+        <span class="subbrand">单卡 VLA</span></a
+      >
+      <nav>
+        <a href="#experiments">交互实验</a><a href="#evidence">实测证据</a
+        ><a href="#model-notes">模型边界</a>
+      </nav>
+      <span class="offline">● 本地运行 · 无需 GPU</span>
+    </header>
+    <div class="layout">
+      <aside>
+        <div class="side-title">
+          <span class="eyebrow">EXPERIMENT CONTROLS</span>
+          <h2>设置工作点</h2>
+          <button id="reset" class="text-button">恢复默认 ↺</button>
+        </div>
+        <form id="controls">
+          <fieldset>
+            <legend>01 <span>精度分配</span><em>假设</em></legend>
+            <label
+              >S1 · 动作头<select id="qA">
+                <option value="bf16">BF16</option>
+                <option value="int8">INT8 · W8A8</option>
+                <option value="fp8">FP8 · W8A8</option>
+                <option value="w4">INT4 · W4A16</option>
+              </select></label
+            >
+            <label
+              >S2 · 视觉语言骨干<select id="qV">
+                <option value="bf16">BF16</option>
+                <option value="int8">INT8 · W8A8</option>
+                <option value="fp8">FP8 · W8A8</option>
+                <option value="w4">INT4 · W4A16</option>
+              </select></label
+            >
+            <label
+              >量化分组大小<select id="group">
+                <option>32</option>
+                <option>64</option>
+                <option selected>128</option>
+                <option>256</option>
+              </select></label
+            >
+            <p class="hint">
+              W4A16 只压缩权重。分组影响 scale 存储；这里不据此猜测准确率。
+            </p>
+          </fieldset>
+          <fieldset>
+            <legend>02 <span>硬件情景</span><em>可编辑</em></legend>
+            <label
+              >相对本机的有效资源<select id="hardware">
+                <option value="base">RTX 6000 Ada 实测量级</option>
+                <option value="compute">算力 2× / 带宽 1×（假设）</option>
+                <option value="bandwidth">算力 1× / 带宽 2×（假设）</option>
+                <option value="edge">算力 0.25× / 带宽 0.2×（假设）</option>
+                <option value="custom">自定义硬件</option>
+              </select></label
+            >
+            <label
+              >有效计算能力 <output for="compute"></output
+              ><input id="compute" type="range" min="0.1" max="4" step="0.05"
+            /></label>
+            <label
+              >有效显存带宽 <output for="bandwidth"></output
+              ><input id="bandwidth" type="range" min="0.1" max="4" step="0.05"
+            /></label>
+            <p class="hint">
+              系数需用相同 shape 标定。假设情景不代表 A5000、Jetson 等未测设备。
+            </p>
+          </fieldset>
+          <fieldset>
+            <legend>03 <span>到达与调度</span></legend>
+            <label
+              >S1 控制周期 <output for="period"></output
+              ><input id="period" type="range" min="10" max="100" step="1"
+            /></label>
+            <label
+              >S2 数据源<select id="source">
+                <option value="camera">周期相机输入</option>
+                <option value="zero">Zero-wait：空闲时生成新观测</option>
+              </select></label
+            >
+            <label
+              >相机频率 <output for="cameraHz"></output
+              ><input id="cameraHz" type="range" min="0" max="120" step="1"
+            /></label>
+            <label
+              >慢环启动频率上限 <output for="slowCap"></output
+              ><input id="slowCap" type="range" min="0" max="60" step="1"
+            /></label>
+            <label
+              >GPU 调度模型<select id="policy">
+                <option value="concurrent">同卡并发，状态依赖慢化</option>
+                <option value="serial">串行，任务边界优先 S1</option>
+              </select></label
+            >
+            <label
+              >S1 忙时<select id="fastQueue">
+                <option value="drop">丢弃新请求，不积压</option>
+                <option value="fifo">FIFO 等待，最多 8 个</option>
+              </select></label
+            >
+            <label
+              >S2 等待帧<select id="slowQueue">
+                <option value="latest">保留最新：替换旧等待帧</option>
+                <option value="dropnew">保留旧帧：丢弃新到帧</option>
+              </select></label
+            >
+            <label class="check"
+              ><input id="fastEnabled" type="checkbox" checked /> 启用
+              S1（关闭可验证 AoI 公式）</label
+            >
+          </fieldset>
+          <details>
+            <summary>高级假设：Roofline、争用和抖动</summary>
+            <label
+              >低精度有效计算倍率 <output for="lowbitMath"></output
+              ><input id="lowbitMath" type="range" min="0.5" max="4" step="0.1"
+            /></label>
+            <label
+              >S1 GEMM 计算/访存时长比 <output for="ratioA"></output
+              ><input id="ratioA" type="range" min="0.1" max="4" step="0.1"
+            /></label>
+            <label
+              >S2 GEMM 计算/访存时长比 <output for="ratioV"></output
+              ><input id="ratioV" type="range" min="0.1" max="4" step="0.1"
+            /></label>
+            <label
+              >额外量化工作 / 原 GEMM 时间 <output for="overhead"></output
+              ><input id="overhead" type="range" min="0" max="100" step="1"
+            /></label>
+            <label
+              >拟合剩余项倍率 <output for="hostScale"></output
+              ><input id="hostScale" type="range" min="0" max="2" step="0.05"
+            /></label>
+            <label
+              >S2 对 S1 的慢化 κₐ <output for="kA"></output
+              ><input id="kA" type="range" min="0" max="3" step="0.05"
+            /></label>
+            <label
+              >S1 对 S2 的慢化 κᵥ <output for="kV"></output
+              ><input id="kV" type="range" min="0" max="3" step="0.02"
+            /></label>
+            <label
+              >量化对争用的假设<select id="contention">
+                <option value="fixed">κ 固定，只改变服务时间</option>
+                <option value="traffic">κ 随对方流量缩放（未验证）</option>
+              </select></label
+            >
+            <label
+              >服务时间抖动幅度 <output for="jitter"></output
+              ><input id="jitter" type="range" min="0" max="0.5" step="0.01"
+            /></label>
+            <label
+              >模拟时长 <output for="seconds"></output
+              ><input id="seconds" type="range" min="4" max="30" step="1"
+            /></label>
+            <label
+              >随机种子<input
+                id="seed"
+                type="number"
+                min="1"
+                max="999999"
+                step="1"
+            /></label>
+          </details>
+        </form>
+        <button class="export" id="export">↓ 导出参数与模拟结果</button>
+      </aside>
+      <main id="experiments">
+        <section class="hero">
+          <div>
+            <span class="eyebrow">PRECISION × SCHEDULING × FRESHNESS</span>
+            <h1>单卡快慢系统实验台</h1>
+            <p>改变精度与资源，观察延迟、排队和信息年龄如何相互影响。</p>
+          </div>
+          <span class="mode-badge">机制模拟 · 非硬件预测</span>
+        </section>
+        <div class="notice">
+          <strong>先区分三件事：</strong>权重缩小、GPU
+          工作变少、动作更及时。三者不等价。下面使用实测量级与可编辑假设，不预测机器人成功率。
+        </div>
+        <div class="presets">
+          <span>试一个情景</span
+          ><button data-preset="stress">20 ms 压力区间</button
+          ><button data-preset="limited">慢环限频 12 Hz</button
+          ><button data-preset="memory">带宽减半 + W4A16</button
+          ><button data-preset="aoi">验证 AoI = 1.5S</button>
+        </div>
+        <div id="error" role="alert" hidden></div>
+        <section class="metrics" aria-live="polite">
+          <article>
+            <span>S1 响应时间 P95</span><strong id="latency">—</strong
+            ><small id="latency-delta"></small>
+          </article>
+          <article>
+            <span>S1 超时 / 丢弃率</span><strong id="miss">—</strong
+            ><small id="miss-detail"></small>
+          </article>
+          <article>
+            <span>缓存 AoI · 时间均值</span><strong id="aoi">—</strong
+            ><small id="aoi-delta"></small>
+          </article>
+          <article>
+            <span>动作所用特征年龄 P95</span><strong id="used-age">—</strong
+            ><small>包含 S1 等待与执行后的年龄</small>
+          </article>
+        </section>
+        <section class="panel service">
+          <div class="panel-title">
+            <div>
+              <span class="eyebrow">01 / SERVICE MODEL</span>
+              <h2>耗时从哪里来</h2>
+            </div>
+            <span class="tag">拟合 + 假设</span>
+          </div>
+          <div id="service-chart" class="chart"></div>
+          <div id="service-note" class="chart-note"></div>
+          <p class="muted">
+            灰色为完整延迟减去独立诊断 GPU
+            时间得到的拟合剩余项，包含未归因开销，不能解释成实测“纯 CPU 时间”。
+          </p>
+        </section>
+        <div class="two-col">
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <span class="eyebrow">02 / SINGLE DEVICE</span>
+                <h2>快慢系统的时间线</h2>
+              </div>
+              <span class="tag">模拟服务区间</span>
+            </div>
+            <div id="timeline" class="chart"></div>
+            <label class="timeline-control"
+              >查看窗口起点 <output id="window-label"></output
+              ><input
+                id="window"
+                type="range"
+                min="0"
+                max="11200"
+                step="100"
+                value="1000"
+            /></label>
+            <p class="muted">
+              蓝色 S1 / 绿色 S2 / 红线丢弃请求。区间重叠不等同于 CUDA kernel
+              重叠；串行模式不模拟抢占。
+            </p>
+          </section>
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <span class="eyebrow">03 / AGE OF INFORMATION</span>
+                <h2>特征新鲜度</h2>
+              </div>
+              <span class="tag">采集 → 当前时刻</span>
+            </div>
+            <div id="age-chart" class="chart"></div>
+            <div id="age-note" class="chart-note"></div>
+            <p class="muted">
+              灰线：相同硬件和调度下 BF16
+              对照。青线：当前精度。发布新特征才重置年龄，开始推理不会重置。
+            </p>
+          </section>
+        </div>
+        <div class="two-col">
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <span class="eyebrow">04 / PRECISION SWEEP</span>
+                <h2>联合选择 S1 / S2 精度</h2>
+              </div>
+              <span class="tag">点击切换</span>
+            </div>
+            <div id="sweep"></div>
+            <p class="muted">
+              每格：超时率 /
+              缓存平均年龄。颜色只表示超时率，不代表模型质量。INT8 与 FP8
+              使用相同默认资源假设。
+            </p>
+          </section>
+          <section class="panel">
+            <div class="panel-title">
+              <div>
+                <span class="eyebrow">05 / PIPELINE</span>
+                <h2>响应时间决定延迟档位</h2>
+              </div>
+              <span class="formula">d = ⌈R / T⌉</span>
+            </div>
+            <div id="delay-chart" class="chart"></div>
+            <div id="buffer"></div>
+            <div id="queue-note" class="chart-note"></div>
+            <p class="muted">
+              Little 定律约束长期平均在途数；不能用它直接把 front
+              深度等同于一次调用的 λW。这里 H=16，仅示意。
+            </p>
+          </section>
+        </div>
+        <section class="panel">
+          <div class="panel-title">
+            <div>
+              <span class="eyebrow">06 / TESTABLE HYPOTHESIS</span>
+              <h2>更多次修正，仍可能保留偏差</h2>
+            </div>
+            <span class="tag">示意误差模型</span>
+          </div>
+          <div class="noise-controls">
+            <label
+              >收缩系数 α
+              <input
+                id="alpha"
+                type="range"
+                min="0"
+                max="1.1"
+                step="0.02"
+                value="0.8" /><output id="alpha-out"></output></label
+            ><label
+              >误差相关性 ρ
+              <input
+                id="rho"
+                type="range"
+                min="0"
+                max="0.95"
+                step="0.05"
+                value="0.6" /><output id="rho-out"></output></label
+            ><label
+              >每步偏置 b
+              <input
+                id="bias"
+                type="range"
+                min="0"
+                max="0.2"
+                step="0.005"
+                value="0.03" /><output id="bias-out"></output
+            ></label>
+          </div>
+          <div id="noise-chart" class="chart"></div>
+          <p class="muted">
+            eₙ₊₁ = αeₙ + b + εₙ；ε 为平稳 AR(1) 噪声，ρ
+            是相邻步相关系数，边际标准差固定为
+            0.1；初始状态误差与噪声独立，仅为说明机制。相关性、偏置和收缩强度没有由位宽自动推定；不是动作误差或成功率预测。
+          </p>
+        </section>
+        <section class="panel evidence">
+          <div class="panel-title">
+            <div>
+              <span class="eyebrow">CONDITIONAL / 不是量化实测</span>
+              <h2>量化能加速多少 GPU 工作</h2>
+            </div>
+            <span class="tag">Amdahl 情景</span>
+          </div>
+          <div id="bounds-table"></div>
+          <p>
+            只让已归因的 Linear / BMM（含其 split-K reduction）整体提速，其余
+            GPU 工作固定，额外量化开销设为零。S = 1 / (1 − p + p/s)。<b
+              >这里的倍率不能当作完整调用或同卡并发加速比。</b
+            >
+          </p>
+        </section>
+        <section class="panel evidence" id="evidence">
+          <div class="panel-title">
+            <div>
+              <span class="eyebrow">HISTORICAL / SO100 回放快照</span>
+              <h2>历史测量与适用范围</h2>
+            </div>
+            <span class="tag measured">RTX 6000 Ada · BF16</span>
+          </div>
+          <div id="evidence-table"></div>
+          <p>
+            以下数值来自 2026-10-04 的 SO100 / H16 回放实验，不是当前机器或
+            GR00T-LIBERO 的评测结果。这里只保留历史摘要，原始 trace
+            与逐次记录未随仓库发布。
+          </p>
+          <p>
+            融合后的配对完成更快，但 S1 event-span P50 从 <b>31.87 ms</b> 增到
+            <b>33.61 ms</b>（RoPE）。因此，本研究应同时优化
+            <b>S1 时限、AoI 与动作质量</b>，而非只追求总吞吐。
+          </p>
+          <div class="links">
+            <a href="../coexecution/README.md">单卡基线说明 ↗</a
+            ><a href="../docs/coexecution.md">计时范围与适用条件 ↗</a
+            ><a href="../docs/timing-protocols.md">LIBERO 计时协议 ↗</a>
+          </div>
+        </section>
+        <section class="panel" id="model-notes">
+          <div class="panel-title">
+            <div>
+              <span class="eyebrow">READ THE ASSUMPTIONS</span>
+              <h2>这个模拟器能解释什么</h2>
+            </div>
+          </div>
+          <div class="notes-grid">
+            <div>
+              <h3>服务时间</h3>
+              <p>
+                GEMM 用 max(计算时间, 搬运时间)
+                近似。权重量化减少权重流量；W4A16 不自动提高乘法吞吐。另加
+                pack/反量化开销与拟合剩余项。
+              </p>
+            </div>
+            <div>
+              <h3>争用</h3>
+              <p>
+                同时活跃时，S1/S2 以 1/(1+κ) 的速度推进；两个方向分别设
+                κ。它是经验慢化模型，不是硬件带宽分区，也不等价于 MPS 或 stream
+                优先级。
+              </p>
+            </div>
+            <div>
+              <h3>信息年龄</h3>
+              <p>
+                只有确定服务、零等待、即时采样等条件下，AoI 才在 [S,2S]
+                均匀分布。相机相位、限频、抖动、排队会改变其分布；有限队列也可能长期不更新。
+              </p>
+            </div>
+            <div>
+              <h3>模型质量</h3>
+              <p>
+                量化误差不必独立或零均值。计划书中的“自补偿”和“INT8
+                买回双卡八成”应作为待检验假设。论文钳位区间是
+                [0,d)，新提交区间是 [d,2d)。
+              </p>
+            </div>
+          </div>
+          <p class="muted">
+            默认参数用于机制教学，未拟合复现周期实验的 16.4%
+            超时率；更不能外推其他硬件的任务性能。模拟器始终是一个共享设备，硬件情景只改变它的有效资源。
+          </p>
+        </section>
+        <footer>
+          本地交互工具 · 保留所有假设 · 可导出结果复查
+          <span id="runtime"></span>
+        </footer>
+      </main>
+    </div>
+    <script src="model.js"></script>
+    <script src="evidence.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
