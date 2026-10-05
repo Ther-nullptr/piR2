@@ -23,6 +23,7 @@ def main():
         "scripts/test_libero_supervisor.py",
         "coexecution/test_timeline.py",
         "coexecution/test_attribution.py",
+        "coexecution/test_adapter_lifecycle.py",
     ]
     tests = [x for x in contracts if (ROOT / x).is_file()]
     if tests:

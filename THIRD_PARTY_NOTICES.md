@@ -6,4 +6,7 @@
 
 The project does not redistribute model weights or training datasets. Obtain them from their publishers under the applicable terms. A project-wide license for independently written code has not been selected; third-party licenses do not automatically license the whole repository.
 
+
 - **Diffusion Policy ConditionalUnet1D**: https://github.com/real-stanford/diffusion_policy. The architecture in `simulation/model.py` is adapted from this MIT-licensed implementation; the original notice is preserved in [licenses/DIFFUSION_POLICY_LICENSE](licenses/DIFFUSION_POLICY_LICENSE). The model is an independent reconstruction, not the unpublished Leap training code.
+
+- **Transformers 4.57.3 Qwen3-VL**: https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py. Copyright 2025 The Qwen Team and The HuggingFace Inc. team. The vision/attention paths in `coexecution/static_s2.py` adapt this Apache-2.0 code to cache static metadata; see [licenses/TRANSFORMERS_LICENSE](licenses/TRANSFORMERS_LICENSE). Fusion adapters preserve the underlying source's attribution and compare against that pinned implementation.
