@@ -5,3 +5,5 @@
 - **MuJoCo Playground**: https://github.com/google-deepmind/mujoco_playground at `ef4fefc13033c0468af4ef651847f5348af0c7d7`. Downloaded separately under its own terms.
 
 The project does not redistribute model weights or training datasets. Obtain them from their publishers under the applicable terms. A project-wide license for independently written code has not been selected; third-party licenses do not automatically license the whole repository.
+
+- **Diffusion Policy ConditionalUnet1D**: https://github.com/real-stanford/diffusion_policy. The architecture in `simulation/model.py` is adapted from this MIT-licensed implementation; the original notice is preserved in [licenses/DIFFUSION_POLICY_LICENSE](licenses/DIFFUSION_POLICY_LICENSE). The model is an independent reconstruction, not the unpublished Leap training code.

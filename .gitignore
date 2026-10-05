@@ -86,6 +86,8 @@ dist/
 /scripts/diagnose_libero_repeatability.py
 /simulation/diagnose_*.py
 /simulation/evaluate_expert_external.py
+/simulation/replay_demonstrations.py
+/scripts/run_leap_experiment.sh
 
 *~
 *.swp
