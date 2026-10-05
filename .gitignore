@@ -93,3 +93,11 @@ dist/
 *.swp
 *.swo
 .DS_Store
+
+# One-off report renderers with historical run constants.
+/coexecution/render_operator_figures.py
+/coexecution/plot_operator_overview.py
+/coexecution/report_fusion.py
+/coexecution/report_runtime.py
+/coexecution/fusion_candidates.py
+/coexecution/quantization_bounds.py
