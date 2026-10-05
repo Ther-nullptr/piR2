@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "sources": {
+    "groot": {
+      "url": "https://github.com/pi-r2-flow/pi-r2-flow.git",
+      "revision": "3af52ca400a6ec7d141416879aa531a6f62f697a",
+      "path": "upstream",
+      "submodule": "learning/Isaac-GR00T",
+      "submodule_revision": "2a39d591a3af24c42bb1d1c9cd708a2dddac0600",
+      "patches": []
+    },
+    "playground": {
+      "url": "https://github.com/google-deepmind/mujoco_playground.git",
+      "revision": "ef4fefc13033c0468af4ef651847f5348af0c7d7",
+      "path": "third_party/mujoco_playground",
+      "patches": []
+    }
+  }
+}
