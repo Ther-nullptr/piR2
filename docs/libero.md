@@ -2,6 +2,10 @@
 
 Use the official `nvidia/GR00T-N1.7-LIBERO` Spatial task checkpoint and all 432 demonstrations / 52,970 frames across ten Spatial tasks. This is GR00T adaptation, not π0.5 training. The VLM backbone remains frozen in training and active on real simulator images in evaluation.
 
+The repository's main research references are the [NVIDIA task-weight repository](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO) and [official LIBERO example](https://github.com/NVIDIA/Isaac-GR00T/blob/main/examples/LIBERO/README.md). The model-family manifest records Spatial, Object, Goal and Long separately. Current scripts implement Spatial only; extending a suite requires the matching checkpoint, data, initialization and full task evaluation.
+
+For the ordinary NVIDIA baseline, the official example loads the local suite subdirectory, uses `LIBERO_PANDA` and `--use-sim-policy-wrapper`, and illustrates `--n-action-steps 8`. Our fixed-delay and wall-clock protocols intentionally change execution timing; their scores are separate from that ordinary baseline. The πR² author fork supplies the algorithm changes, not NVIDIA's published fine-tuned weights. Pin the actual source and model versions instead of silently tracking a moving `main` branch.
+
 ## Assets and environment
 
 Prepare and patch GR00T source with `python3 tools/prepare_sources.py --component groot`. Follow its installation instructions in a Python 3.10 CUDA environment at `.venv/`. Model access may require accepting the publisher's terms and logging into Hugging Face locally. Then:

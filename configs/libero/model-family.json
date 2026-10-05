@@ -1,0 +1,14 @@
+{
+  "model_repository": "nvidia/GR00T-N1.7-LIBERO",
+  "model_revision": "2ea293aa20ba7cf5bbf3ba17a5fbcb1a01cbfe21",
+  "reference_example": "https://github.com/NVIDIA/Isaac-GR00T/blob/main/examples/LIBERO/README.md",
+  "embodiment": "LIBERO_PANDA",
+  "primary_starting_point": "existing_suite_finetuned_checkpoint",
+  "suites": {
+    "spatial": {"checkpoint_subdirectory": "libero_spatial", "pipeline_status": "implemented"},
+    "object": {"checkpoint_subdirectory": "libero_object", "pipeline_status": "research_target"},
+    "goal": {"checkpoint_subdirectory": "libero_goal", "pipeline_status": "research_target"},
+    "long": {"checkpoint_subdirectory": "libero_10", "pipeline_status": "research_target"}
+  },
+  "research_axes": ["piR2_adaptation", "real_vlm_closed_loop", "system1_system2_timing", "deployment_efficiency"]
+}
