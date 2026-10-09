@@ -1,6 +1,7 @@
 /* Queue simulation and rendering run locally; file:// is supported. */
 "use strict";
 const M = window.VLAModel,
+  S = window.PiR2Scenarios,
   $ = (id) => document.getElementById(id);
 const fmt = (value, digits = 1) =>
   value === null || !Number.isFinite(value)
@@ -11,21 +12,30 @@ const svg = (width, height, body) =>
 
 // This view consumes the scheduling model's events and snapshots. It
 // does not maintain a second controller, queue, or deadline implementation.
-let queueConfig = { ...M.queueDefaults },
+let queueConfig = { ...M.queueDefaults, executionPolicy: "paper" },
   queueResult,
   queueBaseline,
+  queueProtocolReference,
+  scenarioSettings = { ...S.defaults },
+  scenarioProjection,
+  scenarioReference,
+  queueAoi,
+  selectedDependency = null,
+  calibrationSource = null,
   queueTime = 260,
   queueRunTimer,
   queueAnimation = null,
   queueLastFrame = null,
   queueFreshnessContext = { latestAdoptedId: null, latestCompletedId: null };
 const queueColors = {
-  vision: ["#e4f1e8", "#34835e"],
-  inference: ["#e6edf8", "#285a93"],
+  vision: ["var(--s2-soft)", "var(--s2)"],
+  inference: ["var(--s1-soft)", "var(--s1)"],
   action: ["#fff0d9", "#b77725"],
   wait: ["#fff8e8", "#b69a62"],
-  bootstrap: ["#edf0f2", "#74828d"],
-  fallback: ["#fbe8e5", "#ae524b"],
+  bootstrap: ["#f3edfa", "#6b458f"],
+  fallback: ["#fee1e4", "var(--red)"],
+  repeat: ["#eee4f6", "#8055a0"],
+  newsegment: ["var(--s1-soft)", "var(--s1)"],
 };
 const queueEscape = (value) =>
   String(value).replace(
@@ -37,15 +47,34 @@ const queueEscape = (value) =>
   );
 const queueCross = '<span class="unused-mark" aria-label="未采用">×</span>';
 const queueModeNames = {
-  independent: "独立资源",
+  independent: "双卡 / 独立 GPU",
   shared: "单卡并发争用",
   serial: "单卡串行对照",
 };
+function queueExecutionName(execution) {
+  if (execution?.repeated) return "重复末动作";
+  return (
+    {
+      "new-segment": "采用新段",
+      "continue-segment": "旧段续播",
+      "repeat-last": "重复末动作",
+      bootstrap: "启动动作",
+      fallback: "无来源保持",
+    }[execution?.executionMode] ||
+    (execution?.fallback
+      ? "无来源保持"
+      : execution?.origin?.kind === "bootstrap"
+        ? "启动动作"
+        : "执行动作")
+  );
+}
 function queueJobTiming(job) {
   return `独占 ${fmt(job.soloMs)} ms；实际 ${fmt(job.responseMs)} ms；共享慢化 +${fmt(job.contentionDelayMs)} ms；等 GPU ${fmt(job.gpuWaitMs)} ms`;
 }
 function queuePhase(job, resource, side) {
   if (!job) return "空闲";
+  if (job.phase === "host-wait") return "等待共享主机服务";
+  if (job.phase === "dispatch") return "首次派发额外开销";
   if (job.phase === "host") return "非 GPU 阶段";
   if (job.phase === "gpu-wait") return "等待 GPU（尚未执行）";
   const rate = resource?.segment?.[side === "a" ? "rateA" : "rateV"];
@@ -68,10 +97,11 @@ function queueFreshness(item, options = {}) {
       band: bootstrap ? "bootstrap" : "unknown",
       ageMs: null,
       ageLabel: bootstrap ? `状态龄 ≥${fmt(queueTime, 0)} ms` : "状态龄未知",
-      status:
-        item.executedAtMs !== null &&
-        item.executedAtMs !== undefined &&
-        item.executedAtMs <= queueTime
+      status: item.repeated
+        ? "重复末动作"
+        : item.executedAtMs !== null &&
+            item.executedAtMs !== undefined &&
+            item.executedAtMs <= queueTime
           ? "已执行"
           : options.committed
             ? "已承诺"
@@ -106,19 +136,21 @@ function queueFreshness(item, options = {}) {
     (adopted &&
       !executed &&
       output.targetTick < queueFreshnessContext.committedUntil);
-  const status = unused
-    ? output.status.includes("expired")
-      ? "已过期"
-      : "未采用"
-    : !ready
-      ? "待生成"
-      : executed
-        ? "已执行"
-        : committed
-          ? "已承诺"
-          : adopted
-            ? "已发布"
-            : "已完成待领取";
+  const status = item.repeated
+    ? "重复末动作"
+    : unused
+      ? output.status.includes("expired")
+        ? "已过期"
+        : "未采用"
+      : !ready
+        ? "待生成"
+        : executed
+          ? "已执行"
+          : committed
+            ? "已承诺"
+            : adopted
+              ? "已发布"
+              : "已完成待领取";
   const band = !ready
     ? "pending"
     : ageMs <= queueConfig.periodMs
@@ -171,7 +203,7 @@ function queueFreshness(item, options = {}) {
         : null,
     completionWaitMs: waitMs,
     color: colors[band],
-    tooltip: `${output.label}；${status}；${started ? `状态采样 ${fmt(stateTime)} ms，当前状态龄 ${fmt(ageMs)} ms` : "请求尚未开始，未生成动作"}；视觉龄 ${started ? visualAge : "尚未读取"}；完成至今 ${completionAge}；完成后等待 ${ready ? `${fmt(waitMs)} ms${executed ? "（已执行）" : unused ? "（已停止等待）" : "（仍待执行）"}` : "尚未开始"}；目标 t${output.targetTick}。${latest ? "当前最新已采用批次。" : latestCompleted ? "当前最新已完成结果。" : ""}年龄不决定动作是否有效。`,
+    tooltip: `${output.label}；${status}；${started ? `状态采样 ${fmt(stateTime)} ms，当前状态龄 ${fmt(ageMs)} ms` : "请求尚未开始，未生成动作"}；视觉龄 ${started ? visualAge : "尚未读取"}；完成至今 ${completionAge}；完成后等待 ${ready ? `${fmt(waitMs)} ms${executed ? "（已执行）" : unused ? "（已停止等待）" : "（仍待执行）"}` : "尚未开始"}；${(queueConfig.executionPolicy === "paper" && !adopted) || output.targetTick === null ? "执行槽待换段时确定" : `目标 t${output.targetTick}`}。${latest ? "当前最新已采用批次。" : latestCompleted ? "当前最新已完成结果。" : ""}年龄不决定动作是否有效。`,
   };
 }
 function queueFreshnessAttributes(metadata) {
@@ -185,7 +217,7 @@ function queueActionSlot(item, options = {}) {
       : item.kind === "fallback"
         ? "fallback"
         : "action";
-  return `<div class="queue-slot queue-freshness-slot slot-${kind} freshness-${metadata.band}${metadata.latest ? " latest-batch" : ""}${options.committed ? " committed" : ""}" ${queueFreshnessAttributes(metadata)} title="${queueEscape(metadata.tooltip)}"><b>${queueEscape(item.label)}${metadata.unused ? queueCross : ""}</b><strong class="slot-state-age">${metadata.ageLabel}</strong><span class="slot-status">${metadata.status}</span>${metadata.latest ? '<em class="latest-batch-badge">最新批次</em>' : metadata.latestCompleted ? '<em class="latest-completed-badge">最新完成</em>' : ""}<small>目标 t${item.targetTick} · ${fmt(item.targetTick * queueConfig.periodMs, 0)} ms</small></div>`;
+  return `<div class="queue-slot queue-freshness-slot slot-${kind} freshness-${metadata.band}${metadata.latest ? " latest-batch" : ""}${options.committed ? " committed" : ""}" ${queueFreshnessAttributes(metadata)} title="${queueEscape(metadata.tooltip)}"><b>${queueEscape(item.label)}${metadata.unused ? queueCross : ""}</b><strong class="slot-state-age">${metadata.ageLabel}</strong><span class="slot-status">${metadata.status}</span>${metadata.latest ? '<em class="latest-batch-badge">最新批次</em>' : metadata.latestCompleted ? '<em class="latest-completed-badge">最新完成</em>' : ""}<small>${item.targetTick === null || item.targetTick === undefined ? "换段后确定执行 tick" : `目标 t${item.targetTick} · ${fmt(item.targetTick * queueConfig.periodMs, 0)} ms`}</small></div>`;
 }
 function queueSlot(label, caption, kind = "inference", options = {}) {
   return `<div class="queue-slot slot-${queueEscape(kind)}${options.committed ? " committed" : ""}"><b>${queueEscape(label)}${options.unused ? queueCross : ""}</b><small>${queueEscape(caption)}</small>${options.committed ? "<em>已承诺</em>" : ""}</div>`;
@@ -194,6 +226,10 @@ function queueEmpty(message = "空等待位") {
   return `<div class="queue-slot slot-empty"><b>空</b><small>${queueEscape(message)}</small></div>`;
 }
 function setQueueControls(preserveActive = false) {
+  for (const input of document.querySelectorAll("[data-scenario-key]")) {
+    if (!preserveActive || input !== document.activeElement)
+      input.value = scenarioSettings[input.dataset.scenarioKey];
+  }
   for (const input of document.querySelectorAll("[data-queue-key]")) {
     const value = queueConfig[input.dataset.queueKey];
     if (
@@ -208,6 +244,9 @@ function setQueueControls(preserveActive = false) {
     )
       input.value = value;
   }
+  $("queue-paper-controls").hidden = queueConfig.executionPolicy !== "paper";
+  $("queue-marginMs").disabled = queueConfig.executionPolicy === "paper";
+  $("queue-paperInitialDelay").max = queueConfig.maxDelay;
   $("queue-fixed-label").hidden = queueConfig.delayMode !== "fixed";
   $("queue-contention-controls").hidden = queueConfig.computeMode !== "shared";
   $("queue-resource-note").textContent =
@@ -215,11 +254,20 @@ function setQueueControls(preserveActive = false) {
       ? "只有 GPU 阶段重叠时降速；非 GPU 阶段保持原耗时。"
       : queueConfig.computeMode === "serial"
         ? "非抢占：正在运行的 GPU 阶段不被打断，空闲边界优先动作请求。"
-        : "两个 worker 使用独立资源；下方四预设也默认使用此模式。";
+        : "两个 worker 使用独立 GPU；主机服务是否共享由上方选项决定。";
   $("queue-fixedDelay").max = queueConfig.maxDelay;
   $("queue-jitter-value").textContent = `±${fmt(queueConfig.jitter * 100, 0)}%`;
 }
 function readQueueControls(preserveActive = false) {
+  for (const input of document.querySelectorAll("[data-scenario-key]")) {
+    const key = input.dataset.scenarioKey;
+    scenarioSettings[key] =
+      typeof S.defaults[key] === "number"
+        ? input.value.trim() === ""
+          ? S.defaults[key]
+          : Number(input.value)
+        : input.value;
+  }
   for (const key of Object.keys(M.queueDefaults)) {
     const input = $(`queue-${key}`);
     if (!input) continue;
@@ -228,13 +276,26 @@ function readQueueControls(preserveActive = false) {
         input.value.trim() === "" ? M.queueDefaults[key] : Number(input.value);
       if (!Number.isFinite(value)) value = M.queueDefaults[key];
       value = Math.min(Number(input.max), Math.max(Number(input.min), value));
-      if (["seed", "maxDelay", "fixedDelay", "bootstrapSlots"].includes(key))
+      if (
+        [
+          "seed",
+          "maxDelay",
+          "fixedDelay",
+          "bootstrapSlots",
+          "delayWindow",
+          "paperInitialDelay",
+        ].includes(key)
+      )
         value = Math.round(value);
       queueConfig[key] = value;
     } else queueConfig[key] = input.value;
   }
   queueConfig.fixedDelay = Math.min(
     queueConfig.fixedDelay,
+    queueConfig.maxDelay,
+  );
+  queueConfig.paperInitialDelay = Math.min(
+    queueConfig.paperInitialDelay,
     queueConfig.maxDelay,
   );
   setQueueControls(preserveActive);
@@ -250,12 +311,16 @@ function queueText(
   return `<text x="${x}" y="${y}" fill="${color}" font-size="${size}" text-anchor="${anchor}">${queueEscape(value)}</text>`;
 }
 function renderQueueTimeline() {
+  if (!queueResult) return;
   const width = 1200,
     height = 637,
     left = 120,
     right = 1170,
     period = queueConfig.periodMs,
-    span = Math.min(queueResult.windowEndMs, period * 12);
+    span = Math.min(
+      queueResult.windowEndMs,
+      Number($("lab-timeline-span").value) || queueResult.windowEndMs,
+    );
   const start = Math.max(
       0,
       Math.min(
@@ -265,14 +330,15 @@ function renderQueueTimeline() {
     ),
     end = start + span,
     x = (time) => left + ((time - start) / span) * (right - left);
+  const aliases = S.dependencyAliases(queueResult, start, end);
   $("queue-window-label").textContent = `${fmt(start, 0)}–${fmt(end, 0)} ms`;
   let body =
-    '<defs><clipPath id="queue-time-clip"><rect x="120" y="25" width="1050" height="576"/></clipPath><pattern id="queue-sharing-pattern" width="6" height="6" patternUnits="userSpaceOnUse"><path d="M-1,1 L1,-1 M0,6 L6,0 M5,7 L7,5" stroke="#9364a0" stroke-width="1.5"/></pattern><pattern id="queue-gpu-wait-pattern" width="6" height="6" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#b58c4a"/></pattern><pattern id="queue-bootstrap-pattern" width="7" height="7" patternUnits="userSpaceOnUse"><rect width="7" height="7" fill="#eef1f3"/><path d="M0,7L7,0" stroke="#dbe1e5" stroke-width="2"/></pattern></defs>';
+    '<defs><clipPath id="queue-time-clip"><rect x="120" y="25" width="1050" height="576"/></clipPath><pattern id="queue-sharing-pattern" width="6" height="6" patternUnits="userSpaceOnUse"><path d="M-1,1 L1,-1 M0,6 L6,0 M5,7 L7,5" stroke="#9364a0" stroke-width="1.5"/></pattern><pattern id="queue-gpu-wait-pattern" width="6" height="6" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#b58c4a"/></pattern><pattern id="queue-bootstrap-pattern" width="7" height="7" patternUnits="userSpaceOnUse"><rect width="7" height="7" fill="#f3edfa"/><path d="M0,7L7,0" stroke="#e2d3f0" stroke-width="2"/></pattern></defs>';
   const lanes = [
-    ["视觉请求 V", 48],
+    ["VLM · S2", 48],
     ["图像等待位", 110],
     ["特征缓存", 172],
-    ["动作请求 I", 234],
+    ["DiT · S1", 234],
     ["完成待领取", 296],
     ["输出目标槽", 358],
     ["控制器执行", 470],
@@ -303,6 +369,7 @@ function renderQueueTimeline() {
     tooltip,
     unused = false,
     readyAt = from,
+    attributes = "",
   ) => {
     if (until <= start || from >= end || until <= from) return;
     const lo = Math.max(from, start),
@@ -310,7 +377,7 @@ function renderQueueTimeline() {
       boxWidth = Math.max(0.8, x(hi) - x(lo) - 2),
       color = queueColors[kind],
       opacity = readyAt > queueTime ? 0.23 : 1;
-    body += `<g opacity="${opacity}"><title>${queueEscape(tooltip)}</title><rect x="${x(lo) + 1}" y="${y}" width="${boxWidth}" height="31" rx="3" fill="${color[0]}" stroke="${color[1]}"/>`;
+    body += `<g opacity="${opacity}" ${attributes}><title>${queueEscape(tooltip)}</title><rect x="${x(lo) + 1}" y="${y}" width="${boxWidth}" height="31" rx="3" fill="${color[0]}" stroke="${color[1]}"/>`;
     if (boxWidth > label.length * 5.5 + (unused ? 12 : 0))
       body += queueText(x(lo) + boxWidth / 2 + 1, y + 20, label, 10, color[1]);
     if (unused)
@@ -327,14 +394,23 @@ function renderQueueTimeline() {
         ? "url(#queue-sharing-pattern)"
         : segment.phase === "gpu-wait"
           ? "url(#queue-gpu-wait-pattern)"
-          : segment.phase === "host"
-            ? "#b7c2c9"
+          : ["host", "dispatch", "host-wait"].includes(segment.phase)
+            ? segment.phase === "host-wait"
+              ? "#dd9787"
+              : "#b7c2c9"
             : null;
       if (fill)
         body += `<rect class="queue-phase-${sharing ? "shared" : segment.phase}" x="${x(lo)}" y="${y + 24}" width="${x(hi) - x(lo)}" height="7" fill="${fill}" opacity="${segment.startMs > queueTime ? 0.23 : 1}"><title>${queueEscape(`${job.label}：${sharing ? "GPU 共享慢化" : segment.phase === "gpu-wait" ? "等待 GPU" : "非 GPU 阶段"}；${fmt(lo)}–${fmt(hi)} ms`)}</title></rect>`;
     }
   };
   const outputBlock = (item) => {
+    if (
+      queueConfig.executionPolicy === "paper" &&
+      item.requestId !== undefined &&
+      (item.adoptedAtMs === null || item.adoptedAtMs > queueTime)
+    )
+      return;
+    if (!Number.isInteger(item.targetTick)) return;
     const from = item.targetTick * period,
       until = from + period;
     if (until <= start || from >= end) return;
@@ -372,10 +448,12 @@ function renderQueueTimeline() {
       job.startMs,
       job.finishMs,
       50,
-      job.label,
+      aliases.vision(job.id),
       "vision",
-      `${job.label} 使用 ${job.sourceLabel}；${fmt(job.startMs)}–${fmt(job.finishMs)} ms；${queueJobTiming(job)}`,
+      `${aliases.vision(job.id)}（${job.label}）使用 ${job.sourceLabel}；${fmt(job.startMs)}–${fmt(job.finishMs)} ms；${queueJobTiming(job)}`,
       queueUnused(job),
+      job.startMs,
+      `data-vision-id="${job.id}" class="${selectedDependency?.featureVersion === job.id ? "lab-selected-job" : ""}"`,
     );
     resourceOverlay(job, 50);
   }
@@ -407,7 +485,7 @@ function renderQueueTimeline() {
       feature.finishMs,
       finish,
       174,
-      `F${feature.id}`,
+      aliases.vision(feature.id),
       "vision",
       `F${feature.id} 缓存；采集 ${fmt(feature.captureMs)} ms，${fmt(feature.finishMs)} ms 就绪`,
     );
@@ -417,17 +495,21 @@ function renderQueueTimeline() {
       request.startMs,
       request.finishMs,
       236,
-      request.label,
+      aliases.action(request).label,
       "inference",
-      `${request.label} 读取 F${request.featureVersion} + s${request.requestTick}；d=${request.d}；${fmt(request.startMs)}–${fmt(request.finishMs)} ms；${queueJobTiming(request)}`,
+      `${aliases.action(request).label}（${request.label}）读取 ${aliases.vision(request.featureVersion)} / F${request.featureVersion} + s${request.requestTick}；d=${request.d}；${fmt(request.startMs)}–${fmt(request.finishMs)} ms；${queueJobTiming(request)}`,
       queueUnused(request),
+      request.startMs,
+      `data-action-id="${request.id}" data-parent-feature="${request.featureVersion}" class="${selectedDependency?.id === request.id ? "lab-selected-job" : ""}"`,
     );
     resourceOverlay(request, 236);
     block(
       request.finishMs,
-      request.publication?.atMs ?? queueResult.windowEndMs,
+      request.publication?.atMs ??
+        request.discardedAtMs ??
+        queueResult.windowEndMs,
       298,
-      `${request.label} W`,
+      `${aliases.action(request).label} W`,
       "wait",
       `${request.label} 已完成；等待控制循环领取`,
       false,
@@ -443,14 +525,32 @@ function renderQueueTimeline() {
     if (!plannedTargets.has(bootstrap.targetTick)) outputBlock(bootstrap);
   for (const execution of queueResult.executions) {
     const origin = execution.origin,
-      kind = origin.kind === "request" ? "action" : origin.kind;
+      producer =
+        origin.kind === "request"
+          ? queueResult.actionRequests[origin.requestId]
+          : null,
+      sourceLabel = producer
+        ? `${aliases.action(producer).label}[${origin.offset}]`
+        : origin.label,
+      repeated =
+        execution.repeated || execution.executionMode === "repeat-last",
+      kind = repeated
+        ? "repeat"
+        : execution.executionMode === "new-segment"
+          ? "newsegment"
+          : origin.kind === "request"
+            ? "action"
+            : origin.kind;
     block(
       execution.timeMs,
       execution.timeMs + period,
       472,
-      origin.label,
+      `${repeated ? "↻ " : ""}${sourceLabel}`,
       kind,
-      `t${execution.tick} 执行 ${origin.label}；d=${execution.delay}`,
+      `t${execution.tick} ${queueExecutionName(execution)} ${sourceLabel}；d=${execution.delay}${producer ? `；源状态 ${fmt(producer.stateCaptureMs)} ms；图像来源 ${producer.featureVersion < 0 ? "图前未知" : `${fmt(producer.featureCaptureMs)} ms`}` : "；启动或保持动作来源未知"}${repeated ? "；保留生产请求，不刷新 AoI" : ""}`,
+      false,
+      execution.timeMs,
+      `data-execution-tick="${execution.tick}" data-execution-mode="${execution.executionMode || (execution.fallback ? "fallback" : "normal")}" data-origin-request="${producer?.id ?? ""}" data-origin-offset="${origin.offset ?? ""}" class="${producer && selectedDependency?.id === producer.id ? "lab-selected-job" : ""}"`,
     );
   }
   for (const segment of queueResult.resourceSegments || []) {
@@ -480,6 +580,17 @@ function renderQueueTimeline() {
         534,
       );
   }
+  for (const request of queueResult.actionRequests) {
+    if (request.startMs < start || request.startMs >= end) continue;
+    if (selectedDependency && selectedDependency.id !== request.id) continue;
+    const parent = queueResult.visualJobs.find(
+      (j) => j.id === request.featureVersion,
+    );
+    if (!parent) continue;
+    const origin = Math.max(start, parent.finishMs),
+      target = request.startMs;
+    body += `<g class="lab-dependency" data-parent-feature="${parent.id}" data-child-request="${request.id}"><title>${aliases.vision(parent.id)} → ${aliases.action(request).label}：实际读取的特征，${fmt(parent.finishMs)} ms 已完成</title><path d="M${x(origin)},205 L${x(target)},232 l-3,-6 m3,6 l3,-6" fill="none" stroke="var(--s2)" stroke-width="${selectedDependency ? 2.5 : 1}" opacity="${selectedDependency ? 1 : 0.45}"${parent.finishMs < start ? ' stroke-dasharray="3 2"' : ""}/></g>`;
+  }
   body += "</g>";
   if (queueTime >= start && queueTime <= end)
     body += `<line x1="${x(queueTime)}" x2="${x(queueTime)}" y1="29" y2="594" stroke="#b77725" stroke-width="2"/><circle cx="${x(queueTime)}" cy="29" r="4" fill="#b77725"/>`;
@@ -491,11 +602,11 @@ function renderQueueSnapshots(snapshot) {
     $("queue-execution").querySelector(".queue-scroll")?.scrollLeft || 0;
   const runningVision = vision.running;
   $("queue-image").innerHTML =
-    `<div class="queue-row-label">已启动的视觉请求</div><div class="queue-slots">${runningVision ? queueSlot(runningVision.label, `${runningVision.sourceLabel} · ${queuePhase(runningVision, snapshot.resource, "v")}`, "vision") : queueEmpty("VLM 空闲")}</div><div class="queue-row-label">1 个图像等待位</div><div class="queue-slots">${vision.pending ? queueSlot(vision.pending.label, `采集 ${fmt(vision.pending.captureMs)} ms`, "vision") : queueEmpty("新帧到来时填入")}</div><p class="muted">${runningVision ? `当前请求已经过 ${fmt(queueTime - runningVision.startMs)} ms；` : ""}图像等待位的覆盖与请求内部等 GPU 分别处理。</p>`;
+    `<div class="queue-row-label">已启动的视觉请求</div><div class="queue-slots">${runningVision ? queueSlot(runningVision.label, `${runningVision.sourceLabel} · ${queuePhase(runningVision, snapshot.resource, "v")}`, "vision") : queueEmpty(vision.admissionReason === "rate-limit" ? `接纳限流至 ${fmt(vision.nextAdmissionMs)} ms` : "VLM 空闲")}</div><div class="queue-row-label">1 个图像等待位</div><div class="queue-slots">${vision.pending ? queueSlot(vision.pending.label, `采集 ${fmt(vision.pending.captureMs)} ms`, "vision") : queueEmpty("新帧到来时填入")}</div><p class="muted">${runningVision ? `当前请求已经过 ${fmt(queueTime - runningVision.startMs)} ms；` : ""}图像等待位的覆盖与请求内部等 GPU 分别处理。</p>`;
   const feature = vision.latestFeature,
     reader = action.running || action.ready;
   $("queue-feature").innerHTML =
-    `<div class="queue-row-label">最新完成版本</div><div class="queue-slots">${queueSlot(`F${feature.id}`, feature.id < 0 ? "图前初始化" : `${feature.label} 于 ${fmt(feature.finishMs)} ms 完成`, "vision")}</div><div class="queue-row-label">动作请求已经读取的快照</div><div class="queue-slots">${reader ? queueSlot(`${reader.label} / F${reader.featureVersion}`, `状态 s${reader.requestTick} · 请求于 ${fmt(reader.startMs)} ms`, "inference") : queueEmpty("无未完成动作请求")}</div><p class="muted">年龄 ${fmt(queueTime - feature.captureMs)} ms；缓存更新不会改变已开始请求的输入。</p>`;
+    `<div class="queue-row-label">最新完成版本</div><div class="queue-slots">${queueSlot(`F${feature.id}`, feature.id < 0 ? "图前初始化" : `${feature.label} 于 ${fmt(feature.finishMs)} ms 完成`, "vision")}</div><div class="queue-row-label">动作请求已经读取的快照</div><div class="queue-slots">${reader ? queueSlot(`${reader.label} / F${reader.featureVersion}`, `状态 s${reader.requestTick} · 请求于 ${fmt(reader.startMs)} ms`, "inference") : queueEmpty("无未完成动作请求")}</div><p class="muted">年龄 ${feature.id < 0 ? "未知（图前初始化）" : `${fmt(queueTime - feature.captureMs)} ms`}；缓存更新不会改变已开始请求的输入。</p>`;
   $("queue-request").innerHTML =
     `<div class="queue-row-label">最多 1 个在途请求</div><div class="queue-slots">${action.running ? queueSlot(action.running.label, `d=${action.running.d} · ${queuePhase(action.running, snapshot.resource, "a")}`, "inference") : queueEmpty("计算 worker 空闲")}</div><div class="queue-row-label">完成结果的暂存位</div><div class="queue-slots">${action.ready ? action.ready.outputs.map((output) => queueActionSlot(output, { requestId: action.ready.id })).join("") : queueEmpty("完成后等待控制循环领取")}</div><p class="muted">${action.ready ? `${queueEscape(action.ready.label)} 于 ${fmt(action.ready.finishMs)} ms 完成，一份结果含 ${action.ready.outputs.length} 个动作。` : action.running ? `请求已经过 ${fmt(queueTime - action.running.startMs)} ms；GPU 等待包含在响应时间内。` : "忙时不排队保存旧状态；下次获准请求时读取新状态。"}</p>`;
   const last = execution.lastExecuted,
@@ -519,7 +630,7 @@ function renderQueueSnapshots(snapshot) {
     ? queueFreshness({ ...last.origin, executedAtMs: last.timeMs })
     : null;
   $("queue-execution").innerHTML =
-    `<div class="queue-executed"><span>刚执行</span><strong>${last ? queueEscape(last.origin.label) : "—"}</strong><small>${last ? `t${last.tick} · ${fmt(last.timeMs)} ms${last.fallback ? " · fallback" : ""}` : "尚未执行"}</small>${lastFreshness ? `<span class="executed-state-age" ${queueFreshnessAttributes(lastFreshness)} title="${queueEscape(lastFreshness.tooltip)}">${lastFreshness.ageLabel}${lastFreshness.latest ? " · 最新批次" : ""}</span>` : ""}</div><div class="queue-scroll" aria-label="未来执行槽，可横向滚动"><div class="queue-targets">${slots.join("")}</div></div><p class="muted">${execution.slots.length} 个未来动作已存储；承诺边界 t${execution.committedUntil}（此前的尚未执行格受保护）。虚线空格表示未来待补，不表示此刻已发生 fallback。</p>${rejected.length ? `<div class="queue-row-label">最近确认未采用的输出</div><div class="queue-slots">${rejected.map((output) => queueActionSlot(output)).join("")}</div>` : ""}`;
+    `<div class="queue-executed"><span>刚执行</span><strong>${last ? queueEscape(last.origin.label) : "—"}</strong><small>${last ? `t${last.tick} · ${fmt(last.timeMs)} ms · ${queueExecutionName(last)}` : "尚未执行"}</small>${lastFreshness ? `<span class="executed-state-age" ${queueFreshnessAttributes(lastFreshness)} title="${queueEscape(lastFreshness.tooltip)}">${lastFreshness.ageLabel}${lastFreshness.latest ? " · 最新批次" : ""}</span>` : ""}</div><div class="queue-scroll" aria-label="未来执行槽，可横向滚动"><div class="queue-targets">${slots.join("")}</div></div><p class="muted">${queueConfig.executionPolicy === "paper" ? `${execution.slots.length} 个当前段的干净动作待执行；用完后在控制 tick 接纳新段，未就绪时重复最后动作。图中的未去噪尾部不可执行。` : `${execution.slots.length} 个未来动作已存储；承诺边界 t${execution.committedUntil}（此前的尚未执行格受保护）。虚线空格表示未来待补，不表示此刻已发生 fallback。`}</p>${rejected.length ? `<div class="queue-row-label">最近确认未采用的输出</div><div class="queue-slots">${rejected.map((output) => queueActionSlot(output)).join("")}</div>` : ""}`;
   $("queue-execution").querySelector(".queue-scroll").scrollLeft =
     executionScroll;
   const names = {
@@ -533,7 +644,7 @@ function renderQueueSnapshots(snapshot) {
     rolling.cells
       .map(
         (cell) =>
-          `<div class="rolling-cell rolling-${cell.kind}" title="位置 ${cell.offset} / 目标 t${cell.targetTick} / ${names[cell.kind]}"><b>${cell.offset}</b><small>t${cell.targetTick}</small></div>`,
+          `<div class="rolling-cell rolling-${cell.kind}" title="位置 ${cell.offset} / ${queueConfig.executionPolicy === "paper" ? "缓冲位置，非预定执行 tick" : `目标 t${cell.targetTick}`} / ${names[cell.kind]}"><b>${cell.offset}</b><small>${queueConfig.executionPolicy === "paper" ? `p${cell.offset}` : `t${cell.targetTick}`}</small></div>`,
       )
       .join("") +
     '<div class="rolling-key"><span>蓝：计算中的承诺前缀</span><span>橙：干净 / 本次输出区</span><span>浅灰：仍待细化</span><span>斜纹：新噪声尾部</span></div>';
@@ -571,13 +682,17 @@ function queueEventDescription(event) {
     case "reserve":
       return `承诺 t${event.startTick}–t${event.startTick + event.length - 1}：${event.slots.map((slot) => slot.label).join("、")}`;
     case "execute":
-      return `t${event.execution.tick} 执行 ${event.execution.origin.label}${event.execution.fallback ? "（fallback）" : ""}`;
+      return `t${event.execution.tick} ${queueExecutionName(event.execution)} ${event.execution.origin.label}`;
     case "delay":
-      return `延迟预算更新为 d=${event.delay}；本次所需 ${event.requiredDelay} tick`;
+      return `d 更新为 ${event.delay}；${queueConfig.executionPolicy === "paper" ? "按近期已完成响应的滚动均值，可升可降" : `本次所需 ${event.requiredDelay} tick，只升不降`}`;
+    case "action-ready-replaced":
+    case "action-superseded":
+    case "ready-superseded":
+      return `${request?.label || "旧结果"} 在接纳前被较新的完成结果覆盖`;
     case "window-end":
       return "观察窗口结束；未来输出未采用与否尚未判定";
     case "action-drained":
-      return `${request.label} 收尾完成，按窗口末尾控制 tick 检查已过期输出`;
+      return `${request.label} 收尾完成；${queueConfig.executionPolicy === "paper" ? "窗口结束后的输出不再接纳" : "按窗口末尾控制 tick 检查已过期输出"}`;
     default:
       return null;
   }
@@ -609,18 +724,20 @@ function renderQueue() {
   $("queue-time-label").textContent = `${fmt(queueTime, 0)} ms`;
   $("queue-delay").textContent = snapshot.delay;
   $("queue-delay-note").textContent =
-    `初始 ${queueResult.initialDelay} / 最终 ${queueResult.finalDelay}；${queueConfig.delayMode === "fixed" ? "固定预算" : "自适应预算"}${queueResult.calibration.overBudget ? " · 标定已超过最大 d" : ""}`;
+    `初始 ${queueResult.initialDelay} / 最终 ${queueResult.finalDelay}；${queueConfig.delayMode === "fixed" ? "固定预算" : queueConfig.executionPolicy === "paper" ? "滚动均值，可升可降" : "P95 初始标定，在线只升不降"}${queueResult.calibration.overBudget ? " · 标定已超过最大 d" : ""}`;
   $("queue-rates").textContent =
     `${fmt(metrics.requests / queueConfig.seconds)} / ${fmt(metrics.controlTicks / queueConfig.seconds)}`;
   $("queue-losses").textContent =
     `${metrics.expiredOutputs} / ${metrics.fallbackTicks}`;
   $("queue-losses-note").textContent =
-    `整段模拟（含 ${metrics.expiredAtWindowEnd} 个收尾过期）；另有 ${metrics.protectedOutputs} 个受承诺保护`;
+    `整段模拟（含 ${metrics.expiredAtWindowEnd} 个收尾过期）；另有 ${metrics.protectedOutputs} 个受承诺保护；重复末动作 ${metrics.repeatTicks || 0} tick（来源保留）`;
   $("queue-age").textContent =
-    `${fmt(queueTime - snapshot.vision.latestFeature.captureMs)} ms`;
-  const readAges = queueResult.actionRequests.map(
-    (request) => request.startMs - request.featureCaptureMs,
-  );
+    snapshot.vision.latestFeature.id < 0
+      ? "未知"
+      : `${fmt(queueTime - snapshot.vision.latestFeature.captureMs)} ms`;
+  const readAges = queueResult.actionRequests
+    .filter((r) => r.featureVersion >= 0)
+    .map((request) => request.startMs - request.featureCaptureMs);
   $("queue-age-note").textContent =
     `请求读入年龄 P95 ${fmt(M.percentile(readAges, 0.95))} ms`;
   renderQueueTimeline();
@@ -636,10 +753,28 @@ function renderQueue() {
         `<div class="queue-event${event.kind === "execute" ? " execution-event" : ""}"><time>${fmt(event.timeMs, 1)} ms</time><span>${queueEscape(queueEventDescription(event) || event.kind)}</span></div>`,
     )
     .join("");
+  window.PiR2Lab.renderAoi(
+    queueAoi,
+    queueTime,
+    queueResult.windowEndMs,
+    queueResult,
+  );
+  window.PiR2Lab.renderPolicyState(
+    queueResult,
+    snapshot,
+    queueTime,
+    queueExecutionName(snapshot.execution.lastExecuted),
+  );
   window.lastQueueSimulation = {
     config: { ...queueConfig },
+    effectiveConfig: { ...scenarioProjection.config },
+    scenario: { ...scenarioSettings },
+    reference: scenarioReference,
+    aoi: queueAoi,
+    calibrationSource,
     result: queueResult,
     baseline: queueBaseline,
+    protocolReference: queueProtocolReference,
     snapshot,
     freshness: { ...queueFreshnessContext },
     timeMs: queueTime,
@@ -657,7 +792,7 @@ function renderQueueResourceSummary() {
     $(`queue-${side}-response`).textContent = `${fmt(metrics[key])} ms`;
     const difference = metrics[key] - base[key];
     $(`queue-${side}-baseline`).textContent =
-      `独立资源对照 ${fmt(base[key])} ms；差值 ${difference >= 0 ? "+" : ""}${fmt(difference)} ms`;
+      `独立 GPU 对照（相同主机策略）${fmt(base[key])} ms；差值 ${difference >= 0 ? "+" : ""}${fmt(difference)} ms`;
   }
   $("queue-overlap").textContent =
     `${fmt((100 * metrics.gpuOverlapMs) / queueResult.windowEndMs)}%`;
@@ -678,18 +813,33 @@ function runQueue() {
   const before = performance.now();
   $("queue-error").hidden = true;
   try {
-    queueResult = M.simulatePolicyQueues(queueConfig);
+    scenarioProjection = S.projectScenario(queueConfig, scenarioSettings);
+    queueResult = M.simulatePolicyQueues(scenarioProjection.config);
+    selectedDependency = null;
+    scenarioReference = M.simulatePolicyQueues(queueConfig);
+    queueAoi = S.simulationAoi(queueResult);
+    queueProtocolReference = M.simulatePolicyQueues({
+      ...scenarioProjection.config,
+      executionPolicy:
+        queueConfig.executionPolicy === "paper" ? "libero" : "paper",
+    });
     queueBaseline =
       queueConfig.computeMode === "independent"
         ? queueResult
         : M.simulatePolicyQueues({
-            ...queueConfig,
+            ...scenarioProjection.config,
             computeMode: "independent",
           });
     queueTime = Math.max(0, Math.min(queueTime, queueResult.windowEndMs));
     $("queue-time").max = queueResult.windowEndMs;
     renderQueue();
     renderQueueResourceSummary();
+    window.PiR2Lab.renderComparison(
+      scenarioProjection,
+      scenarioReference,
+      queueResult,
+    );
+    window.PiR2Lab.renderPolicyComparison(queueResult, queueProtocolReference);
     $("queue-runtime").textContent =
       `${queueResult.events.length} 个事件 · 种子 ${queueConfig.seed} · 生成 ${fmt(performance.now() - before, 0)} ms`;
   } catch (error) {
@@ -704,9 +854,9 @@ $("queue-controls").addEventListener("submit", (event) =>
 );
 $("queue-controls").addEventListener("input", (event) => {
   const key = event.target.dataset.queueKey;
-  if (!key) return;
+  if (!key && !event.target.dataset.scenarioKey) return;
   const number = $(`queue-${key}`);
-  if (event.target.type === "range" && number !== event.target)
+  if (key && event.target.type === "range" && number !== event.target)
     number.value = event.target.value;
   clearTimeout(queueRunTimer);
   queueRunTimer = setTimeout(() => {
@@ -722,7 +872,11 @@ $("queue-controls").addEventListener("change", (event) => {
 });
 $("queue-reset").addEventListener("click", () => {
   clearTimeout(queueRunTimer);
-  queueConfig = { ...M.queueDefaults };
+  resetScenario();
+  queueConfig = {
+    ...M.queueDefaults,
+    executionPolicy: queueConfig.executionPolicy,
+  };
   queueTime = Math.min(260, queueConfig.seconds * 1000);
   setQueueControls();
   runQueue();
@@ -730,11 +884,13 @@ $("queue-reset").addEventListener("click", () => {
 for (const button of document.querySelectorAll("[data-queue-preset]"))
   button.addEventListener("click", () => {
     clearTimeout(queueRunTimer);
+    resetScenario();
     const timings = { 1: [30, 20], 2: [140, 20], 3: [30, 80], 4: [140, 80] }[
       button.dataset.queuePreset
     ];
     queueConfig = {
       ...M.queueDefaults,
+      executionPolicy: queueConfig.executionPolicy,
       vlmMs: timings[0],
       actionMs: timings[1],
     };
@@ -743,8 +899,10 @@ for (const button of document.querySelectorAll("[data-queue-preset]"))
   });
 $("queue-shared-preset").addEventListener("click", () => {
   clearTimeout(queueRunTimer);
+  resetScenario();
   queueConfig = {
     ...M.queueDefaults,
+    executionPolicy: queueConfig.executionPolicy,
     vlmMs: 100,
     actionMs: 20,
     computeMode: "shared",
@@ -794,12 +952,24 @@ $("queue-play").addEventListener("click", () => {
 $("queue-export").addEventListener("click", () => {
   if (!queueResult) return;
   const payload = {
-    schema: 1,
+    schema: 3,
     kind: "pir2_policy_queue_simulation",
     generatedAt: new Date().toISOString(),
-    config: queueConfig,
+    config: queueResult.config,
+    baseConfig: queueConfig,
+    scenarioAssumptions: scenarioSettings,
+    soloCalibrationSource: calibrationSource,
+    samePolicyReference: {
+      config: scenarioReference.config,
+      metrics: scenarioReference.metrics,
+    },
+    aoi: queueAoi,
+    otherSchedulingPolicy: {
+      config: queueProtocolReference.config,
+      metrics: queueProtocolReference.metrics,
+    },
     assumptions:
-      "Inputs are isolated full-request latencies split into pre-GPU host and GPU work. Independent, overlapping GPU slowdown, or nonpreemptive serial resource scheduling selected in config. Initial d calibrated in isolation; online d follows actual responses. One latest waiting image; one outstanding action request; protected timestamped execution slots. Synthetic scheduling only; no measured GPU or task success claim.",
+      "Inputs are isolated full-request latencies split into pre-GPU host and GPU work. Independent, overlapping GPU slowdown, or nonpreemptive serial resource scheduling selected in config. executionPolicy=libero uses isolated P95 plus margin, monotone d, timestamped protected slots and zero-delta hold on exhaustion. executionPolicy=paper is a mechanism reference: continuously queried action worker, rolling completed-latency mean with round-to-even d, latest-ready result, clean-segment boundary swaps and last-emitted-action repetition. Its initial d and maximum d are explicit simulator assumptions; per-request clean width is frozen, not a bit-exact deployment reproduction. Repeated outputs retain their original producer and AoI. Optional shared nonpreemptive host server and VLM admission cap. Quantization scales only assumed GPU work, with optional added host work; precision labels are not benchmark results. AoI follows consumed features and producing actions; unknown bootstrap/fallback intervals are gaps. Synthetic scheduling only; no measured GPU, quantization accuracy or task success claim.",
     result: queueResult,
     independentReference: {
       config: queueBaseline.config,
@@ -819,5 +989,137 @@ $("queue-export").addEventListener("click", () => {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
+function resetScenario() {
+  scenarioSettings = { ...S.defaults };
+  calibrationSource = null;
+  selectedDependency = null;
+  $("lab-calibration-source").textContent =
+    "机制示例：当前参数为可编辑假设，未拟合硬件性能。";
+}
+function applyLabConfig(config, assumptions = {}) {
+  clearTimeout(queueRunTimer);
+  resetScenario();
+  queueConfig = { ...M.queueDefaults, ...config };
+  scenarioSettings = { ...S.defaults, ...assumptions };
+  queueTime = 260;
+  setQueueControls();
+  runQueue();
+}
+$("lab-example-feedback").addEventListener("click", () => {
+  applyLabConfig(
+    {
+      actionMs: 30,
+      vlmMs: 200,
+      gpuShareA: 1 / 3,
+      gpuShareV: 0.8,
+      periodMs: 50,
+      cameraHz: 20,
+      computeMode: "shared",
+      slowdownA: 0,
+      slowdownV: 0,
+      hostMode: "shared",
+      seconds: 12,
+      marginMs: 5,
+    },
+    { visionSpeedup: 2, visionPrecision: "INT8 / W8A8" },
+  );
+});
+$("lab-example-latch").addEventListener("click", () => {
+  applyLabConfig({
+    actionMs: 48,
+    vlmMs: 30,
+    periodMs: 50,
+    marginMs: 0,
+    startupActionDelayMs: 3,
+    computeMode: "independent",
+    seconds: 4,
+  });
+});
+$("queue-executionPolicy").addEventListener("change", () => {
+  clearTimeout(queueRunTimer);
+  readQueueControls();
+  runQueue();
+});
+$("lab-example-repeat").addEventListener("click", () => {
+  applyLabConfig({
+    executionPolicy: "paper",
+    delayMode: "fixed",
+    fixedDelay: 2,
+    paperInitialDelay: 2,
+    actionMs: 160,
+    vlmMs: 30,
+    periodMs: 50,
+    seconds: 2,
+    bootstrapSlots: 2,
+  });
+  queueTime = 450;
+  renderQueue();
+});
+$("lab-example-recover-d").addEventListener("click", () => {
+  applyLabConfig({
+    executionPolicy: "paper",
+    paperInitialDelay: 1,
+    delayWindow: 2,
+    actionMs: 40,
+    vlmMs: 30,
+    periodMs: 50,
+    startupActionDelayMs: 100,
+    seconds: 2,
+  });
+  queueTime = 300;
+  renderQueue();
+});
+$("lab-compare-cap").addEventListener("click", () => {
+  queueConfig.vlmRateCapHz = 5;
+  setQueueControls();
+  runQueue();
+});
+$("lab-timeline-span").addEventListener("change", renderQueueTimeline);
+$("queue-timeline").addEventListener("click", (event) => {
+  if (!queueResult) return;
+  const node = event.target.closest(
+    "[data-action-id], [data-vision-id], [data-execution-tick]",
+  );
+  if (!node) {
+    selectedDependency = null;
+    renderQueueTimeline();
+    return;
+  }
+  selectedDependency = node.hasAttribute("data-execution-tick")
+    ? node.dataset.originRequest === ""
+      ? null
+      : queueResult.actionRequests[Number(node.dataset.originRequest)]
+    : node.hasAttribute("data-action-id")
+      ? queueResult.actionRequests[Number(node.dataset.actionId)]
+      : queueResult.actionRequests.find(
+          (r) => r.featureVersion === Number(node.dataset.visionId),
+        );
+  renderQueueTimeline();
+});
+for (const id of ["lab-vision-budget", "lab-action-budget"])
+  $(id).addEventListener("input", () => {
+    if (queueResult)
+      window.PiR2Lab.renderComparison(
+        scenarioProjection,
+        scenarioReference,
+        queueResult,
+      );
+  });
+window.addEventListener("message", (event) => {
+  if (
+    event.origin !== location.origin ||
+    event.source !== $("lab-replay-frame").contentWindow
+  )
+    return;
+  const source = S.safeSoloMessage(event.data);
+  if (!source) return;
+  applyLabConfig({ ...source.config, executionPolicy: "libero" });
+  calibrationSource = source;
+  $("lab-calibration-source").textContent =
+    `已按本地 LIBERO 调度口径载入 ${source.conditionId} 的独占 RPC 均值：VLM ${fmt(source.config.vlmMs)} ms，DiT ${fmt(source.config.actionMs)} ms。完整 RPC 暂按 GPU 比例 1 建模；主机比例、争用系数与量化收益尚未拟合，请在高级参数中设置。频率不自动换算成速度。`;
+  renderQueue();
+  window.PiR2Lab.showTab("simulation");
+});
 setQueueControls();
 runQueue();
+window.PiR2Lab.initNavigation();
