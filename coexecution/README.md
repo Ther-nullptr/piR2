@@ -1,6 +1,6 @@
 # Single-GPU S1/S2 execution tools
 
-The S1/S2 replay tools below are auxiliary GR00T inference and profiling tools. Their workload loads the SO100 replay checkpoint `outputs/pir2-so100-smoke/checkpoint-10` and real prerecorded SO100 observations. The separate opt-in GR00T fusion/integer adapters described below target standard LIBERO Flow inference. Neither replay profiling nor adapter tests replace closed-loop evaluation.
+The S1/S2 replay tools below are auxiliary GR00T inference and profiling tools. Their workload loads the SO100 replay checkpoint `outputs/pir2-so100-smoke/checkpoint-10` and real prerecorded SO100 observations. The separate opt-in GR00T fusion/integer adapters described below target standard LIBERO Flow and serial πR² inference. Neither replay profiling nor adapter tests replace closed-loop evaluation.
 
 The two workers run a real VLM (S2) and a rolling DiT action head (S1) on one physical GPU. Feature handoff uses completion events and reader leases. Optional fusion, static input handling and CUDA Graph variants are explicit A/B choices. Numerical checks restore a paired starting buffer and compare with the eager path; periodic replay also records deadlines and feature ages.
 
@@ -20,7 +20,7 @@ See [measurement definitions](../docs/coexecution.md). Raw JSON, plots, SQLite e
 
 ## Experimental GR00T fusion and integer inference
 
-这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选 DiT CUDA Graph；依赖固定版本的 Speedup Paradox 整数后端。当前范围是单提交者、冻结权重、B1 的标准 Flow 推理。流式 πR²、并发调用和量化闭环质量尚未验证，服务入口拒绝把这些实验选项用于 `--variant pir2`。
+这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；依赖固定版本的 Speedup Paradox 整数后端。当前范围是单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝，同进程并发优化服务也不支持。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
 
 The modules provide instance-local, reversible adaptations. Weight packing happens during installation; activation scales, quantization and packing run online. Integer GEMM uses INT32 accumulation and a fused scale/bias/BF16 output epilogue. Compatible QKV/KV and gate/up projections share preparation. The native dispatch can combine activation preparation with GELU or SiLU-times-up; AdaLN modulation can produce the packed input directly. Fused SDPA remains floating point. No checkpoint, convolution layout, sampling schedule, observation or VLM-cache policy is changed by enabling quantization.
 
@@ -35,14 +35,15 @@ python scripts/serve_libero_protocol.py \
   --quantization-scope all --quantization-category-id 2
 ```
 
-This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` is a separate serial-only option: first calls and new tensor signatures capture graphs and must be excluded from timing. The current reference Graph helper is not suitable for concurrent S1/S2 capture. Enabled experimental optimizations therefore reject paired `--vlm-device` workers in one process; default BF16 paired workers remain supported. Close the optimization scope before changing weights or using the policy concurrently.
+This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` is a separate serial-only option for Flow and πR². It captures only the pure DiT forward; rolling buffers, noise, action decoding and the VLM remain eager: first calls and new tensor signatures capture graphs and must be excluded from timing. The current reference Graph helper is not suitable for concurrent S1/S2 capture. Enabled experimental optimizations therefore reject paired `--vlm-device` workers in one process; default BF16 paired workers remain supported. Close the optimization scope before changing weights or using the policy concurrently.
 
 - `--operator-fusion`: BF16 RoPE/RMSNorm, AdaLN modulation, and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
+- `--vision-channels-last`: independently opt into channels-last-3D inputs and weights for the vision patch Conv3D. This can avoid the `SlowDilated3d` fallback; it preserves tensor values but can change BF16 rounding. The original weight storage, layout and hooks are restored on exit. Compare fusion and integer modes with the same explicit layout setting and measure its action differences separately.
 - `--inference-precision {bf16,w8a8,w4a4}`: BF16 is the default; W4A4 is experimental and can substantially change actions.
 - `--quantization-scope transformer`: quantize selected vision/text/DiT transformer projections. `all` additionally selects other BF16 Linear modules, including conditioning and vocabulary projections; it does not skip logits or cache condition calculations.
 - `--quantization-category-id N`: with `scope=all`, quantize the fixed embodiment's category projections. Each call checks B1 and the actual ID; omitting the option leaves these projections in BF16. ID 2 is the LIBERO_PANDA mapping in the pinned model, not a universal embodiment ID.
 - `--group-conditioning`: with integer precision, fusion and `scope=all`, concatenate the DiT blocks' condition projections and final output-modulation projection using the reference `IntegerProjectionGroup`. They consume the same activated condition in this fused forward, so one preparation and GEMM serves all projections. Shared `[B,D]` and per-token `[B,T,D]` conditions retain their values; this is within one forward, with no reuse across denoising steps. Concatenated weights are packed at installation and require additional packed-weight storage. The option defaults off, requires complete coverage of the group to take effect, and records actual groups in the identity metadata. It does not establish streaming checkpoint or closed-loop quality. Measure both its complete group and full inference; the speedup of these small projections is not the speedup of every model GEMM.
-- `--quantization-coverage FILE`: optionally select recorded executed Linear sites using a JSON `linears` mapping with input `shape` fields. Without this file, the selected model inventory is used.
+- `--quantization-coverage FILE`: optionally select ordinary Linear sites using a JSON `linears` mapping keyed by module name. Input `shape` fields are needed only for legacy shape-based tactic lookup. Without this file, the selected model inventory is used; category projections are selected separately by `--quantization-category-id`.
 - `--quantization-tactics FILE`: optional `{"8": {"module.name": 0}, "4": {...}}` mapping. `--quantization-group-tactics FILE` accepts rows with `bits`, `members` and `tactic`; legacy shape rows additionally require explicit coverage. Tactics are integers 0–7. Unmatched entries use reference tactic 0, not a measured optimum. No past experiment directory is searched automatically.
 
 For an already loaded eval-mode BF16 CUDA policy, the same public interface is:
@@ -70,7 +71,7 @@ An optional RTX 6000 Ada preset for the pinned `GR00T-N1.7-LIBERO/libero_10` mod
 --quantization-group-tactics configs/quantization/groot-libero10-ada/group-tactics.json
 ```
 
-The preset covers 469 executed Linear sites and seven fixed-category projections, with separate choices for W8A8 and W4A4. Calibration used B1/H40 standard Flow4, the pinned model/backend, SDPA, shared fusion, DiT Graph and an experimental channels-last-3D Conv3D layout. The preset does not change that layout or model weights. Other input lengths, checkpoints or hardware require remeasurement; the configuration is never selected automatically. The backend performs INT8-by-INT8 or packed INT4-by-INT4 Tensor Core GEMM with INT32 accumulation. Floating scales, bias and BF16 output conversion are fused into its epilogue; floating SDPA is outside the integer GEMM claim.
+The preset covers 469 executed Linear sites and seven fixed-category projections, with separate choices for W8A8 and W4A4. Calibration used B1/H40 standard Flow4, the pinned model/backend, SDPA, shared fusion, DiT Graph and a channels-last-3D Conv3D layout. The preset does not select that layout; it requires the separate `--vision-channels-last` option. Other input lengths, checkpoints or hardware require remeasurement; the configuration is never selected automatically. The backend performs INT8-by-INT8 or packed INT4-by-INT4 Tensor Core GEMM with INT32 accumulation. Floating scales, bias and BF16 output conversion are fused into its epilogue; floating SDPA is outside the integer GEMM claim.
 
 To recalibrate, collect executed input shapes on a representative full call, then compare reference tactics 0–7 on actual packed activations and weights using CUDA Graph event timing. Retain raw repetitions and check every candidate against the same-precision reference before choosing a tactic. Export module-name entries and exact group-member entries in the formats above. Recheck complete policy outputs after loading the files in a fresh process, and measure BF16, previous and candidate configurations in one randomized, matched GPU session. Isolated repeated-GEMM timings have different cache behavior from a full policy; a microbenchmark winner alone is not evidence of a full-policy improvement.
 
@@ -80,10 +81,35 @@ Lightweight public CI runs only the configuration and restoration contracts. Exp
 
 ```bash
 PIR2_GPU_TESTS=1 python -m pytest -q \
-  coexecution/test_groot_fusion_gpu.py coexecution/test_quantization_gpu.py
+  coexecution/test_groot_fusion_gpu.py coexecution/test_quantization_gpu.py \
+  coexecution/test_groot_vision_layout_gpu.py
 ```
 
 Kernel agreement at a fixed precision does not establish quantization quality versus BF16 or robot-task success. Preserve raw evidence outside Git and report unexecuted streaming/closed-loop checks in the PR. Source and license attribution is recorded in [third-party notices](../THIRD_PARTY_NOTICES.md).
+
+### Serial streaming validation
+
+Use a Spatial πR² checkpoint produced by the [training recipe](../docs/libero.md),
+then compare the same checkpoint with BF16, fusion BF16, W8A8 and W4A4. Supply
+`--variant pir2` to the server above, omit `--group-conditioning`, and regenerate
+packed weights from the selected checkpoint. Compare eager execution first, then
+enable `--dit-cuda-graph` explicitly. Keep the same Graph setting across precision
+comparisons; changed input signatures recapture and require separate warmup.
+The Long/Flow tactic preset is not a calibrated Spatial/streaming configuration.
+
+Before model-quality evaluation, the following opt-in check runs the actual
+pinned action-head implementation with a small AlternateVLDiT and synthetic
+inputs. It exercises bootstrap, changing slide sizes and image delays, fresh
+visual features, reset and restoration. Graph checks also change context length and
+mask values, preserve earlier outputs, and verify normal and exceptional cleanup.
+Fusion is compared with unfused execution
+at the same precision; the trace checks INT8/INT4 kernel execution. It bypasses
+the VLM and uses random weights, so it establishes neither task accuracy nor
+production-model speedup:
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_groot_streaming_gpu.py
+```
 
 ## Measured LIBERO queue reports
 

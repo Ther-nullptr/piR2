@@ -197,7 +197,10 @@ def main():
     print(
         "Starting full Spatial adaptation", args.variant, "global_batch=64", flush=True
     )
-    experiment.run(cfg)
+    from libero_model_loading import task_checkpoint_backbone
+
+    with task_checkpoint_backbone():
+        experiment.run(cfg)
 
 
 if __name__ == "__main__":

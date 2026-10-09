@@ -14,7 +14,7 @@ Prepare and patch GR00T source with `python3 tools/prepare_sources.py --componen
 .venv/bin/python scripts/fetch_groot_spatial.py
 ```
 
-The downloader fixes both model and dataset revisions and copies the official modality configuration. It does not download every suite or training optimizer state. The Cosmos backbone must also be available through the authorized local cache before offline serving.
+The downloader fixes both model and dataset revisions and copies the official modality configuration. It does not download every suite or training optimizer state. Cosmos configuration and processor assets must also be available through the authorized local cache before offline serving. The training and protocol entrypoints load backbone weights from the complete task checkpoint; see the [loading boundary](environment.md).
 
 Create a separate Python 3.12 simulator environment at `.venv-pi05/` with hf-libero 0.1.4, robosuite 1.4.0, MuJoCo 3.8.1, NumPy, PyAV, Pillow, pyzmq and msgpack. Prepare LIBERO assets through its normal package instructions, then create the isolated local config:
 
