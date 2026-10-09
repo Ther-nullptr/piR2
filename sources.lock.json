@@ -16,6 +16,12 @@
       "revision": "ef4fefc13033c0468af4ef651847f5348af0c7d7",
       "path": "third_party/mujoco_playground",
       "patches": []
+    },
+    "robotics-kernels": {
+      "url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox.git",
+      "revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "path": "third_party/robotics-the-speedup-paradox",
+      "patches": []
     }
   }
 }

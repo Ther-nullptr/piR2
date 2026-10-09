@@ -15,6 +15,12 @@ from libero_experiment_utils import checkpoint_identity
 from libero_protocol_scheduler import extra_buffer_shift, project_commands
 from transformers import BatchFeature
 
+from coexecution.groot_optimization import (
+    GrootOptimizations,
+    add_optimization_arguments,
+    optimization_config,
+)
+
 KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
 
 
@@ -273,7 +279,10 @@ def main():
     parser.add_argument("--port", type=int, default=5570)
     parser.add_argument("--variant", choices=["flow", "pir2"], required=True)
     parser.add_argument("--role", choices=["action", "vlm"], default="action")
+    add_optimization_arguments(parser)
     args = parser.parse_args()
+    optimization = optimization_config(args)
+    optimization.validate_variant(args.variant)
     args.output.mkdir(parents=True, exist_ok=True)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
@@ -319,8 +328,20 @@ def main():
     server.register_endpoint("vision", backend.vision)
     server.register_endpoint("install", backend.install)
     server.register_endpoint("plan", backend.plan)
-    print("TIMED_PROTOCOL_SERVER_READY", args.variant, args.role, args.port, flush=True)
-    server.run()
+    with GrootOptimizations(core, optimization) as optimized:
+        if optimization.enabled:
+            identity["inference_optimization"] = optimized.evidence()
+            (args.output / "identity.json").write_text(
+                json.dumps(identity, indent=2) + "\n"
+            )
+        print(
+            "TIMED_PROTOCOL_SERVER_READY",
+            args.variant,
+            args.role,
+            args.port,
+            flush=True,
+        )
+        server.run()
 
 
 if __name__ == "__main__":
