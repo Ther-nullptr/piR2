@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from libero_protocol_scheduler import CommandTimeline, latency_budget, summarize_values
+from libero_queue_trace import LatestFrameMailbox, QueueTrace, feature_dependency
 
 
 @dataclass(frozen=True)
@@ -53,11 +54,10 @@ class RealClock:
 
 
 class VisionWorker:
-    def __init__(self, port):
+    def __init__(self, port, events=None):
         self.port = port
         self.condition = threading.Condition()
-        self.pending = None
-        self.latest = None
+        self.queue = LatestFrameMailbox(events or QueueTrace())
         self.stopping = False
         self.error = None
         self.submitted = 0
@@ -72,16 +72,19 @@ class VisionWorker:
 
     def offer(self, observation):
         with self.condition:
-            if self.pending is not None:
+            if self.queue.offer(observation) is not None:
                 self.skipped_frames += 1
-            self.pending = observation
             self.condition.notify()
+
+    def snapshot(self):
+        with self.condition:
+            return self.queue.snapshot()
 
     def ready(self, observation):
         with self.condition:
             if self.error is not None:
                 raise RuntimeError("VLM worker failed") from self.error
-            result = self.latest
+            result = self.queue.latest
             if result and (
                 result["meta"]["capture_s"] > observation.capture_s
                 or result["meta"]["source_tick"] > observation.tick
@@ -97,12 +100,11 @@ class VisionWorker:
             while True:
                 with self.condition:
                     self.condition.wait_for(
-                        lambda: self.stopping or self.pending is not None
+                        lambda: self.stopping or self.queue.pending is not None
                     )
                     if self.stopping:
                         break
-                    observation = self.pending
-                    self.pending = None
+                    observation = self.queue.take()
                     self.submitted += 1
                 start = time.monotonic()
                 result = client.call_endpoint(
@@ -132,7 +134,7 @@ class VisionWorker:
                 with self.condition:
                     self.completed += 1
                     result["sequence"] = self.completed
-                    self.latest = result
+                    self.queue.publish(result, rpc_completed_s=finished)
         except Exception as error:  # noqa: BLE001 -- propagate worker failures to the controller
             with self.condition:
                 self.error = error
@@ -144,10 +146,9 @@ class VisionWorker:
         with self.condition:
             if self.stop_time is None:
                 self.stop_time = time.monotonic() if cutoff is None else cutoff
-            if self.pending is not None:
+            if self.queue.drop_pending() is not None:
                 self.dropped_at_stop += 1
             self.stopping = True
-            self.pending = None
             self.condition.notify()
 
     def close(self):
@@ -172,8 +173,10 @@ class VisionWorker:
 
 
 class ActionWorker:
-    def __init__(self, port):
+    def __init__(self, port, events=None, initial_feature=None):
         self.port = port
+        self.events = events or QueueTrace()
+        self.initial_feature = initial_feature
         self.local = threading.local()
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.completed = []
@@ -207,13 +210,27 @@ class ActionWorker:
                 host="127.0.0.1", port=self.port, timeout_ms=120000
             )
             self.local.installed = -1
+            self.local.feature = self.initial_feature
         client = self.local.client
         started = time.monotonic()
+        selected = visual if visual is not None else self.local.feature
+        self.events.emit(
+            "action_started",
+            t_s=started,
+            request_tick=r,
+            state_tick=observation.tick,
+            state_capture_s=observation.capture_s,
+            delay_ticks=d,
+            submitted_s=submitted_s,
+            deadline_s=deadline_s,
+            **feature_dependency(selected),
+        )
         if visual is not None and visual["sequence"] != self.local.installed:
             client.call_endpoint(
                 "install", {"vl_embeds": visual["vl_embeds"], "meta": visual["meta"]}
             )
             self.local.installed = visual["sequence"]
+            self.local.feature = visual
         plan_rpc_start = time.monotonic()
         result = client.call_endpoint(
             "plan",
@@ -226,11 +243,20 @@ class ActionWorker:
                 "output_scope": "native",
             },
         )
+        completed = time.monotonic()
+        actual_feature = {
+            "sequence": selected.get("sequence") if selected else None,
+            "meta": result["audit"]["cache"],
+        }
         result["client_timing"] = {
             "submitted_s": submitted_s,
             "started_s": started,
-            "completed_s": time.monotonic(),
+            "completed_s": completed,
             "deadline_s": deadline_s,
+            "plan_rpc_started_s": plan_rpc_start,
+            "state_tick": observation.tick,
+            "state_capture_s": observation.capture_s,
+            **feature_dependency(actual_feature),
             "cache_age_at_request_ms": max(
                 0.0, (plan_rpc_start - result["audit"]["cache"]["capture_s"]) * 1000
             ),
@@ -238,6 +264,21 @@ class ActionWorker:
                 0.0, (plan_rpc_start - observation.capture_s) * 1000
             ),
         }
+        self.events.emit(
+            "action_completed",
+            t_s=completed,
+            request_tick=r,
+            state_tick=observation.tick,
+            state_capture_s=observation.capture_s,
+            delay_ticks=d,
+            deadline_s=deadline_s,
+            valid_start_tick=result["audit"]["valid_start_tick"],
+            valid_end_tick=result["audit"]["valid_end_tick"],
+            server_seconds=result["audit"]["server_seconds"],
+            request_elapsed_s=completed - submitted_s,
+            worker_elapsed_s=completed - started,
+            **feature_dependency(actual_feature),
+        )
         self.completed.append(result)
         return result
 
@@ -258,11 +299,31 @@ def run_control_loop(
     trace,
     record_video=False,
     clock=None,
+    events=None,
 ):
     """The actor/vision interfaces are injectable so clock contracts can be tested."""
     clock = clock or RealClock()
+    events = events or QueueTrace(clock=clock.now)
+    if isinstance(actor, ActionWorker):
+        actor.events = events
+    if isinstance(vision, VisionWorker):
+        vision.queue.events = events
     timeline = CommandTimeline(initial_plan)
     base = clock.now()
+    bootstrap_feature = {
+        "sequence": 0,
+        "meta": {"source_tick": 0, "capture_s": initial_capture_s},
+    }
+    events.emit(
+        "control_start",
+        t_s=base,
+        period_s=period,
+        max_steps=max_steps,
+        initial_delay_ticks=initial_delay,
+        initial_capture_s=initial_capture_s,
+        bootstrap_action_slots=len(initial_plan),
+        **feature_dependency(bootstrap_feature),
+    )
     next_data = copy_observation(initial)
     next_capture = initial_capture_s
     pending = None
@@ -317,11 +378,34 @@ def run_control_loop(
                 "client_timing": timing,
             }
             request_records.append(record)
-            trace.write(json.dumps(record) + "\n")
+            events.emit(**record)
+            events.emit(
+                "action_adopted",
+                request_tick=audit["request_tick"],
+                adopted_at_tick=tick,
+                installed_slots=publication.installed,
+                expired_slots=publication.expired,
+                protected_slots=publication.protected,
+                valid_start_tick=audit["valid_start_tick"],
+                valid_end_tick=audit["valid_end_tick"],
+                deadline_miss=late,
+            )
         if pending is None and tick >= next_request:
             prefix = timeline.reserve(tick, delay)
             visual = vision.ready(current)
             submitted = clock.now()
+            events.emit(
+                "action_submitted",
+                t_s=submitted,
+                request_tick=tick,
+                state_tick=current.tick,
+                state_capture_s=current.capture_s,
+                delay_ticks=delay,
+                deadline_s=base + (tick + delay) * period,
+                committed_start_tick=tick,
+                committed_end_tick=tick + delay,
+                **feature_dependency(visual or bootstrap_feature),
+            )
             pending = actor.submit(
                 current,
                 tick,
@@ -333,6 +417,8 @@ def run_control_loop(
             )
             next_request = tick + delay
         action, fallback, command_age = timeline.execute(tick)
+        buffer_snapshot = timeline.snapshot()
+        camera_snapshot = vision.snapshot() if hasattr(vision, "snapshot") else None
         fallbacks += int(fallback)
         applied = clock.now()
         next_data, success, terminated = step_fn(action)
@@ -355,9 +441,13 @@ def run_control_loop(
             "command_age_ticks": command_age,
             "action_delay_budget_ticks": delay,
             "action_request_pending": pending is not None and not pending.done(),
+            "executed_slot": timeline.last_execution,
+            "action_buffer": buffer_snapshot,
+            "action_buffer_phase": "after_execute",
+            "camera_queue": camera_snapshot,
         }
         ticks.append(row)
-        trace.write(json.dumps(row) + "\n")
+        events.emit(t_s=applied, **row)
         if record_video:
             frames.append(next_data["video.image"].copy())
         if success or terminated:
@@ -367,6 +457,9 @@ def run_control_loop(
     else:
         clock.sleep_until(base + max_steps * period)
     controlled_end = clock.now()
+    events.emit(
+        "control_end", t_s=controlled_end, control_steps=len(ticks), reason=reason
+    )
     vision.request_stop(controlled_end)
     # Waiting is allowed only after the timed control episode has ended.
     if pending is not None:
@@ -378,27 +471,22 @@ def run_control_loop(
             ),
         )
         expired += expired_at_end
-        trace.write(
-            json.dumps(
-                {
-                    "kind": "unused_result_at_episode_end",
-                    "expired_before_episode_end": expired_at_end,
-                    "unneeded_future_slots": len(result["actions"]) - expired_at_end,
-                    "audit": result["audit"],
-                    "client_timing": result["client_timing"],
-                }
-            )
-            + "\n"
+        events.emit(
+            "unused_result_at_episode_end",
+            expired_before_episode_end=expired_at_end,
+            unneeded_future_slots=len(result["actions"]) - expired_at_end,
+            audit=result["audit"],
+            client_timing=result["client_timing"],
         )
     actor.close()
     vlm_stats = vision.close()
     for timing, elapsed in zip(
         vlm_stats.get("rpc_times", []), vlm_stats.get("rpc_seconds", []), strict=True
     ):
-        trace.write(
-            json.dumps({"kind": "vision_request", "rpc_seconds": elapsed, **timing})
-            + "\n"
+        events.emit(
+            "vision_request", t_s=timing["completed_s"], rpc_seconds=elapsed, **timing
         )
+    events.flush(trace)
     metric_summary = summarize_values
 
     completed = actor.completed
@@ -433,6 +521,11 @@ def run_control_loop(
         "control_period_valid": period_valid,
         "actual_control_intervals_seconds": metric_summary(intervals),
         "controlled_wall_seconds": controlled_end - base,
+        "controlled_start_s": base,
+        "controlled_end_s": controlled_end,
+        "physical_control_seconds": len(ticks) * period,
+        "first_success_tick": ticks[-1]["tick"] if success else None,
+        "measurement_mode": "success_terminated_closed_loop",
         "control_lateness_seconds": metric_summary(lateness),
         "control_deadline_misses_over5ms": sum(x > 0.005 for x in lateness),
         "environment_step_seconds": metric_summary(
@@ -501,6 +594,7 @@ def calibrate(client, observation, capture_s, seed, period, visual, port):
     )
     queue = CommandTimeline(boot["actions"])
     samples = []
+    raw_samples = []
     actor = ActionWorker(port)
     try:
         for tick in range(12):
@@ -518,6 +612,14 @@ def calibrate(client, observation, capture_s, seed, period, visual, port):
                 submitted,
             ).result()
             elapsed = result["client_timing"]["completed_s"] - submitted
+            raw_samples.append(
+                {
+                    "sample_index": tick,
+                    "excluded": tick < 2,
+                    "rpc_seconds": elapsed,
+                    "server_seconds": result["audit"]["server_seconds"],
+                }
+            )
             if tick >= 2:
                 samples.append(elapsed)
             queue.publish(
@@ -532,11 +634,17 @@ def calibrate(client, observation, capture_s, seed, period, visual, port):
     d, ood = latency_budget(float(np.percentile(samples, 95)) + 0.005, period)
     return d, {
         "sample_count": len(samples),
+        "raw_samples": raw_samples,
+        "action_rpc_seconds": samples,
+        "action_server_seconds": [
+            row["server_seconds"] for row in raw_samples if not row["excluded"]
+        ],
         "p95_rpc_seconds": float(np.percentile(samples, 95)),
         "margin_seconds": 0.005,
         "selected_delay_ticks": d,
         "over_training_budget": ood,
         "includes_cache_install_and_thread_queue": True,
+        "workload": "solo_action_with_cache_install_without_concurrent_vlm",
         "scope": "warm GPU/RPC timing; reset and fresh sensor capture follow before scored control",
     }
 
@@ -551,7 +659,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
 
         slow = PolicyClient(host="127.0.0.1", port=args.slow_port, timeout_ms=120000)
         records = []
-        for _ in range(2):
+        for sample_index in range(getattr(args, "slow_warmup_calls", 12)):
             started = time.monotonic()
             visual = slow.call_endpoint(
                 "vision",
@@ -566,14 +674,25 @@ def deployment_episode(env, observation, client, args, seed, trace):
             records.append(
                 {
                     "rpc_seconds": time.monotonic() - started,
+                    "sample_index": sample_index,
+                    "excluded": sample_index < 2,
                     "vlm_seconds": visual["meta"]["vlm_seconds"],
                     "vlm_forward_calls": 1,
                 }
             )
-        del slow
+        slow.socket.close()
+        slow.context.term()
         args.slow_warmup = {
             "scope": "outside scored control, repeated for each condition/process",
             "calls": records,
+            "workload": "solo_vlm_without_concurrent_action",
+            "included_sample_count": sum(not row["excluded"] for row in records),
+            "rpc_seconds": summarize_values(
+                [row["rpc_seconds"] for row in records if not row["excluded"]]
+            ),
+            "server_vlm_seconds": summarize_values(
+                [row["vlm_seconds"] for row in records if not row["excluded"]]
+            ),
         }
         (args.output / "slow-warmup.json").write_text(
             json.dumps(args.slow_warmup, indent=2) + "\n"
@@ -603,8 +722,16 @@ def deployment_episode(env, observation, client, args, seed, trace):
             "seed": seed,
         },
     )
-    actor = ActionWorker(args.port)
-    vision = VisionWorker(args.slow_port)
+    events = QueueTrace()
+    actor = ActionWorker(
+        args.port,
+        events=events,
+        initial_feature={
+            "sequence": 0,
+            "meta": {"capture_s": capture, "source_tick": 0},
+        },
+    )
+    vision = VisionWorker(args.slow_port, events=events)
 
     def advance(action):
         from evaluate_libero_protocol import checked_env_step
@@ -627,6 +754,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
             args.max_steps,
             trace,
             args.record_video,
+            events=events,
         )
     finally:
         if gc_was_enabled:
@@ -636,5 +764,6 @@ def deployment_episode(env, observation, client, args, seed, trace):
     result["bootstrap_seconds"] = boot["bootstrap_seconds"]
     result["bootstrap_forward_counts"] = boot["forward_counts"]
     result["calibration"] = calibration
+    result["visual_solo_calibration"] = args.slow_warmup
     result["cyclic_gc_disabled_during_control"] = True
     return result, frames

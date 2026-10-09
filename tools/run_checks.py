@@ -24,6 +24,7 @@ def main():
         "coexecution/test_timeline.py",
         "coexecution/test_attribution.py",
         "coexecution/test_adapter_lifecycle.py",
+        "scripts/test_libero_inference_backend.py",
     ]
     tests = [x for x in contracts if (ROOT / x).is_file()]
     if tests:
@@ -32,7 +33,16 @@ def main():
         )
     if (ROOT / "simulator/model.test.cjs").is_file():
         subprocess.run(
-            ["node", "--test", "simulator/model.test.cjs"], cwd=ROOT, check=True
+            [
+                "node",
+                "--test",
+                *[
+                    str(p.relative_to(ROOT))
+                    for p in sorted((ROOT / "simulator").glob("*.test.cjs"))
+                ],
+            ],
+            cwd=ROOT,
+            check=True,
         )
     print("Repository syntax and available scheduling/accounting contracts passed.")
 

@@ -13,6 +13,25 @@ Deployment keeps control independent from unfinished RPCs. An observation comput
 
 Warm-up and full request calibration occur outside scored control. Control frequency, policy query frequency and plan publication frequency are separate metrics. Record action/VLM latency, actual cache age, state/image timestamp difference, control lateness, expired/fallback slots and recovery counts. Quantiles are calculated from raw requests, not averaged episode quantiles.
 
+For a hardware scan, the evaluator accepts `--task-ids 0 3 --episodes-per-task 1 --max-steps 300 --no-video`. The default still selects all ten Spatial tasks. A selected subset is labelled `selected_task_subset`, and its expected episode count uses only those tasks. Episodes retain ordinary first-success/environment-termination semantics: `physical_control_seconds` and the deployment `controlled_start_s`/`controlled_end_s` report actual exposure; a 300-tick cap does not promise 15 seconds after an early success. Subset success is not a full-suite result.
+
+Deployment calibration stores all 12 action samples in `calibration.json`, marking the first two as excluded; `action_rpc_seconds` and `action_server_seconds` contain the ten included samples. The action budget remains `min(5, ceil((p95 RPC + 0.005) / 0.05))`, with an explicit over-budget flag. `slow-warmup.json` similarly keeps every visual RPC/server sample and marks the first two excluded. `--slow-warmup-calls` defaults to 12. These are solo warm calibration measurements; concurrent-control latency comes from the episode trace.
+
+Measured queue traces retain the existing `control_tick`, `request_completed`, `unused_result_at_episode_end` and `vision_request` row kinds. New lifecycle rows add `schema_version: 1`, a unique insertion-order `seq`, and `t_s` in the same host monotonic-clock domain as worker RPC and controller timestamps. Threads collect detached metadata in memory; JSON/file I/O occurs after timed control and worker drain. Row order is insertion order, so timeline viewers use each event's timestamp instead of assuming timestamps increase with `seq`.
+
+| Event / field | Meaning |
+|---|---|
+| `control_start`, `control_end` | Bounds of the scored wall-clock interval; drain work can complete after its end |
+| `camera_offered`, `camera_replaced`, `camera_dropped` | Actual latest-frame mailbox transitions, keyed by `source_tick`/`capture_s`; replacement identifies `replacement_source_tick` |
+| `vision_started`, `feature_published` | In-flight frame ownership and feature availability; publication records `feature_sequence`, actual publish `t_s`, and separate `rpc_completed_s` |
+| `camera_queue` | Waiting/in-flight ticks and capture times, plus the asynchronous worker's published feature sequence/source/capture time |
+| `action_submitted`, `action_started`, `action_completed` | Request lifecycle keyed by `request_tick`; every stage records state and selected/consumed feature dependencies; completion uses the server's actual cache audit |
+| `action_adopted` | Controller tick accepting a result, including installed, expired and protected slot counts |
+| `control_tick.executed_slot` | Producer metadata for the command just applied |
+| `control_tick.action_buffer` | Detached remaining-slot ownership after execution, with `committed_until` and `slots` |
+
+Each slot reports `tick`, `status` (`future`, `committed` or `fallback`), `committed`, `fallback`, `producer_kind` and `producer_request_tick`. Bootstrap and fallback slots have no model request producer; a fallback's `reserved_at_tick` records when the hold command was committed. Sequence 0 in `control_start` and action dependencies denotes the bootstrap feature; the asynchronous camera worker begins at sequence 1. Request metadata includes `state_tick`, `state_capture_s`, `feature_sequence`, `feature_source_tick`, `feature_capture_s`, `delay_ticks` and `deadline_s`. Traces contain metadata and executed actions, never images or embeddings.
+
 Strict timing validity requires mean frequency within 2% of 20Hz, maximum control lateness at most 5ms and adjacent interval error at most 5ms. All episodes remain in the success-rate denominator, including timing-invalid episodes. Deployment timing runs without concurrent training; the adopted-client supervisor temporarily suspends training and waits for its GPU to become quiet before deployment, then resumes it.
 
 The local LIBERO wrapper clears accumulated object-property samplers before hard model reload. This fixes non-reproducible fixture placement without changing task success predicates. Actual fixture-model, settled simulator-state and initial RGB hashes are compared across methods, rather than assuming seed/init-state equality suffices.
