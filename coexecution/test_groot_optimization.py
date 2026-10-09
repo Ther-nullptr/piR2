@@ -50,6 +50,27 @@ def test_category_requires_expanded_scope():
         OptimizationConfig(scope="all", category_id=-1)
 
 
+def test_condition_grouping_requires_shared_condition_path():
+    for options in ({}, {"precision": "w8a8"}, {"precision": "w8a8", "fusion": True}):
+        with pytest.raises(ValueError, match="Condition grouping"):
+            OptimizationConfig(group_conditioning=True, **options)
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            [
+                "--inference-precision",
+                "w4a4",
+                "--operator-fusion",
+                "--quantization-scope",
+                "all",
+                "--group-conditioning",
+            ]
+        )
+    )
+    assert config.group_conditioning
+
+
 def test_empty_integer_coverage_is_rejected_before_gpu_install(tmp_path, monkeypatch):
     coverage = tmp_path / "coverage.json"
     coverage.write_text('{"linears": {"old.name": {}}}')

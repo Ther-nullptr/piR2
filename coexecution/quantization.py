@@ -149,8 +149,19 @@ class PreparedLinear(IntegerLinear):
 
 
 class TransformerINT:
-    def __init__(self, model, executed, native=False, expanded=False):
+    def __init__(
+        self, model, executed, native=False, expanded=False, condition_group=False
+    ):
         sites, groups, activations, text = inventory(model, expanded)
+        if condition_group:
+            dit = model.action_head.model
+            names = {id(module): name for name, module in model.named_modules()}
+            # PointwiseFusion passes the same activated condition to every block
+            # and the output modulation. Reuse the reference projection group.
+            groups.append(
+                [names[id(block.norm1.linear)] for block in dit.transformer_blocks]
+                + [names[id(dit.proj_out_1)]]
+            )
         self.sites = {n: s for n, s in sites.items() if n in executed}
         self.groups = [g for g in groups if all(n in self.sites for n in g)]
         self.activations = [a for a in activations if a[2] in self.sites]
@@ -233,6 +244,10 @@ class TransformerINT:
         return q.forward_packed(prepare(x, q.bits, lut, up))
 
     def set(self, mode):
+        for groups in self.grouped.values():
+            for _, group in groups:
+                group._input = group._output = None
+                group._remaining.clear()
         for m, attr, had, original in self.saved:
             if had:
                 setattr(m, attr, original)
@@ -246,7 +261,6 @@ class TransformerINT:
         for name, (m, _, _) in self.sites.items():
             m.forward = linears[name].forward
         for names, group in self.grouped[bits]:
-            assert group._input is None
             for i, name in enumerate(names):
                 self.sites[name][0].forward = lambda x, g=group, i=i: g.project(x, i)
         for activation, attr, down, approximate in self.activations:

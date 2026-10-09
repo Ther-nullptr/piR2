@@ -22,6 +22,7 @@ class OptimizationConfig:
     coverage: Path | None = None
     tactics: Path | None = None
     group_tactics: Path | None = None
+    group_conditioning: bool = False
 
     def __post_init__(self):
         if self.precision not in ("bf16", "w8a8", "w4a4"):
@@ -32,6 +33,12 @@ class OptimizationConfig:
             raise ValueError("Category ID must be nonnegative")
         if self.category_id is not None and self.scope != "all":
             raise ValueError("Category projections require scope=all")
+        if self.group_conditioning and (
+            not self.fusion or self.scope != "all" or self.precision == "bf16"
+        ):
+            raise ValueError(
+                "Condition grouping requires fusion, scope=all and integer precision"
+            )
 
     @property
     def enabled(self):
@@ -58,6 +65,7 @@ def add_optimization_arguments(parser):
     parser.add_argument("--quantization-coverage", type=Path)
     parser.add_argument("--quantization-tactics", type=Path)
     parser.add_argument("--quantization-group-tactics", type=Path)
+    parser.add_argument("--group-conditioning", action="store_true")
 
 
 def optimization_config(args):
@@ -70,6 +78,7 @@ def optimization_config(args):
         coverage=args.quantization_coverage,
         tactics=args.quantization_tactics,
         group_tactics=args.quantization_group_tactics,
+        group_conditioning=args.group_conditioning,
     )
 
 
@@ -176,7 +185,13 @@ class GrootOptimizations:
             }
             if not sites.keys() & executed.keys() and not categories:
                 raise ValueError("Quantization selected no matching projections")
-            controller = TransformerINT(model, executed, native=True, expanded=expanded)
+            controller = TransformerINT(
+                model,
+                executed,
+                native=True,
+                expanded=expanded,
+                condition_group=self.config.group_conditioning,
+            )
             self.stack.callback(controller.close)
             extra = AdditionalConnections(self.policy, controller, categories)
             self.stack.callback(extra.close)
@@ -188,6 +203,7 @@ class GrootOptimizations:
                 "category_linears": sorted(categories),
                 "scope": self.config.scope,
                 "category_id": self.config.category_id,
+                "projection_groups": controller.groups,
                 "tactic_policy": "Explicit entries reused; unmatched entries use 0",
             }
         if self.config.dit_graph:

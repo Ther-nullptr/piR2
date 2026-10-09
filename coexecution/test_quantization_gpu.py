@@ -17,7 +17,7 @@ import torch
 from robotics_kernels.ampere_ada.integer import prepare_activation
 from robotics_kernels.common.fused import prepare_gelu
 
-from coexecution.quantization import TransformerINT, prepare
+from coexecution.quantization import TransformerINT, inventory, prepare
 from coexecution.quantization_connections import AdditionalConnections, DitGraphs
 
 
@@ -81,6 +81,49 @@ def test_integer_linear_matches_quantized_reference_and_restores(bits, native):
         adapter.close()
     assert "forward" not in linear.__dict__
     equal(model(x), original)
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("tokens", [1, 41])
+@torch.inference_mode()
+def test_condition_group_reuses_pack_and_gemm_and_releases_inputs(bits, tokens):
+    dit = torch.nn.Module()
+    blocks = [torch.nn.Module(), torch.nn.Module()]
+    for block in blocks:
+        block.norm1 = Norm(64)
+    dit.transformer_blocks = torch.nn.ModuleList(blocks)
+    dit.proj_out_1 = torch.nn.Linear(64, 128, device="cuda", dtype=torch.bfloat16)
+    model = torch.nn.Module()
+    model.action_head = torch.nn.Module()
+    model.action_head.model = dit
+    sites = inventory(model, expanded=True)[0]
+    modules = [site[0] for site in sites.values()]
+    condition = torch.randn(
+        (1, 64) if tokens == 1 else (1, tokens, 64), device="cuda", dtype=torch.bfloat16
+    )
+    adapter = TransformerINT(
+        model, sites, native=True, expanded=True, condition_group=True
+    )
+    try:
+        for _ in range(2):
+            expected = [adapter.quant[bits][name](condition) for name in sites]
+            adapter.set(f"w{bits}a{bits}")
+            with patch.object(adapter, "dispatch", wraps=adapter.dispatch) as dispatch:
+                actual = [module(condition) for module in modules]
+                assert dispatch.call_count == 1
+            for value, reference in zip(actual, expected):
+                equal(value, reference)
+            group = adapter.grouped[bits][0][1]
+            assert group._input is None and group._output is None
+            condition.add_(0.25)
+        # A forward interrupted before the other projections must release its cache.
+        modules[0](condition)
+        assert group._input is condition
+    finally:
+        adapter.close()
+    assert group._input is None and group._output is None
+    assert not group._remaining
+    assert all("forward" not in module.__dict__ for module in modules)
 
 
 @pytest.mark.parametrize("bits", [8, 4])
