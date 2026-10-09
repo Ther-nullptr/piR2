@@ -73,7 +73,7 @@
       stateCapture = null;
     if (tick && !tick.fallback && !slot?.fallback) {
       if (slot?.producer_kind === "bootstrap") {
-        imageCapture = initial.feature_capture_s ?? episode.initial_capture_s;
+        imageCapture = initial.feature_capture_s ?? null;
         stateCapture = episode.initial_capture_s;
       } else if (executedRequest) {
         imageCapture = executedRequest.feature_capture_s;

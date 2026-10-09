@@ -145,3 +145,11 @@ test("calibration message uses solo means and exports only concise hardware fiel
   assert.equal(m.type, "pir2:load-solo-calibration");
   assert.equal(m.hardware.command, undefined);
 });
+
+test("unknown bootstrap image capture never inherits the state timestamp", () => {
+  const missing = structuredClone(episode);
+  missing.initial_feature.feature_capture_s = null;
+  const snapshot = M.stateAt(missing, 0.05);
+  assert.equal(snapshot.imageAgeMs, null);
+  assert.equal(snapshot.stateAgeMs, 250);
+});
