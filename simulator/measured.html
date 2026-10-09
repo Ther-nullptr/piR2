@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>πR² · LIBERO 实测队列回放</title>
+    <style>
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+      }
+      .player {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        background: #f1f5fa;
+        padding: 13px;
+        border-radius: 8px;
+      }
+      .player output {
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+        min-width: 170px;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 10px;
+        margin: 16px 0;
+      }
+      .dot {
+        display: inline-block;
+        width: 11px;
+        height: 11px;
+        border-radius: 2px;
+        margin-right: 5px;
+      }
+      .s1dot {
+        background: var(--s1);
+      }
+      .s2dot {
+        background: var(--s2);
+      }
+      .readydot {
+        background: #c4dcf2;
+      }
+      .fallbackdot {
+        background: #b72f3b;
+      }
+      .bootstrapdot {
+        background: repeating-linear-gradient(
+          45deg,
+          #e9e1fa,
+          #e9e1fa 3px,
+          #a48ac4 4px,
+          #a48ac4 5px
+        );
+      }
+      .buffer {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(67px, 1fr));
+        gap: 5px;
+        min-height: 50px;
+      }
+      .slot {
+        border: 1px solid #92b9dc;
+        background: #e9f2fa;
+        border-radius: 5px;
+        padding: 7px 4px;
+        text-align: center;
+        position: relative;
+        color: #21537d;
+        font-size: 12px;
+      }
+      .slot small {
+        display: block;
+        font-size: 10px;
+        margin-top: 2px;
+      }
+      .slot.committed {
+        border: 3px solid #2166ac;
+        padding: 5px 2px;
+        background: #cde2f5;
+      }
+      .slot.bootstrap {
+        color: #6b458f;
+        background: repeating-linear-gradient(
+          45deg,
+          #f3edfa,
+          #f3edfa 5px,
+          #e2d3f0 5px,
+          #e2d3f0 7px
+        );
+      }
+      .slot.fallback {
+        background: #fee1e4;
+        color: #922332;
+        border-color: #b72f3b;
+      }
+      .chart {
+        width: 100%;
+        display: block;
+        overflow: visible;
+      }
+      .split {
+        display: grid;
+        grid-template-columns: 1.35fr 1fr;
+        gap: 22px;
+      }
+      .model {
+        background: #f9f6ef;
+        border-color: #dfd1ad;
+      }
+      .model .badge {
+        color: #83611f;
+        border-color: #c8aa62;
+      }
+      .model .card {
+        background: white;
+      }
+      .methods p {
+        font-size: 13px;
+        line-height: 1.65;
+        margin: 8px 0;
+      }
+      .methods b {
+        color: #253e5c;
+      }
+      .kpi {
+        font-size: 25px;
+        font-weight: 700;
+        letter-spacing: -0.8px;
+      }
+      .empty {
+        padding: 15px;
+        color: #657184;
+      }
+      .subtle {
+        font-size: 11px;
+        letter-spacing: 1px;
+        color: #617489;
+        text-transform: uppercase;
+      }
+      @media (max-width: 900px) {
+        .cards {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        .split {
+          grid-template-columns: 1fr;
+        }
+        main {
+          padding: 15px;
+        }
+        .panel {
+          padding: 15px;
+        }
+        .player {
+          flex-wrap: wrap;
+        }
+        h1 {
+          font-size: 25px;
+        }
+      }
+      .embedded header,
+      .embedded .static-gallery {
+        display: none;
+      }
+      .embedded main {
+        padding: 8px;
+      }
+      .selected-dependency {
+        outline: 3px solid #e2ad28;
+      }
+      #dependency-detail {
+        min-height: 2em;
+      }
+      .chart {
+        touch-action: pan-y;
+      }
+      .scroll table {
+        min-width: 850px;
+      }
+      .measured-observation .player {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        box-shadow: 0 3px 8px #172b4d15;
+        margin-bottom: 12px;
+      }
+      .observation-heading {
+        margin: 12px 0 4px;
+      }
+      .measured-observation {
+        margin-bottom: 24px;
+      }
+    </style>
+    <style>
+      /*SHARED_STYLES*/
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="badge">真实 CUDA 运行 · NVIDIA GR00T · LIBERO Spatial</span>
+      <h1>πR² 实测队列与信息年龄</h1>
+      <p>
+        回放真实相机、视觉缓存、DiT 请求和执行动作的来源。图中的请求条表示主机
+        RPC 时间；GPU 内核是否重叠需要独立 profile 证据。
+      </p>
+    </header>
+    <main>
+      <div id="error" role="alert"></div>
+      <section class="panel">
+        <div class="section-title">
+          <h2>真实实验回放 · 本地 LIBERO 调度</h2>
+          <span id="generated" class="muted"></span>
+        </div>
+        <div class="controls">
+          <label>部署<select id="layout"></select></label>
+          <label>频率 / 功率条件<select id="condition"></select></label>
+          <label>任务回合<select id="episode"></select></label>
+          <label
+            >时间窗口<select id="span">
+              <option value="0">完整回合（默认）</option>
+              <option value="1">游标附近 1 秒</option>
+              <option value="0.5">游标附近 0.5 秒</option>
+              <option value="2">游标附近 2 秒</option>
+            </select></label
+          >
+          <button id="counterpart" type="button">切换相同条件另一部署</button>
+        </div>
+        <div class="measured-observation">
+          <div class="player">
+            <button id="play" type="button">播放</button
+            ><input
+              id="time"
+              type="range"
+              min="0"
+              max="1"
+              step="0.001"
+              value="0"
+              aria-label="控制开始后的秒数"
+            /><output id="time-label"></output
+            ><label
+              >倍速<select id="speed">
+                <option>0.25</option>
+                <option selected>1</option>
+                <option>2</option>
+              </select></label
+            >
+          </div>
+          <h3 class="observation-heading">有来源编号的逐事件时序</h3>
+          <div class="legend chart-legend" id="measured-timeline-legend">
+            <span style="color: var(--s2)">■ S2 视觉</span
+            ><span style="color: var(--s1)">■ S1 动作</span
+            ><span>浅蓝：完成待领取</span><span>箭头：实际使用</span>
+          </div>
+          <p class="chart-caption">
+            S1[n].k 使用 S2-n 的特征；点击追溯。00 起编号，pre 表示窗口前。
+          </p>
+          <svg
+            id="timeline"
+            class="chart"
+            viewBox="0 0 1200 248"
+            role="img"
+            aria-label="缓存发布到实际 DiT 使用的依赖时间线"
+          ></svg>
+          <p id="dependency-detail" class="note" aria-live="polite"></p>
+          <h3 class="observation-heading">信息年龄 AoI · 队列与延迟</h3>
+          <div class="legend chart-legend" id="measured-aoi-legend">
+            <span style="color: var(--s2)">━ 最新缓存</span
+            ><span style="color: var(--s1)">━ 执行动作的图像</span
+            ><span style="color: var(--state)">━ 执行动作的状态</span>
+          </div>
+          <p class="chart-caption">
+            AoI＝当前时刻−来源采样时刻。点／菱形为读入年龄；未知来源留空。
+          </p>
+          <svg
+            id="queues"
+            class="chart"
+            viewBox="0 0 1200 500"
+            role="img"
+            aria-label="最新缓存、实际执行动作图像与状态的信息年龄，以及队列和延迟"
+          ></svg>
+        </div>
+        <h3>当前状态与动作槽</h3>
+        <p id="exposure" class="note"></p>
+
+        <div id="state" class="cards"></div>
+
+        <div class="section-title">
+          <h3>动作槽：最近已执行 tick 的 after_execute 快照</h3>
+          <span id="buffer-label" class="muted"></span>
+        </div>
+        <div id="buffer" class="buffer"></div>
+        <p class="note">
+          粗边框：已承诺；细边框：未来可替换；紫色：启动动作；红色：fallback。槽显示目标
+          tick 与实际生产它的 S1。快照保持到下一条真实记录，不提前展示未来状态。
+        </p>
+
+        <h3>本地 LIBERO：d 的每次超时与只增不减规则</h3>
+        <p class="note">
+          以下是这些实测记录所用的本地封装规则；论文的滚动均值估计在“机制仿真”页另列。仅在请求超时且被控制器消费时更新：d
+          ← max(d, min(5, ceil((完整 RPC + 5 ms) /
+          控制周期)))。随后更快的请求不会降低 d。微小越界也能锁定更高
+          d；这不能单独证明某个频点的硬件吞吐发生跃迁。
+        </p>
+        <div id="delay-explanation" class="note"></div>
+        <div class="scroll"><table id="delay-transitions"></table></div>
+      </section>
+      <section class="panel">
+        <h2>条件汇总与单 / 双卡对照</h2>
+        <div id="condition-kpis" class="cards"></div>
+        <div id="hardware"></div>
+        <div id="paired-comparison" class="scroll"></div>
+        <div class="controls">
+          <label
+            >横轴<select id="x-axis">
+              <option value="s2_solo_capacity_rps">S2 独占容量 / req/s</option>
+              <option value="s1_solo_capacity_rps">S1 独占容量 / req/s</option>
+              <option value="s2_effective_sm_mhz">S2 实际 SM / MHz</option>
+              <option value="s1_effective_sm_mhz">S1 实际 SM / MHz</option>
+              <option value="average_power_w">合计板卡功率 / W</option>
+            </select></label
+          >
+          <label
+            >纵轴<select id="y-axis">
+              <option value="used_cache_age_p95">
+                DiT 使用时图像年龄 p95 / ms
+              </option>
+              <option value="frame_replacement_fraction">等待帧替换比例</option>
+              <option value="fresh_slots_mean">S1 生产槽数均值</option>
+              <option value="d_mean">平均 d / tick</option>
+              <option value="s1_rpc_p95_ms">并发运行 S1 RPC p95 / ms</option>
+              <option value="s2_rpc_p95_ms">并发运行 S2 RPC p95 / ms</option>
+              <option value="fallback_fraction">fallback 比例</option>
+              <option value="joules_per_control_tick">
+                每控制 tick 板卡能耗 / J
+              </option>
+            </select></label
+          >
+        </div>
+        <svg
+          id="scatter"
+          class="chart"
+          viewBox="0 0 760 370"
+          role="img"
+          aria-label="全部真实频率与功率条件"
+        ></svg>
+        <p class="note">
+          独占容量为校准完整 RPC
+          均值的倒数。所有频点、基线重复和功率条件均保留为独立观测；申请的频率不等于实际频率。并发运行的
+          RPC 含通信、主机等待等，不能再次当成无干扰服务时间。
+        </p>
+        <div class="scroll"><table id="comparison"></table></div>
+        <details>
+          <summary>相同初始状态的配对证据</summary>
+          <div id="pairing"></div>
+        </details>
+      </section>
+      <section class="panel">
+        <h2>从独占校准建立可编辑假设</h2>
+        <p class="note">
+          只带入 S1 / S2 独占 RPC 均值、周期、相机频率与初始 d。共享干扰、CUDA
+          重叠、抖动等参数仍是假设，未经这些实测数据拟合。模型结果不预测 LIBERO
+          成功率。
+        </p>
+        <button id="load-calibration" type="button">
+          用独占校准建立假设情景</button
+        ><span id="calibration-status" class="note" aria-live="polite"></span>
+      </section>
+      <section class="panel static-gallery">
+        <h2>静态频率与功率曲线</h2>
+        <!--CORE-SWEEP--><!--POWER-SWEEP-->
+      </section>
+      <!--PROFILE_EVIDENCE-->
+      <section class="panel">
+        <h2>测量口径</h2>
+        <div id="methods"></div>
+        <details>
+          <summary>原始硬件元数据（本地）</summary>
+          <pre id="hardware-json" class="json"></pre>
+        </details>
+      </section>
+      <footer id="footer"></footer>
+    </main>
+    <script>
+      /*REPORT_DATA*/
+    </script>
+    <script>
+      /*MEASURED_MODEL*/
+    </script>
+    <script>
+      /*REPORT_APP*/
+    </script>
+  </body>
+</html>

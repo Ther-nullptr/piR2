@@ -101,3 +101,6 @@ dist/
 /coexecution/report_runtime.py
 /coexecution/fusion_candidates.py
 /coexecution/quantization_bounds.py
+
+# Optional downloaded webfonts; preserve license beside local assets.
+/simulator/fonts/

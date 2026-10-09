@@ -1,0 +1,351 @@
+/* Source Han Sans, SIL OFL 1.1; optional local font asset, see README. */
+@font-face {
+  font-family: "Source Han Sans CN VF";
+  src:
+    local("Source Han Sans CN VF"),
+    url("fonts/SourceHanSansCN-VF.ttf.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 250 900;
+  font-display: swap;
+}
+/* Shared visual language, derived from the measured replay. */
+:root {
+  --ui-font:
+    "Source Han Sans CN VF", "Source Han Sans SC", "Source Han Sans CN",
+    "思源黑体", "Noto Sans CJK SC", sans-serif;
+  --ink: #18263b;
+  --bg: #f3f5f8;
+  --line: #dde3eb;
+  --accent: #2166ac;
+  --s1-soft: #e7f0fa;
+  --s2-soft: #fff0e4;
+  --state: #27856b;
+  --repeat: #8055a0;
+  font-family: var(--ui-font);
+  color: #18263b;
+  background: #f3f5f8;
+  --s1: #2166ac;
+  --s2: #b65f14;
+  --red: #b72f3b;
+  --muted: #66758a;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+header,
+.top {
+  background: #14263e;
+  color: white;
+  padding: 30px max(24px, calc((100vw - 1440px) / 2));
+  border-bottom: 5px solid #6bc8b0;
+}
+header p,
+.top .subbrand,
+.top .offline {
+  color: #c4d3e6;
+  max-width: 1000px;
+  margin-bottom: 0;
+}
+h1 {
+  font-size: 30px;
+  letter-spacing: -1px;
+  margin: 10px 0;
+}
+h2 {
+  font-size: 20px;
+  letter-spacing: -0.4px;
+  margin: 0 0 12px;
+}
+h3 {
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 650;
+  margin: 0 0 7px;
+}
+.badge {
+  display: inline-block;
+  border: 1px solid #6bc8b0;
+  color: #9aead4;
+  font-size: 11px;
+  letter-spacing: 1.4px;
+  padding: 5px 8px;
+  border-radius: 4px;
+}
+main {
+  max-width: 1488px;
+  margin: 0 auto;
+  padding: 22px 24px 60px;
+}
+.panel {
+  min-width: 0;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 22px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 3px #172b4d04;
+}
+.muted,
+.note {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.note {
+  margin: 8px 0;
+}
+label {
+  font-size: 12px;
+  color: #53627a;
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+select,
+input[type="number"],
+button {
+  font: inherit;
+  background: white;
+  border: 1px solid #bcc7d5;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #15283f;
+}
+button {
+  cursor: pointer;
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+  min-width: 68px;
+}
+button:hover {
+  background: #184c82;
+}
+input[type="range"] {
+  accent-color: var(--accent);
+  min-width: 160px;
+  flex: 1;
+}
+input[type="number"] {
+  width: 100px;
+}
+.card,
+.metrics article {
+  border: 1px solid #dce4ee;
+  border-top: 3px solid #8ca0bb;
+  border-radius: 7px;
+  padding: 12px;
+  min-height: 99px;
+}
+.card.s1 {
+  border-top-color: var(--s1);
+}
+.card.s2 {
+  border-top-color: var(--s2);
+}
+.card strong,
+.metrics strong {
+  font-size: 16px;
+}
+.card p,
+.metrics small {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+.legend {
+  display: flex;
+  gap: 17px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #53627a;
+  margin: 12px 0;
+}
+.section-title,
+.panel-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.chart text,
+.queue-chart svg,
+.queue-slot,
+.queue-executed strong {
+  font-family: var(--ui-font);
+}
+.chart text {
+  font-size: 11px;
+  fill: #53627a;
+}
+.grid {
+  stroke: #e8ecf2;
+  stroke-width: 1;
+}
+.cursor {
+  stroke: #19283f;
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+.scroll {
+  overflow-x: auto;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+td,
+th {
+  padding: 9px 10px;
+  text-align: right;
+  border-bottom: 1px solid #e6ebf1;
+  white-space: nowrap;
+}
+td:first-child,
+th:first-child {
+  text-align: left;
+  position: sticky;
+  left: 0;
+  background: white;
+}
+th {
+  font-weight: 650;
+  color: #5d6c81;
+}
+tr.selected td {
+  background: #ecf5fb;
+}
+a {
+  color: var(--accent);
+}
+details {
+  margin: 14px 0;
+}
+summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.json {
+  max-height: 280px;
+  overflow: auto;
+  background: #edf1f6;
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+.good {
+  color: #16735b;
+}
+.warn {
+  color: #ac5127;
+}
+footer {
+  font-size: 12px;
+  color: #66758a;
+  padding: 5px;
+}
+#error {
+  color: #b72f3b;
+  white-space: pre-wrap;
+}
+/* Common controls and tokens; each view owns only its layout. */
+[hidden] {
+  display: none !important;
+}
+button,
+input,
+select {
+  font-family: var(--ui-font);
+}
+button,
+a,
+input,
+select {
+  outline-offset: 4px;
+}
+a {
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+input[type="range"] {
+  width: 100%;
+}
+output {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+.panel-title {
+  margin-bottom: 20px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.panel-title h2 {
+  margin: 0;
+}
+.notice,
+.chart-note {
+  background: #f1f5fa;
+  color: #53627a;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.player,
+.queue-observation-controls {
+  background: #f1f5fa;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 13px;
+  box-shadow: 0 3px 8px #172b4d15;
+}
+.queue-playback button {
+  font: inherit;
+  white-space: nowrap;
+}
+.tag,
+.mode-badge {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: #f1f5fa;
+}
+@media (max-width: 900px) {
+  .panel {
+    padding: 15px;
+  }
+  h1 {
+    font-size: 25px;
+  }
+}
+
+.chart-legend {
+  gap: 8px 16px;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.chart-caption {
+  margin: 4px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.queue-policy-notes summary {
+  margin: 0;
+}
+.queue-policy-notes[open] summary {
+  margin-bottom: 12px;
+}

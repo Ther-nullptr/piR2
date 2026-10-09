@@ -24,7 +24,10 @@ def main():
         "coexecution/test_timeline.py",
         "coexecution/test_attribution.py",
         "coexecution/test_adapter_lifecycle.py",
+        "coexecution/test_queue_report.py",
+        "coexecution/test_feature_usage.py",
         "scripts/test_libero_inference_backend.py",
+        "simulator/test_serve.py",
     ]
     tests = [x for x in contracts if (ROOT / x).is_file()]
     if tests:
