@@ -2,11 +2,14 @@
 
 import argparse
 import json
+import logging
 import os
 import threading
 from pathlib import Path
 
 from libero_inference_backend import Backend, endpoint_layout
+
+LOGGER = logging.getLogger(__name__)
 
 
 def load_core(checkpoint, output, device):
@@ -82,6 +85,7 @@ def supervise_workers(workers, worker_fn=serve):
         try:
             worker_fn(*worker)
         except BaseException as error:
+            LOGGER.exception("Paired inference endpoint exited with an error")
             errors.append(error)
         finally:
             finished.set()

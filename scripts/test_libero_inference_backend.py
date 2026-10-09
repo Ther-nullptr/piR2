@@ -1,7 +1,6 @@
 """Check paired device mapping without loading or validating a model on CPU."""
 
 import pytest
-
 from libero_inference_backend import endpoint_layout
 
 

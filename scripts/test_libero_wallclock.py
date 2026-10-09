@@ -4,9 +4,9 @@ import io
 import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
