@@ -60,6 +60,20 @@ with GrootOptimizations(policy, config) as optimized:
 # Original module forwards/processors are restored, including on failure.
 ```
 
+An optional RTX 6000 Ada preset for the pinned `GR00T-N1.7-LIBERO/libero_10` model is provided as [coverage](../configs/quantization/groot-libero10-ada/coverage.json), [single-projection tactics](../configs/quantization/groot-libero10-ada/tactics.json) and [group tactics](../configs/quantization/groot-libero10-ada/group-tactics.json). These are executable configuration inputs, not timing reports. Add the following options to the standard Flow invocation above, selecting `w4a4` instead for INT4:
+
+```bash
+--inference-precision w8a8 --operator-fusion --dit-cuda-graph \
+--quantization-scope all --quantization-category-id 2 --group-conditioning \
+--quantization-coverage configs/quantization/groot-libero10-ada/coverage.json \
+--quantization-tactics configs/quantization/groot-libero10-ada/tactics.json \
+--quantization-group-tactics configs/quantization/groot-libero10-ada/group-tactics.json
+```
+
+The preset covers 469 executed Linear sites and seven fixed-category projections, with separate choices for W8A8 and W4A4. Calibration used B1/H40 standard Flow4, the pinned model/backend, SDPA, shared fusion, DiT Graph and an experimental channels-last-3D Conv3D layout. The preset does not change that layout or model weights. Other input lengths, checkpoints or hardware require remeasurement; the configuration is never selected automatically. The backend performs INT8-by-INT8 or packed INT4-by-INT4 Tensor Core GEMM with INT32 accumulation. Floating scales, bias and BF16 output conversion are fused into its epilogue; floating SDPA is outside the integer GEMM claim.
+
+To recalibrate, collect executed input shapes on a representative full call, then compare reference tactics 0–7 on actual packed activations and weights using CUDA Graph event timing. Retain raw repetitions and check every candidate against the same-precision reference before choosing a tactic. Export module-name entries and exact group-member entries in the formats above. Recheck complete policy outputs after loading the files in a fresh process, and measure BF16, previous and candidate configurations in one randomized, matched GPU session. Isolated repeated-GEMM timings have different cache behavior from a full policy; a microbenchmark winner alone is not evidence of a full-policy improvement.
+
 The service records the configuration, replaced sites and tactic-file hashes in its local identity output. A complete comparison must include online activation preparation and checks, use matching fusion/layout/Graph settings for BF16 and integer variants, and record checkpoint/input identity. Profiled GPU duration sums, isolated GEMM timing, complete Linear timing and synchronized CPU-observation-to-action latency are different metrics. Installation, compilation, packing and Graph capture are reported separately. Old experiment measurements are not automatically performance claims for a different entrypoint or configuration.
 
 Lightweight public CI runs only the configuration and restoration contracts. Explicit local GPU checks use no model download:

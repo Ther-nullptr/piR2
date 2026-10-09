@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -190,3 +191,56 @@ def test_group_shape_tactics_require_explicit_coverage(tmp_path):
     assert grouped[4][0][1].linear.tactic == 3
     apply_tactics(controller, extra, config, {})
     assert grouped[4][0][1].linear.tactic == 0
+
+
+def test_ada_preset_loads_through_public_tactic_interface():
+    preset = (
+        Path(__file__).resolve().parents[1] / "configs/quantization/groot-libero10-ada"
+    )
+    coverage = json.loads((preset / "coverage.json").read_text())["linears"]
+    singles = json.loads((preset / "tactics.json").read_text())
+    rows = json.loads((preset / "group-tactics.json").read_text())
+    assert set(singles["8"]) == set(singles["4"])
+    assert set(coverage) <= set(singles["8"])
+    assert all(set(row["members"]) <= set(coverage) for row in rows)
+    controller = SimpleNamespace(
+        quant={
+            bits: {name: SimpleNamespace(tactic=-1) for name in coverage}
+            for bits in (8, 4)
+        },
+        grouped={
+            bits: [
+                (row["members"], SimpleNamespace(linear=SimpleNamespace(tactic=-1)))
+                for row in rows
+                if row["bits"] == bits
+            ]
+            for bits in (8, 4)
+        },
+    )
+    extra = SimpleNamespace(
+        quant={
+            bits: {
+                name: SimpleNamespace(tactic=-1)
+                for name in singles[str(bits)]
+                if name not in coverage
+            }
+            for bits in (8, 4)
+        }
+    )
+    apply_tactics(
+        controller,
+        extra,
+        OptimizationConfig(
+            tactics=preset / "tactics.json", group_tactics=preset / "group-tactics.json"
+        ),
+        coverage,
+    )
+    for bits in (8, 4):
+        actual = {**controller.quant[bits], **extra.quant[bits]}
+        assert {n: q.tactic for n, q in actual.items()} == singles[str(bits)]
+        expected = {
+            tuple(row["members"]): row["tactic"] for row in rows if row["bits"] == bits
+        }
+        assert {
+            tuple(n): g.linear.tactic for n, g in controller.grouped[bits]
+        } == expected
