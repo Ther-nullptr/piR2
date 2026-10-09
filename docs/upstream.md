@@ -27,6 +27,6 @@ its original license and hash manifest. Attribution is recorded in
 [environment.md](environment.md).
 
 这里复用参考实现的量化计算路径，不把它描述为新量化算法，也不将参考项目的任务成功率
-视为 GR00T 或 πR² 的质量结论。当前接入范围为标准 Flow；逐位置条件的适配器测试不等于
-训练后的 πR² 滚动推理或 LIBERO 闭环已验证。性能和质量报告必须注明真实模型、检查点、
+视为 GR00T 或 πR² 的质量结论。当前接入范围为标准 Flow 及串行 πR²；真实动作头的
+随机权重滚动测试不等于训练后检查点或 LIBERO 闭环已验证。性能和质量报告必须注明真实模型、检查点、
 输入、执行路径与测量范围。

@@ -13,6 +13,14 @@ Keep `.venv/`, `.venv-pi05/`, `.venv-sim/`, `.libero-config-pi05/`, weights and 
 
 Set CUDA_VISIBLE_DEVICES explicitly after inspecting GPU occupancy. Supply credentials through the standard local Hugging Face login, never through committed configuration. Host-specific EGL or libexpat fixes belong in the local shell environment, not shared source. GPU evaluation results must state source revisions, checkpoint identity, dataset, initialization and timing protocol.
 
+The Spatial training and protocol entrypoints construct the Qwen3-VL backbone from
+its configuration while loading a complete GR00T task checkpoint. Keep the backbone
+configuration and processor assets available; a separate copy of its base weights
+is unnecessary. The scoped loader preserves the requested dtype and attention
+implementation. Full-checkpoint validation still rejects missing, unexpected or
+mismatched weights, apart from the training adapter's explicitly initialized new
+streaming parameters. Do not use this loading context for a bare backbone checkpoint.
+
 ## Optional GR00T fusion and integer inference
 
 Use a separate Linux CUDA model environment for the experimental GR00T fusion and
@@ -51,7 +59,8 @@ install compatible prerequisites deliberately in the chosen environment. Keep
 the editable dependency checkout in place: its CUDA build reads the bundled
 headers and provenance at runtime. Review its [source and licensing boundaries](../THIRD_PARTY_NOTICES.md).
 
-The adapters are opt-in and currently scoped to the standard Flow entrypoint;
-they do not establish streaming πR² compatibility or closed-loop task quality.
+The adapters are opt-in for standard Flow and serial πR² inference, with optional pure-DiT CUDA Graph.
+Streaming condition grouping and paired optimized workers remain unsupported.
+Synthetic streaming checks do not establish trained-checkpoint or closed-loop quality.
 See [execution configuration and validation](../coexecution/README.md). GPU/model checks
 remain explicit local commands, not public CI dependencies.

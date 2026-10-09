@@ -24,11 +24,12 @@ def test_default_does_not_import_gpu_modules_or_touch_policy():
     before = set(sys.modules)
     with GrootOptimizations(object(), config) as scope:
         assert not scope.config.enabled
+        assert not config.vision_channels_last
         assert scope.evidence()["coverage"] == {}
     assert set(sys.modules) == before
 
 
-def test_flags_are_independent_and_streaming_is_explicitly_unsupported():
+def test_flags_are_independent_and_streaming_allows_eager_integer_inference():
     parser = argparse.ArgumentParser()
     add_optimization_arguments(parser)
     config = optimization_config(
@@ -39,9 +40,80 @@ def test_flags_are_independent_and_streaming_is_explicitly_unsupported():
     assert config.precision == "w4a4"
     assert not config.fusion and not config.dit_graph
     config.validate_variant("flow")
-    with pytest.raises(ValueError, match="streaming"):
-        config.validate_variant("pir2")
+    config.validate_variant("pir2")
     OptimizationConfig().validate_variant("pir2")
+
+
+def test_vision_layout_is_independent_and_opt_in():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(parser.parse_args(["--vision-channels-last"]))
+    assert config.vision_channels_last and config.enabled
+    assert config.precision == "bf16" and not config.fusion and not config.dit_graph
+    config.validate_variant("pir2")
+    config.validate_variant("flow")
+
+
+@pytest.mark.parametrize(
+    "training,dtype,device,message",
+    [
+        (True, "bf16", "cuda", "eval-mode BF16"),
+        (False, "fp32", "cuda", "eval-mode BF16"),
+        (False, "bf16", "cpu", "require CUDA"),
+    ],
+)
+def test_vision_layout_preserves_model_guards(
+    monkeypatch, training, dtype, device, message
+):
+    model = SimpleNamespace(
+        training=training,
+        parameters=lambda: iter(
+            [SimpleNamespace(dtype=dtype, device=SimpleNamespace(type=device))]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
+    with (
+        pytest.raises(ValueError, match=message),
+        GrootOptimizations(
+            SimpleNamespace(model=model), OptimizationConfig(vision_channels_last=True)
+        ),
+    ):
+        pytest.fail("Layout conversion cannot bypass the model guards")
+
+
+def test_streaming_allows_serial_dit_graph_and_rejects_condition_grouping():
+    OptimizationConfig(dit_graph=True).validate_variant("pir2")
+    config = OptimizationConfig(
+        precision="w8a8", fusion=True, scope="all", group_conditioning=True
+    )
+    config.validate_variant("flow")
+    with pytest.raises(ValueError, match="Streaming piR2"):
+        config.validate_variant("pir2")
+
+
+def test_streaming_condition_guard_also_applies_to_direct_scope(monkeypatch):
+    model = SimpleNamespace(
+        training=False,
+        config=SimpleNamespace(streaming=True),
+        parameters=lambda: iter(
+            [SimpleNamespace(dtype="bf16", device=SimpleNamespace(type="cuda"))]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
+    with (
+        pytest.raises(ValueError, match="Streaming piR2"),
+        GrootOptimizations(
+            SimpleNamespace(model=model),
+            OptimizationConfig(
+                precision="w8a8",
+                fusion=True,
+                scope="all",
+                group_conditioning=True,
+                vision_channels_last=True,
+            ),
+        ),
+    ):
+        pytest.fail("A direct scope cannot bypass the streaming condition restriction")
 
 
 def test_category_requires_expanded_scope():
@@ -190,6 +262,24 @@ def test_group_shape_tactics_require_explicit_coverage(tmp_path):
     apply_tactics(controller, extra, config, {"q": {"shape": [1, 41, 1536]}})
     assert grouped[4][0][1].linear.tactic == 3
     apply_tactics(controller, extra, config, {})
+    assert grouped[4][0][1].linear.tactic == 0
+
+
+@pytest.mark.parametrize("named_tactics", [False, True])
+def test_name_only_coverage_does_not_require_legacy_shapes(tmp_path, named_tactics):
+    groups = tmp_path / "groups.json"
+    groups.write_text(
+        json.dumps([{"bits": 8, "members": ["q", "k", "v"], "tactic": 2}])
+    )
+    grouped = {
+        bits: [(["q", "k", "v"], SimpleNamespace(linear=SimpleNamespace(tactic=7)))]
+        for bits in (8, 4)
+    }
+    controller = SimpleNamespace(quant={8: {}, 4: {}}, grouped=grouped)
+    extra = SimpleNamespace(quant={8: {}, 4: {}})
+    config = OptimizationConfig(group_tactics=groups if named_tactics else None)
+    apply_tactics(controller, extra, config, {name: {} for name in ("q", "k", "v")})
+    assert grouped[8][0][1].linear.tactic == (2 if named_tactics else 0)
     assert grouped[4][0][1].linear.tactic == 0
 
 

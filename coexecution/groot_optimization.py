@@ -23,6 +23,7 @@ class OptimizationConfig:
     tactics: Path | None = None
     group_tactics: Path | None = None
     group_conditioning: bool = False
+    vision_channels_last: bool = False
 
     def __post_init__(self):
         if self.precision not in ("bf16", "w8a8", "w4a4"):
@@ -42,14 +43,16 @@ class OptimizationConfig:
 
     @property
     def enabled(self):
-        return self.precision != "bf16" or self.fusion or self.dit_graph
+        return (
+            self.precision != "bf16"
+            or self.fusion
+            or self.dit_graph
+            or self.vision_channels_last
+        )
 
     def validate_variant(self, variant):
-        if self.enabled and variant != "flow":
-            raise ValueError(
-                "Experimental optimizations currently support standard Flow only; "
-                "streaming piR2 integration is not validated"
-            )
+        if variant == "pir2" and self.group_conditioning:
+            raise ValueError("Streaming piR2 condition grouping is not validated")
 
 
 def add_optimization_arguments(parser):
@@ -66,6 +69,7 @@ def add_optimization_arguments(parser):
     parser.add_argument("--quantization-tactics", type=Path)
     parser.add_argument("--quantization-group-tactics", type=Path)
     parser.add_argument("--group-conditioning", action="store_true")
+    parser.add_argument("--vision-channels-last", action="store_true")
 
 
 def optimization_config(args):
@@ -79,6 +83,7 @@ def optimization_config(args):
         tactics=args.quantization_tactics,
         group_tactics=args.quantization_group_tactics,
         group_conditioning=args.group_conditioning,
+        vision_channels_last=args.vision_channels_last,
     )
 
 
@@ -97,6 +102,7 @@ def apply_tactics(controller, extra, config, coverage):
     groups = read_json(config.group_tactics, [])
     for bits in (8, 4):
         models = {**controller.quant[bits], **extra.quant[bits]}
+        legacy = [row for row in groups if row["bits"] == bits and "shape" in row]
         for name, tactic in singles.get(str(bits), {}).items():
             if name in models:
                 models[name].tactic = checked_tactic(tactic)
@@ -107,7 +113,7 @@ def apply_tactics(controller, extra, config, coverage):
                 for row in groups
                 if row["bits"] == bits and row.get("members") == list(names)
             ]
-            if not matching and names[0] in coverage:
+            if not matching and legacy and names[0] in coverage:
                 shape = coverage[names[0]]["shape"]
                 signature = [
                     math.prod(shape[:-1]),
@@ -115,11 +121,7 @@ def apply_tactics(controller, extra, config, coverage):
                     q.out_features,
                     q.bias is not None,
                 ]
-                matching = [
-                    row
-                    for row in groups
-                    if row["bits"] == bits and row.get("shape") == signature
-                ]
+                matching = [row for row in legacy if row["shape"] == signature]
             choices = {checked_tactic(row["tactic"]) for row in matching}
             if len(choices) > 1:
                 raise ValueError("Conflicting grouped tactics")
@@ -129,8 +131,9 @@ def apply_tactics(controller, extra, config, coverage):
 class GrootOptimizations:
     """One serial, frozen BF16 CUDA policy; close before replacing its weights.
 
-    This scope neither selects a checkpoint nor changes Conv3D layout, sampling,
-    observations or the policy's VLM cache. No optimization is enabled by default.
+    This scope neither selects a checkpoint nor changes sampling, observations
+    or the policy's VLM cache. No optimization is enabled by default.
+    Vision Conv3D layout conversion requires the explicit vision_channels_last flag.
     """
 
     def __init__(self, policy, config=None):
@@ -157,8 +160,21 @@ class GrootOptimizations:
             raise ValueError("Optimizations require an eval-mode BF16 model")
         if next(model.parameters()).device.type != "cuda":
             raise ValueError("Optimizations require CUDA")
-        if getattr(model.config, "streaming", False):
-            raise ValueError("Streaming checkpoint optimization is not validated")
+        self.config.validate_variant(
+            "pir2" if getattr(model.config, "streaming", False) else "flow"
+        )
+        if self.config.vision_channels_last:
+            proj = model.backbone.model.visual.patch_embed.proj
+            self.stack.callback(setattr, proj.weight, "data", proj.weight.data)
+            proj.weight.data = proj.weight.data.contiguous(
+                memory_format=torch.channels_last_3d
+            )
+            hook = proj.register_forward_pre_hook(
+                lambda _module, inputs: (
+                    inputs[0].contiguous(memory_format=torch.channels_last_3d),
+                )
+            )
+            self.stack.callback(hook.remove)
         if self.config.fusion:
             from coexecution.groot_fusion import NonGemmAdapters
             from coexecution.groot_pointwise import PointwiseFusion
@@ -225,7 +241,7 @@ class GrootOptimizations:
         return {
             "config": config,
             "coverage": self.coverage,
-            "scope": "Experimental standard Flow; streaming and task quality unvalidated",
+            "scope": "Experimental serial inference; replay checks do not establish task quality",
         }
 
     def close(self):
