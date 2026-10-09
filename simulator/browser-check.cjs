@@ -16,6 +16,10 @@ const path = require("node:path");
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("file://" + path.resolve("simulator/index.html"));
   await page.waitForFunction(() => !!window.lastQueueSimulation);
+  await page.selectOption("#queue-executionPolicy", "libero");
+  await page.waitForFunction(
+    () => window.lastQueueSimulation?.config.executionPolicy === "libero",
+  );
   const queueCases = [];
   for (const [preset, delay] of [
     ["1", 1],
@@ -146,10 +150,11 @@ const path = require("node:path");
     throw new Error(
       "Slot freshness did not retain the feature actually read by its request",
     );
-  await page.screenshot({
-    path: path.join(directory, "queues-freshness.png"),
-    fullPage: true,
-  });
+  if (!process.argv.includes("--no-screenshots"))
+    await page.screenshot({
+      path: path.join(directory, "queues-freshness.png"),
+      fullPage: true,
+    });
   await page.click("#queue-shared-preset");
   await page.locator("details.queue-advanced > summary").click();
   for (const [id, value] of [
@@ -220,10 +225,11 @@ const path = require("node:path");
     !(await page.locator("#queue-timeline").textContent()).includes("GPU 活跃")
   )
     throw new Error("GPU activity lane missing");
-  await page.screenshot({
-    path: path.join(directory, "queues-desktop.png"),
-    fullPage: true,
-  });
+  if (!process.argv.includes("--no-screenshots"))
+    await page.screenshot({
+      path: path.join(directory, "queues-desktop.png"),
+      fullPage: true,
+    });
   const queueDownloadPromise = page.waitForEvent("download");
   await page.click("#queue-export");
   const queueDownload = await queueDownloadPromise;
@@ -240,11 +246,280 @@ const path = require("node:path");
     !queueExport.result.resourceSegments.length
   )
     throw new Error("Queue export is missing execution provenance");
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.screenshot({
-    path: path.join(directory, "queues-mobile.png"),
-    fullPage: true,
+  await page.click("#lab-example-feedback");
+  const feedback = await page.evaluate(() => {
+    const s = window.lastQueueSimulation;
+    return {
+      baseD: s.reference.finalDelay,
+      d: s.result.finalDelay,
+      baseHz: s.reference.metrics.admittedVlmHz,
+      hz: s.result.metrics.admittedVlmHz,
+      camera: s.config.cameraHz,
+    };
   });
+  if (
+    feedback.baseD !== 1 ||
+    feedback.d !== 2 ||
+    feedback.baseHz !== 5 ||
+    feedback.hz !== 8 ||
+    feedback.camera !== 20
+  )
+    throw new Error(
+      "Admission/host feedback example regressed: " + JSON.stringify(feedback),
+    );
+  await page.click("#lab-compare-cap");
+  const capped = await page.evaluate(() => window.lastQueueSimulation);
+  if (
+    capped.result.finalDelay !== 1 ||
+    capped.result.metrics.admittedVlmHz !== 5 ||
+    capped.config.cameraHz !== 20
+  )
+    throw new Error(
+      "Admission cap changed capture rate or failed to bound work",
+    );
+  await page.click("#lab-example-latch");
+  const latch = await page.evaluate(() => ({
+    r: window.lastQueueSimulation.result,
+    source: window.lastQueueSimulation.calibrationSource,
+  }));
+  if (
+    latch.r.initialDelay !== 1 ||
+    latch.r.finalDelay !== 2 ||
+    latch.r.actionRequests[0].responseMs !== 51 ||
+    latch.source !== null
+  )
+    throw new Error(
+      "First dispatch overhead did not trigger persistent d transition",
+    );
+  await page.click('[data-queue-preset="1"]');
+  await page.locator("#scenario-visionPrecision").selectOption("INT4 / W4A16");
+  await page.waitForFunction(
+    () =>
+      window.lastQueueSimulation.scenario.visionPrecision === "INT4 / W4A16",
+  );
+  if (
+    await page.evaluate(
+      () =>
+        window.lastQueueSimulation.effectiveConfig.vlmMs !==
+        window.lastQueueSimulation.config.vlmMs,
+    )
+  )
+    throw new Error("Precision label silently scaled latency");
+  await page.locator("#scenario-visionSpeedup").fill("2");
+  await page.waitForFunction(
+    () => window.lastQueueSimulation.effectiveConfig.vlmMs === 15,
+  );
+  const dependent = page.locator('#queue-timeline [data-action-id="5"]');
+  await dependent.dispatchEvent("click");
+  const provenance = await page.evaluate(() => {
+    const r = window.lastQueueSimulation.result,
+      child = r.actionRequests[5];
+    const highlighted = document.querySelector(
+      "#queue-timeline .lab-selected-job[data-vision-id]",
+    );
+    const arrow = document.querySelector("#queue-timeline .lab-dependency");
+    return {
+      parent: child.featureVersion,
+      highlight: highlighted ? Number(highlighted.dataset.visionId) : null,
+      arrow: arrow ? Number(arrow.dataset.parentFeature) : null,
+    };
+  });
+  if (
+    provenance.parent !== provenance.highlight ||
+    provenance.parent !== provenance.arrow
+  )
+    throw new Error(
+      "Dependency highlight does not use actual consumed feature",
+    );
+  await page.locator("#queue-vlmMs").fill("140");
+  await page.waitForFunction(
+    () => window.lastQueueSimulation.config.vlmMs === 140,
+  );
+  if (await page.locator("#queue-timeline .lab-selected-job").count())
+    throw new Error(
+      "Selection retained an obsolete feature dependency after recompute",
+    );
+  if ((await page.locator("#lab-aoi-chart .lab-aoi-series").count()) !== 3)
+    throw new Error(
+      "Cache / executed image / executed state AoI series missing",
+    );
+  await page.locator("#scenario-visionSpeedup").fill("0");
+  await page.waitForFunction(() => window.lastQueueSimulation === null);
+  await page.selectOption("#lab-timeline-span", "600");
+  await page.locator("#queue-timeline").dispatchEvent("click");
+  await page.locator("#scenario-visionSpeedup").fill("2");
+  await page.waitForFunction(() => window.lastQueueSimulation !== null);
+  await page.click("#lab-example-repeat");
+  const repeated = await page.evaluate(() => {
+    const s = window.lastQueueSimulation,
+      repeats = s.result.executions.filter((e) => e.repeated);
+    const e = repeats.find(
+      (e) =>
+        e.origin.kind === "request" &&
+        s.result.actionRequests[e.origin.requestId].featureVersion >= 0,
+    );
+    if (!e) return null;
+    const r = s.result.actionRequests[e.origin.requestId];
+    return {
+      tick: e.tick,
+      time: e.timeMs,
+      id: r.id,
+      offset: e.origin.offset,
+      state: r.stateCaptureMs,
+      image: r.featureCaptureMs,
+      mode: s.config.executionPolicy,
+      d: s.result.finalDelay,
+    };
+  });
+  if (!repeated || repeated.mode !== "paper" || repeated.d !== 2)
+    throw new Error("Old-segment repeat scenario missing provenance");
+  await page.locator("#queue-time").fill(String(repeated.time + 10));
+  await page.locator("#queue-time").dispatchEvent("input");
+  const repeatState = await page.evaluate(() => {
+    const s = window.lastQueueSimulation;
+    return {
+      e: s.snapshot.execution.lastExecuted,
+      image: PiR2Scenarios.ageAt(s.aoi.executionImage, s.timeMs),
+      state: PiR2Scenarios.ageAt(s.aoi.executionState, s.timeMs),
+      live: document.querySelector("#lab-policy-live").textContent,
+    };
+  });
+  if (
+    !repeatState.e.repeated ||
+    repeatState.e.origin.requestId !== repeated.id ||
+    repeatState.image !== repeated.time + 10 - repeated.image ||
+    repeatState.state !== repeated.time + 10 - repeated.state ||
+    !repeatState.live.includes("重复末动作")
+  )
+    throw new Error("Repeated action lost source or reset AoI");
+  if (
+    (await page
+      .locator('#queue-timeline [data-execution-mode="repeat-last"]')
+      .count()) === 0 ||
+    (await page.locator("#lab-aoi-chart .lab-aoi-repeat").count()) === 0
+  )
+    throw new Error("Repeat time ranges not exposed in charts");
+  await page
+    .locator(`#queue-timeline [data-execution-tick="${repeated.tick}"]`)
+    .dispatchEvent("click");
+  if (
+    (await page
+      .locator(
+        `#queue-timeline .lab-selected-job[data-action-id="${repeated.id}"]`,
+      )
+      .count()) !== 1
+  )
+    throw new Error(
+      "Clicking a repeated action did not highlight its original producer",
+    );
+  await page.click("#lab-example-recover-d");
+  const recovery = await page.evaluate(() =>
+    window.lastQueueSimulation.result.actionRequests
+      .slice(0, 4)
+      .map((r) => r.d),
+  );
+  if (JSON.stringify(recovery) !== "[1,3,2,1]")
+    throw new Error(
+      "Rolling d did not return after initial stall: " +
+        JSON.stringify(recovery),
+    );
+  if (
+    (await page.locator('#lab-delay-chart [data-series="delay"]').count()) !== 1
+  )
+    throw new Error("d timeline missing");
+  await page.selectOption("#queue-executionPolicy", "libero");
+  await page.waitForFunction(
+    () => window.lastQueueSimulation?.config.executionPolicy === "libero",
+  );
+  if (
+    (await page.evaluate(() => window.lastQueueSimulation.result.finalDelay)) <=
+    1
+  )
+    throw new Error("LIBERO contrast lost monotone d");
+  await page.click("#lab-example-repeat");
+  const integratedUrl = process.argv
+    .find((arg) => arg.startsWith("--url="))
+    ?.slice(6);
+  let integrated = null;
+  if (integratedUrl) {
+    const live = await browser.newPage({
+      viewport: { width: 1440, height: 1050 },
+    });
+    live.on("pageerror", (error) => errors.push(error.message));
+    await live.goto(integratedUrl);
+    const iframe = live.frameLocator("#lab-replay-frame");
+    await iframe.locator("#load-calibration").waitFor();
+    await iframe.locator("#layout").selectOption("single");
+    await iframe.locator("#condition").selectOption("core1200");
+    const before = await live.evaluate(
+      () => window.lastQueueSimulation.config.actionMs,
+    );
+    await live.evaluate(() =>
+      window.postMessage(
+        {
+          type: "pir2:load-solo-calibration",
+          version: 1,
+          layout: "single",
+          solo: { actionMs: 999, vlmMs: 999 },
+          periodMs: 50,
+          cameraHz: 20,
+        },
+        location.origin,
+      ),
+    );
+    await live.waitForTimeout(30);
+    if (
+      (await live.evaluate(
+        () => window.lastQueueSimulation.config.actionMs,
+      )) !== before
+    )
+      throw new Error(
+        "Parent accepted calibration from outside the report iframe",
+      );
+    await iframe.locator("#load-calibration").click();
+    await live.waitForFunction(
+      () =>
+        window.lastQueueSimulation.calibrationSource?.conditionId ===
+        "single/core1200",
+    );
+    if (!(await live.locator("#queue-mode").isVisible()))
+      throw new Error("Calibration did not switch to scenario");
+    integrated = await live.evaluate(() => ({
+      source: window.lastQueueSimulation.calibrationSource,
+      mode: window.lastQueueSimulation.config.computeMode,
+      effective: window.lastQueueSimulation.effectiveConfig,
+    }));
+    if (
+      integrated.mode !== "shared" ||
+      integrated.effective.actionMs >= 100 ||
+      integrated.effective.vlmMs <= 0
+    )
+      throw new Error("Solo calibration import failed");
+    await live.click("#lab-tab-replay");
+    await iframe.locator("#counterpart").click();
+    if (
+      (await iframe.locator("#layout").inputValue()) !== "dual" ||
+      (await iframe.locator("#condition").inputValue()) !== "core1200"
+    )
+      throw new Error("Counterpart switch did not preserve frequency");
+    await iframe.locator("#load-calibration").click();
+    await live.waitForFunction(
+      () => window.lastQueueSimulation.calibrationSource?.layout === "dual",
+    );
+    if (
+      (await live.evaluate(
+        () => window.lastQueueSimulation.config.computeMode,
+      )) !== "independent"
+    )
+      throw new Error("Dual calibration not assigned independent GPUs");
+    await live.close();
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  if (!process.argv.includes("--no-screenshots"))
+    await page.screenshot({
+      path: path.join(directory, "queues-mobile.png"),
+      fullPage: true,
+    });
   const queueLayout = await page.evaluate(() => ({
     width: innerWidth,
     scroll: document.documentElement.scrollWidth,
@@ -261,6 +536,10 @@ const path = require("node:path");
         serial,
         hostOnly,
         queueLayout,
+        feedback,
+        repeated,
+        recovery,
+        integrated,
         errors,
       },
       null,

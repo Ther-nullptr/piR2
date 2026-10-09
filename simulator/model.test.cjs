@@ -2,6 +2,289 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const M = require("./model.js");
 
+test("paper policy consumes only the seeded clean segment then adopts d clean outputs", () => {
+  const r = M.simulatePolicyQueues({
+    executionPolicy: "paper",
+    delayMode: "fixed",
+    fixedDelay: 2,
+    actionMs: 80,
+    seconds: 0.4,
+  });
+  assert.equal(r.bootstrap.length, 2);
+  assert.deepEqual(
+    r.executions.slice(0, 6).map((e) => e.executionMode),
+    [
+      "bootstrap",
+      "bootstrap",
+      "new-segment",
+      "continue-segment",
+      "new-segment",
+      "continue-segment",
+    ],
+  );
+  assert.deepEqual(
+    r.actionRequests.slice(0, 3).map((x) => x.startMs),
+    [0, 80, 160],
+  );
+  assert.deepEqual(
+    r.executions.slice(2, 4).map((x) => [x.origin.requestId, x.origin.offset]),
+    [
+      [0, 0],
+      [0, 1],
+    ],
+  );
+  assert.equal(r.metrics.expiredOutputs, 0);
+  assert.ok(r.executions.every((e) => !e.repeated));
+});
+
+test("paper lateness repeats the last emitted clean output without walking into the tail", () => {
+  const r = M.simulatePolicyQueues({
+    executionPolicy: "paper",
+    delayMode: "fixed",
+    fixedDelay: 1,
+    actionMs: 120,
+    vlmMs: 20,
+    seconds: 0.45,
+  });
+  assert.equal(r.bootstrap.length, 1);
+  assert.equal(r.executions[3].executionMode, "new-segment");
+  const repeated = r.executions[4];
+  assert.equal(repeated.executionMode, "repeat-last");
+  assert.equal(repeated.repeated, true);
+  assert.equal(repeated.origin.requestId, 0);
+  assert.equal(repeated.origin.offset, 0);
+  assert.equal(repeated.origin.targetTick, 4);
+  assert.equal(repeated.origin.producerTargetTick, 3);
+  assert.equal(r.actionRequests[0].outputs[0].executedAtMs, 150);
+  assert.equal(r.metrics.expiredOutputs, 0);
+  assert.equal(r.metrics.fallbackTicks, 0);
+  assert.ok(r.metrics.repeatTicks > 0);
+  assert.ok(
+    r.executions
+      .filter((x) => x.origin.kind === "request")
+      .every((e) => e.origin.offset < r.actionRequests[e.origin.requestId].d),
+  );
+});
+
+test("paper rolling full-request mean raises and lowers d at worker admission", () => {
+  const r = M.simulatePolicyQueues({
+    executionPolicy: "paper",
+    delayWindow: 2,
+    paperInitialDelay: 1,
+    actionMs: 40,
+    startupActionDelayMs: 100,
+    periodMs: 50,
+    marginMs: 250,
+    seconds: 0.4,
+  });
+  assert.equal(r.initialDelay, 1);
+  assert.deepEqual(
+    r.actionRequests.slice(0, 4).map((a) => a.d),
+    [1, 3, 2, 1],
+  );
+  assert.deepEqual(
+    r.actionRequests.slice(0, 4).map((a) => a.startMs),
+    [0, 140, 180, 220],
+  );
+  assert.deepEqual(
+    r.actionRequests.slice(0, 4).map((a) => a.stateCaptureMs),
+    [0, 100, 150, 200],
+  );
+  assert.equal(r.calibration.scope, "paper-reference-initial-seed");
+  assert.equal(r.finalDelay, 1);
+  const changes = r.events.filter((e) => e.kind === "delay");
+  assert.deepEqual(
+    changes.map((e) => e.delay),
+    [3, 2, 1],
+  );
+  assert.equal(M.policyQueueSnapshot(r, 139).delay, 1);
+  assert.equal(M.policyQueueSnapshot(r, 140).delay, 3);
+});
+
+test("paper delay uses round-to-even and records exceeding the simulator guard", () => {
+  for (const [actionMs, expected] of [
+    [125, 2],
+    [175, 4],
+  ]) {
+    const r = M.simulatePolicyQueues({
+      executionPolicy: "paper",
+      actionMs,
+      seconds: 0.5,
+    });
+    assert.equal(r.actionRequests[1].d, expected);
+  }
+  const r = M.simulatePolicyQueues({
+    executionPolicy: "paper",
+    actionMs: 300,
+    maxDelay: 2,
+    seconds: 0.8,
+  });
+  assert.equal(r.actionRequests[1].d, 2);
+  assert.ok(r.metrics.overBudgetRequests > 0);
+  assert.ok(r.events.some((e) => e.kind === "delay" && e.requiredDelay === 6));
+});
+
+test("paper continuous worker has one latest-ready result and causal snapshots", () => {
+  const r = M.simulatePolicyQueues({
+    executionPolicy: "paper",
+    delayMode: "fixed",
+    fixedDelay: 2,
+    actionMs: 20,
+    seconds: 0.2,
+  });
+  const before = M.policyQueueSnapshot(r, 35);
+  assert.equal(before.action.ready.id, 0);
+  assert.equal(before.action.running.id, 1);
+  assert.ok(before.action.ready.outputs.every((o) => o.targetTick === null));
+  assert.ok(
+    before.action.ready.outputs.every(
+      (o) => !o.unused && o.discardedAtMs == null,
+    ),
+  );
+  assert.equal(r.actionRequests[0].discardedAtMs, 40);
+  assert.equal(r.actionRequests[3].discardedAtMs, 100);
+  assert.equal(r.actionRequests[4].publication.atMs, 100);
+  assert.deepEqual(
+    r.actionRequests[4].outputs.map((o) => o.targetTick),
+    [2, 3],
+  );
+  assert.ok(
+    M.policyQueueSnapshot(r, 99).action.running.outputs.every(
+      (o) => o.targetTick === null,
+    ),
+  );
+  const adopted = M.policyQueueSnapshot(r, 100);
+  assert.equal(adopted.action.running.id, 5);
+  assert.equal(adopted.action.ready, null);
+  assert.equal(adopted.execution.activeSegment.requestId, 4);
+  assert.equal(adopted.execution.activeSegment.remaining, 1);
+  assert.equal(adopted.execution.lastExecuted.origin.requestId, 4);
+  assert.ok(r.actionRequests.every((a) => a.startMs < r.windowEndMs));
+  assert.equal(r.metrics.expiredOutputs, 0);
+});
+
+test("paper unadopted latest-ready and drained output are censored rather than expired", () => {
+  const r = M.simulatePolicyQueues({
+    executionPolicy: "paper",
+    delayMode: "fixed",
+    fixedDelay: 2,
+    actionMs: 40,
+    cameraHz: 0,
+    seconds: 0.06,
+  });
+  assert.equal(r.actionRequests.length, 2);
+  assert.equal(r.drainEndMs, 80);
+  assert.equal(r.metrics.expiredOutputs, 0);
+  for (const a of r.actionRequests)
+    for (const o of a.outputs) {
+      assert.equal(o.targetTick, null);
+      assert.equal(o.status, "window-ended");
+      assert.equal(o.unused, false);
+      assert.equal(o.unusedAtMs, null);
+    }
+  const s = M.policyQueueSnapshot(r, 55);
+  assert.equal(s.action.ready.id, 0);
+  assert.equal(s.action.running.id, 1);
+  assert.equal(s.action.running.finishMs, null);
+});
+
+test("paper empty cold start is unknown fallback, then holds a real producer", () => {
+  const r = M.simulatePolicyQueues({
+    executionPolicy: "paper",
+    bootstrapSlots: 0,
+    delayMode: "fixed",
+    fixedDelay: 1,
+    actionMs: 120,
+    seconds: 0.3,
+  });
+  assert.deepEqual(
+    r.executions.slice(0, 3).map((e) => e.executionMode),
+    ["fallback", "fallback", "fallback"],
+  );
+  assert.equal(r.executions[3].executionMode, "new-segment");
+  assert.equal(r.executions[4].executionMode, "repeat-last");
+  assert.equal(r.metrics.fallbackTicks, 3);
+});
+
+test("paper policy validates execution parameters", () => {
+  for (const c of [
+    { executionPolicy: "unknown" },
+    { delayWindow: 0 },
+    { delayWindow: 1.2 },
+    { paperInitialDelay: 0 },
+    { paperInitialDelay: 3, maxDelay: 2 },
+  ])
+    assert.throws(() => M.simulatePolicyQueues(c), RangeError);
+});
+
+test("paper continuous resource scheduling conserves work without duplicate admission", () => {
+  for (const computeMode of ["independent", "shared", "serial"])
+    for (const hostMode of ["independent", "shared"])
+      for (const gpuShare of [0, 0.6, 1]) {
+        const r = M.simulatePolicyQueues({
+          executionPolicy: "paper",
+          actionMs: 43,
+          vlmMs: 71,
+          startupActionDelayMs: 7,
+          delayWindow: 3,
+          jitter: 0.2,
+          seconds: 0.7,
+          computeMode,
+          hostMode,
+          gpuShareA: gpuShare,
+          gpuShareV: gpuShare,
+        });
+        for (const job of [...r.actionRequests, ...r.visualJobs]) {
+          closeTo(
+            job.segments.reduce((s, x) => s + x.workMs, 0),
+            job.gpuWorkMs,
+          );
+          closeTo(
+            job.segments.reduce((s, x) => s + x.hostWorkMs, 0),
+            job.hostWorkMs,
+          );
+          closeTo(
+            job.responseMs,
+            job.soloMs +
+              job.dispatchOverheadMs +
+              job.hostWaitMs +
+              job.gpuWaitMs +
+              job.contentionDelayMs,
+          );
+          assert.ok(job.startMs < r.windowEndMs);
+        }
+        for (const [i, request] of r.actionRequests.entries()) {
+          if (i) closeTo(request.startMs, r.actionRequests[i - 1].finishMs);
+          assert.equal(request.outputs.length, request.d);
+          if (request.publication) {
+            assert.ok(request.publication.atMs >= request.finishMs);
+            assert.equal(request.publication.installed, request.d);
+          }
+        }
+        for (const e of r.executions)
+          if (e.origin.kind === "request") {
+            const source = r.actionRequests[e.origin.requestId];
+            assert.ok(source.finishMs <= e.timeMs);
+            assert.equal(e.origin.featureVersion, source.featureVersion);
+            assert.ok(e.origin.offset < source.d);
+            assert.equal(
+              e.origin.producerTargetTick,
+              source.outputs[e.origin.offset].targetTick,
+            );
+            if (e.repeated)
+              assert.ok(
+                source.outputs[e.origin.offset].executedAtMs < e.timeMs,
+              );
+          }
+        if (computeMode === "serial") assert.equal(r.metrics.gpuOverlapMs, 0);
+        if (hostMode === "shared")
+          closeTo(
+            r.metrics.hostBusyMs,
+            r.metrics.hostBusyAMs + r.metrics.hostBusyVMs,
+          );
+      }
+});
+
 test("a missed deadline exactly at control end is counted independently of future output censoring", () => {
   const r = M.simulatePolicyQueues({
     actionMs: 80,
@@ -82,6 +365,7 @@ test("late two-slot output only loses its expired prefix", () => {
   assert.equal(first.outputs[1].executedAtMs, 150);
   assert.equal(first.unused, false);
   assert.equal(r.executions[3].origin.label, "I-1a[1]");
+  assert.equal(r.executions[3].executionMode, "new-segment");
 });
 
 test("seeded calibration underestimation adapts after a partially late result", () => {
@@ -586,4 +870,316 @@ test("resource configuration rejects invalid or unbounded values", () => {
     { gpuShareA: NaN },
   ])
     assert.throws(() => M.simulatePolicyQueues(config));
+});
+
+test("VLM admission cap preserves camera arrivals and selects the newest waiting frame", () => {
+  const r = M.simulatePolicyQueues({
+    vlmMs: 10,
+    actionMs: 20,
+    cameraHz: 100,
+    vlmRateCapHz: 10,
+    seconds: 0.35,
+  });
+  assert.equal(r.frames.length, 35);
+  assert.deepEqual(
+    r.visualJobs.map((v) => [v.captureMs, v.startMs]),
+    [
+      [0, 0],
+      [100, 100],
+      [200, 200],
+      [300, 300],
+    ],
+  );
+  assert.equal(r.metrics.replacedFrames, 30);
+  closeTo(r.metrics.admittedVlmHz, 4 / 0.35);
+  const at95 = M.policyQueueSnapshot(r, 95);
+  assert.equal(at95.vision.running, null);
+  assert.equal(at95.vision.pending.label, "O9");
+  assert.equal(at95.vision.admissionReason, "rate-limit");
+  assert.equal(at95.vision.nextAdmissionMs, 100);
+  assert.equal(at95.vision.admittedJobs, 1);
+  assert.equal(r.frameDrops.at(-1).reason, "window-ended");
+});
+
+test("rate limited vision waits for completion and respects the control cutoff", () => {
+  const r = M.simulatePolicyQueues({
+    vlmMs: 220,
+    cameraHz: 100,
+    vlmRateCapHz: 10,
+    seconds: 0.4,
+  });
+  assert.deepEqual(
+    r.visualJobs.map((v) => [v.captureMs, v.startMs]),
+    [
+      [0, 0],
+      [220, 220],
+    ],
+  );
+  assert.equal(M.policyQueueSnapshot(r, 150).vision.admissionReason, "running");
+  assert.equal(r.drainEndMs, 440);
+  const cutoff = M.simulatePolicyQueues({
+    vlmMs: 10,
+    vlmRateCapHz: 10,
+    seconds: 0.1,
+  });
+  assert.equal(cutoff.visualJobs.length, 1);
+  assert.equal(cutoff.frames.length, 2);
+  assert.equal(
+    M.policyQueueSnapshot(cutoff, 100).vision.admissionReason,
+    "window-ended",
+  );
+});
+
+test("shared host serializes prefixes with action winning simultaneous admission", () => {
+  for (const computeMode of ["independent", "shared", "serial"]) {
+    const r = M.simulatePolicyQueues({
+      ...resourcePair,
+      computeMode,
+      hostMode: "shared",
+      gpuShareA: 0.5,
+      gpuShareV: 0.5,
+    });
+    const a = r.actionRequests[0],
+      v = r.visualJobs[0];
+    closeTo(a.hostStartMs, 0);
+    closeTo(a.hostReadyMs, 10);
+    closeTo(a.finishMs, 20);
+    closeTo(v.hostStartMs, 10);
+    closeTo(v.hostWaitMs, 10);
+    closeTo(v.hostReadyMs, 60);
+    closeTo(v.finishMs, 110);
+    closeTo(v.contentionDelayMs, 0);
+    closeTo(r.metrics.hostBusyMs, 60);
+    assert.equal(M.policyQueueSnapshot(r, 5).vision.running.phase, "host-wait");
+    assert.equal(M.policyQueueSnapshot(r, 5).vision.running.hostStartMs, null);
+    closeTo(M.policyQueueSnapshot(r, 5).vision.running.hostWaitMs, 5);
+    closeTo(M.policyQueueSnapshot(r, 5).action.running.hostRemainingMs, 5);
+    assert.ok(
+      r.resourceSegments.every(
+        (s) => !(s.actionPhase === "host" && s.visionPhase === "host"),
+      ),
+    );
+  }
+});
+
+test("a running shared host prefix is not preempted by a later action", () => {
+  const r = M.simulatePolicyQueues({
+    hostMode: "shared",
+    actionMs: 10,
+    gpuShareA: 0.5,
+    vlmMs: 60,
+    gpuShareV: 0,
+    cameraHz: 1,
+    marginMs: 0,
+    seconds: 0.15,
+  });
+  const a = r.actionRequests[1],
+    v = r.visualJobs[0];
+  closeTo(v.hostStartMs, 5);
+  closeTo(v.finishMs, 65);
+  closeTo(a.startMs, 50);
+  closeTo(a.hostStartMs, 65);
+  closeTo(a.hostWaitMs, 15);
+  closeTo(a.finishMs, 75);
+  assert.equal(a.featureVersion, -1);
+  assert.equal(a.stateCaptureMs, 50);
+});
+
+test("host and serial GPU waits are separate and admitted work drains after cutoff", () => {
+  const r = M.simulatePolicyQueues({
+    ...resourcePair,
+    actionMs: 80,
+    computeMode: "serial",
+    hostMode: "shared",
+    gpuShareA: 0.5,
+    gpuShareV: 0.8,
+    seconds: 0.05,
+  });
+  const a = r.actionRequests[0],
+    v = r.visualJobs[0];
+  closeTo(a.finishMs, 80);
+  closeTo(v.hostWaitMs, 40);
+  closeTo(v.hostReadyMs, 60);
+  closeTo(v.gpuWaitMs, 20);
+  closeTo(v.gpuStartMs, 80);
+  closeTo(v.finishMs, 160);
+  closeTo(v.responseMs, v.soloMs + v.hostWaitMs + v.gpuWaitMs);
+  closeTo(v.contentionDelayMs, 0);
+  closeTo(r.drainEndMs, 160);
+  closeTo(r.metrics.hostBusyMs, 50);
+  closeTo(r.metrics.hostWaitVMs, 40);
+  closeTo(r.metrics.gpuWaitVMs, 20);
+  assert.equal(r.visualJobs.length, 1);
+  assert.equal(r.actionRequests.length, 1);
+});
+
+test("a small first dispatch delay misses one slot and permanently latches adaptive d", () => {
+  const config = { actionMs: 48, marginMs: 0, cameraHz: 0, seconds: 0.5 };
+  const baseline = M.simulatePolicyQueues(config);
+  const r = M.simulatePolicyQueues({ ...config, startupActionDelayMs: 3 });
+  assert.deepEqual(r.calibration, baseline.calibration);
+  assert.equal(r.initialDelay, 1);
+  assert.equal(r.finalDelay, 2);
+  const first = r.actionRequests[0];
+  closeTo(first.soloMs, 48);
+  closeTo(first.hostMs, 0);
+  closeTo(first.dispatchOverheadMs, 3);
+  closeTo(first.hostWorkMs, 3);
+  closeTo(first.gpuWorkMs, 48);
+  closeTo(first.finishMs, 51);
+  closeTo(first.contentionDelayMs, 0);
+  assert.equal(first.publication.expired, 1);
+  assert.equal(first.segments[0].phase, "dispatch");
+  assert.equal(M.policyQueueSnapshot(r, 1).action.running.phase, "dispatch");
+  assert.equal(M.policyQueueSnapshot(r, 99).delay, 1);
+  assert.equal(M.policyQueueSnapshot(r, 100).delay, 2);
+  assert.ok(
+    r.actionRequests
+      .slice(1)
+      .every(
+        (a) => a.d === 2 && a.dispatchOverheadMs === 0 && a.responseMs === 48,
+      ),
+  );
+  assert.equal(baseline.metrics.expiredOutputs, 0);
+});
+
+test("dispatch retains the shared host until its ordinary prefix completes", () => {
+  const r = M.simulatePolicyQueues({
+    ...resourcePair,
+    hostMode: "shared",
+    gpuShareA: 0.5,
+    gpuShareV: 0,
+    startupActionDelayMs: 3,
+  });
+  const a = r.actionRequests[0],
+    v = r.visualJobs[0];
+  closeTo(a.hostReadyMs, 13);
+  closeTo(a.finishMs, 23);
+  closeTo(v.hostStartMs, 13);
+  closeTo(v.hostWaitMs, 13);
+  closeTo(v.finishMs, 113);
+  assert.deepEqual(
+    a.segments.map((s) => s.phase),
+    ["dispatch", "host", "gpu"],
+  );
+});
+
+test("admission and host configuration rejects invalid or unbounded values", () => {
+  for (const config of [
+    { vlmRateCapHz: -1 },
+    { vlmRateCapHz: 241 },
+    { vlmRateCapHz: NaN },
+    { hostMode: "preemptive" },
+    { startupActionDelayMs: -1 },
+    { startupActionDelayMs: 1001 },
+    { startupActionDelayMs: Infinity },
+  ])
+    assert.throws(() => M.simulatePolicyQueues(config));
+});
+
+test("host service, dispatch and GPU work remain conserved across queues and snapshots", () => {
+  const hostPhase = (p) => p === "host" || p === "dispatch";
+  for (let seed = 0; seed < 36; seed++) {
+    const config = {
+      seed,
+      computeMode: ["independent", "shared", "serial"][seed % 3],
+      hostMode: seed % 2 ? "independent" : "shared",
+      actionMs: 13 + seed * 7,
+      vlmMs: 17 + seed * 11,
+      gpuShareA: (seed % 4) / 3,
+      gpuShareV: (Math.floor(seed / 4) % 3) / 2,
+      startupActionDelayMs: (seed % 5) * 3,
+      vlmRateCapHz: seed % 3 ? 7 + seed : 0,
+      cameraHz: 19 + seed,
+      slowdownA: seed % 3,
+      slowdownV: seed % 4,
+      jitter: 0.2,
+      seconds: 0.7,
+    };
+    const r = M.simulatePolicyQueues(config);
+    assert.deepEqual(M.simulatePolicyQueues(config), r);
+    for (const job of [...r.actionRequests, ...r.visualJobs]) {
+      closeTo(
+        job.responseMs,
+        job.hostWorkMs +
+          job.hostWaitMs +
+          job.gpuWorkMs +
+          job.gpuWaitMs +
+          job.contentionDelayMs,
+      );
+      closeTo(job.hostWorkMs, job.hostMs + job.dispatchOverheadMs);
+      closeTo(
+        job.segments.reduce((total, s) => total + s.workMs, 0),
+        job.gpuWorkMs,
+      );
+      closeTo(
+        job.segments.reduce((total, s) => total + s.hostWorkMs, 0),
+        job.hostWorkMs,
+      );
+      closeTo(
+        job.segments.reduce((total, s) => total + s.dispatchWorkMs, 0),
+        job.dispatchOverheadMs,
+      );
+      assert.ok(
+        job.segments.every(
+          (s) => s.endMs > s.startMs && s.workMs >= 0 && s.hostWorkMs >= 0,
+        ),
+      );
+      assert.ok(job.startMs < r.windowEndMs);
+      const at = Math.min(r.windowEndMs, job.startMs + job.responseMs / 2);
+      const snapshot = M.policyQueueSnapshot(r, at);
+      const visible = job.outputs
+        ? snapshot.action.running
+        : snapshot.vision.running;
+      assert.equal(visible.id, job.id);
+      closeTo(
+        visible.hostRemainingMs +
+          visible.segments.reduce((total, s) => total + s.hostWorkMs, 0),
+        job.hostWorkMs,
+      );
+      closeTo(
+        visible.gpuRemainingMs +
+          visible.segments.reduce((total, s) => total + s.workMs, 0),
+        job.gpuWorkMs,
+      );
+      closeTo(
+        visible.elapsedMs,
+        visible.segments.reduce((total, s) => total + s.endMs - s.startMs, 0),
+      );
+      assert.ok(visible.segments.every((s) => s.endMs <= at));
+    }
+    if (config.hostMode === "shared")
+      assert.ok(
+        r.resourceSegments.every(
+          (s) => !(hostPhase(s.actionPhase) && hostPhase(s.visionPhase)),
+        ),
+      );
+    if (config.computeMode === "serial")
+      assert.ok(r.resourceSegments.every((s) => !(s.rateA > 0 && s.rateV > 0)));
+    if (config.vlmRateCapHz)
+      assert.ok(
+        r.visualJobs
+          .slice(1)
+          .every(
+            (job, i) =>
+              job.startMs - r.visualJobs[i].startMs >=
+              1000 / config.vlmRateCapHz - 1e-6,
+          ),
+      );
+  }
+});
+
+test("default independent host prefixes preserve the existing event stream", () => {
+  const r = M.simulatePolicyQueues({
+    ...resourcePair,
+    computeMode: "independent",
+    gpuShareA: 0.5,
+    gpuShareV: 0.5,
+  });
+  assert.deepEqual(
+    r.events.filter((e) => e.timeMs === 0).map((e) => e.kind),
+    ["camera", "vision-start", "reserve", "action-start", "execute"],
+  );
+  closeTo(r.actionRequests[0].finishMs, 20);
+  closeTo(r.visualJobs[0].finishMs, 100);
 });
