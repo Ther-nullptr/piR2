@@ -43,8 +43,10 @@ class CommandTimeline:
         initial = project_commands(initial)
         self.commands = {k: v.copy() for k, v in enumerate(initial)}
         self.origins = {k: 0 for k in self.commands}
+        self.bootstrap_slots = set(self.commands)
         self.fallback_slots = set()
         self.committed_until = 0
+        self.last_execution = None
         self.last = np.zeros(7, dtype=np.float32)
         self.last[-1] = 1.0
 
@@ -77,6 +79,7 @@ class CommandTimeline:
                 continue
             self.commands[tick] = action.copy()
             self.origins[tick] = request_tick
+            self.bootstrap_slots.discard(tick)
             self.fallback_slots.discard(tick)
             installed += 1
         return Publication(installed, expired, protected)
@@ -85,12 +88,45 @@ class CommandTimeline:
         if tick not in self.commands:
             self.reserve(tick, 1)
         self.committed_until = max(self.committed_until, tick + 1)
+        self.last_execution = self._slot(tick)
         action = self.commands.pop(tick)
         origin = self.origins.pop(tick)
         fallback = tick in self.fallback_slots
         self.fallback_slots.discard(tick)
+        self.bootstrap_slots.discard(tick)
         self.last = action.copy()
         return action.copy(), fallback, tick - origin
+
+    def _slot(self, tick):
+        fallback = tick in self.fallback_slots
+        bootstrap = tick in self.bootstrap_slots
+        committed = tick < self.committed_until
+        return {
+            "tick": tick,
+            "status": "fallback"
+            if fallback
+            else "committed"
+            if committed
+            else "future",
+            "committed": committed,
+            "fallback": fallback,
+            "producer_kind": "fallback"
+            if fallback
+            else "bootstrap"
+            if bootstrap
+            else "request",
+            "producer_request_tick": None
+            if fallback or bootstrap
+            else self.origins[tick],
+            "reserved_at_tick": self.origins[tick] if fallback else None,
+        }
+
+    def snapshot(self):
+        """Return detached ownership metadata, without reserving or consuming slots."""
+        return {
+            "committed_until": self.committed_until,
+            "slots": [self._slot(tick) for tick in sorted(self.commands)],
+        }
 
 
 def extra_buffer_shift(buffer_origin, request_tick):
