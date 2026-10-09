@@ -16,6 +16,16 @@
       "revision": "ef4fefc13033c0468af4ef651847f5348af0c7d7",
       "path": "third_party/mujoco_playground",
       "patches": []
+    },
+    "source_han_sans": {
+      "url": "https://github.com/adobe-fonts/source-han-sans",
+      "revision": "a4f7cf94edfb9d7ffbdfc4841de276358bd7e0f2",
+      "path": "simulator/fonts",
+      "asset": "Variable/WOFF2/TTF/Subset/SourceHanSansCN-VF.ttf.woff2",
+      "sha256": "f971e3bff46f76b49e1d5510556c2297c618ec4b491a295a4e741cdd38257799",
+      "license": "SIL-OFL-1.1",
+      "optional": true,
+      "patches": []
     }
   }
 }
