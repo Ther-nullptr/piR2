@@ -9,12 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-from gr00t.policy.server_client import PolicyClient
-from libero.libero import benchmark, get_libero_path
-from libero_observations import batch_observation, write_video
 from libero_protocol_scheduler import CommandTimeline, initial_frame_index
-from libero_reproducible_env import LiberoEnv
-from libero_streaming_client import nested_observation
 
 KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
 
@@ -27,6 +22,9 @@ def snapshot(observation):
 
 
 def nested(observation):
+    from libero_observations import batch_observation
+    from libero_streaming_client import nested_observation
+
     return nested_observation(batch_observation(observation))
 
 
@@ -47,6 +45,8 @@ def checked_env_step(env, action):
 
 
 def wait_server(port):
+    from gr00t.policy.server_client import PolicyClient
+
     client = PolicyClient(host="127.0.0.1", port=port, timeout_ms=5000)
     deadline = time.monotonic() + 900
     while not client.ping():
@@ -177,6 +177,9 @@ def algorithm_episode(env, observation, client, args, seed, trace):
     return {
         "success": success,
         "control_steps": steps,
+        "physical_control_seconds": steps * period,
+        "first_success_tick": steps - 1 if success else None,
+        "measurement_mode": "success_terminated_closed_loop",
         "policy_calls": calls,
         "forward_counts": counts,
         "action_trace_sha256": hashlib.sha256(trajectory.tobytes()).hexdigest(),
@@ -192,6 +195,13 @@ def algorithm_episode(env, observation, client, args, seed, trace):
 
 
 def save_summary(output, records, config):
+    task_ids = config.get("task_ids", list(range(10)))
+    expected = {
+        (task, episode)
+        for task in task_ids
+        for episode in range(config["episodes_per_task"])
+    }
+    completed = {(row["task_id"], row["episode_id"]) for row in records}
     summary = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "config": config,
@@ -200,7 +210,11 @@ def save_summary(output, records, config):
         "success_rate": float(np.mean([x["success"] for x in records]))
         if records
         else None,
-        "complete": len(records) == 10 * config["episodes_per_task"],
+        "expected_episodes": len(expected),
+        "complete": completed == expected and len(records) == len(expected),
+        "evaluation_scope": "full_spatial_suite"
+        if sorted(task_ids) == list(range(10))
+        else "selected_task_subset",
         "per_task": [],
     }
     if config["protocol"] == "deployment" and records:
@@ -227,7 +241,7 @@ def save_summary(output, records, config):
             ),
             "note": "Main success rate includes all trials; timing-invalid trials are never silently dropped.",
         }
-    for task_id in range(10):
+    for task_id in task_ids:
         rows = [x for x in records if x["task_id"] == task_id]
         if rows:
             summary["per_task"].append(
@@ -241,7 +255,7 @@ def save_summary(output, records, config):
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--protocol", choices=["algorithm", "deployment"], required=True
@@ -251,15 +265,65 @@ def main():
     parser.add_argument("--port", type=int, default=5570)
     parser.add_argument("--slow-port", type=int, default=5572)
     parser.add_argument("--episodes-per-task", type=int, default=20)
+    parser.add_argument(
+        "--task-ids", nargs="+", type=int, choices=range(10), default=list(range(10))
+    )
+    parser.add_argument("--no-video", action="store_true")
+    parser.add_argument("--slow-warmup-calls", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=720)
     parser.add_argument("--control-hz", type=float, default=20)
     parser.add_argument("--visual-delay", type=int, default=3)
     parser.add_argument("--action-delay", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--artificial-compute-wait", type=float, default=0)
-    args = parser.parse_args()
+    return parser
+
+
+def save_run_configuration(output, config):
+    """Bind resumes to stable provenance and retain each server invocation separately."""
+    identities = {
+        key: config[key] for key in ("checkpoint", "slow_checkpoint") if key in config
+    }
+    stable_config = {
+        **config,
+        **{
+            key: {
+                name: value
+                for name, value in identity.items()
+                if name not in {"pid", "cuda_stream"}
+            }
+            for key, identity in identities.items()
+        },
+    }
+    path = output / "config.json"
+    if path.exists() and json.loads(path.read_text()) != stable_config:
+        raise RuntimeError("Protocol/checkpoint config changed on resume")
+    path.write_text(json.dumps(stable_config, indent=2) + "\n")
+    invocation = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "identities": identities,
+    }
+    with (output / "runtime-identities.jsonl").open("a") as stream:
+        stream.write(json.dumps(invocation) + "\n")
+    return stable_config
+
+
+def main():
+    args = build_parser().parse_args()
     if args.control_hz != 20:
         raise ValueError("This protocol must match LIBERO's physical20Hz control step")
+    if len(set(args.task_ids)) != len(args.task_ids):
+        raise ValueError("Task IDs must be unique")
+    if args.episodes_per_task < 1 or args.max_steps < 1:
+        raise ValueError("At least one episode and control step are required")
+    if args.slow_warmup_calls < 3:
+        raise ValueError(
+            "At least three VLM warmup calls are required (first two excluded)"
+        )
+    from libero.libero import benchmark, get_libero_path
+    from libero_observations import write_video
+    from libero_reproducible_env import LiberoEnv
+
     args.output.mkdir(parents=True, exist_ok=True)
     lock = (args.output / ".evaluation.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -272,15 +336,32 @@ def main():
     config["checkpoint"] = identity
     config["suite"] = "libero_spatial"
     config["initial_state_indices"] = list(range(args.episodes_per_task))
-    config["version"] = 4
+    config["version"] = 5
+    config["measurement_mode"] = "success_terminated_closed_loop"
+    config["input_dependencies"] = {
+        "camera": "physical observation released at each control tick; latest waiting frame replaces older waiting frames",
+        "vlm": "one in-flight visual request; last completed real VLM feature is eligible when capture/source tick do not exceed state",
+        "action": "current robot state, selected completed VLM feature, immutable committed action prefix",
+        "bootstrap": "fresh physical image and state captured together before timed control",
+        "termination": "first success, environment termination, or max steps; actual exposure reported per episode",
+    }
+    if args.protocol == "algorithm":
+        config["input_dependencies"].update(
+            camera="retained observation history at requested fixed visual delay; initial history padding is explicit",
+            vlm="one real VLM forward for each requested historical image before planning",
+            action="current robot state, fixed-delay historical image feature, immutable committed prefix; compute waits do not advance physics",
+            bootstrap="initial image and state before controlled simulated time",
+        )
     config["reset_fix"] = "clear_property_samplers_on_model_reload"
     root = Path(__file__).resolve().parents[1]
     implementation_files = [
         "scripts/evaluate_libero_protocol.py",
         "scripts/libero_wallclock.py",
         "scripts/libero_protocol_scheduler.py",
+        "scripts/libero_queue_trace.py",
         "scripts/libero_reproducible_env.py",
         "scripts/serve_libero_protocol.py",
+        "scripts/libero_inference_backend.py",
         "scripts/libero_streaming_client.py",
         "scripts/libero_observations.py",
         "upstream/learning/Isaac-GR00T/gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
@@ -303,17 +384,15 @@ def main():
             "rate_mean_tolerance_fraction": 0.02,
             "no_future_observation_release": True,
             "cyclic_gc_disabled_during_control": True,
-            "slow_vlm_warmup_calls_per_condition": 2,
+            "slow_vlm_warmup_calls_per_condition": args.slow_warmup_calls,
+            "slow_vlm_calibration_excluded_initial_calls": 2,
             "strict_timing_validity": "mean frequency within2%, max lateness and adjacent interval error each<=5ms",
             "fallback": "zero Cartesian delta; retain last committed gripper",
             "flow_publication": "all native clean positions after committed prefix",
             "pir2_publication": "only next clean delay-sized segment",
             "action_delay_budget": "calibratedp95 plus5ms, nondecreasing within episode, maximum5ticks",
         }
-    path = args.output / "config.json"
-    if path.exists() and json.loads(path.read_text()) != config:
-        raise RuntimeError("Protocol/checkpoint config changed on resume")
-    path.write_text(json.dumps(config, indent=2) + "\n")
+    config = save_run_configuration(args.output, config)
     records_path = args.output / "episodes.jsonl"
     records = (
         [json.loads(x) for x in records_path.read_text().splitlines()]
@@ -322,7 +401,7 @@ def main():
     )
     completed = {(x["task_id"], x["episode_id"]) for x in records}
     suite = benchmark.get_benchmark_dict()["libero_spatial"]()
-    for task_id in range(10):
+    for task_id in args.task_ids:
         task = suite.get_task(task_id)
         states = suite.get_task_init_states(task_id)
         env = LiberoEnv(
@@ -347,7 +426,7 @@ def main():
                     raw, _, _, _ = env._env.step([0, 0, 0, 0, 0, 0, -1])
                 obs = env._process_observation(raw)
                 initial_fingerprints = env.initial_fingerprints(obs)
-                args.record_video = episode_id == 0
+                args.record_video = episode_id == 0 and not args.no_video
                 trace_path = (
                     args.output / f"task{task_id}-episode{episode_id}-trace.jsonl"
                 )

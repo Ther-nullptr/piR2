@@ -3,8 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>πR² · 异步队列模拟器</title>
+    <title>πR² · 实测与队列实验台</title>
     <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="shared.css" />
   </head>
   <body>
     <header class="top">
@@ -12,8 +13,38 @@
         ><span class="brand-icon">π</span> REACTIVE LAB
         <span class="subbrand">πR² 队列实验台</span></a
       >
-      <span class="offline">● 本地运行 · 无需 GPU</span>
+      <span class="offline">● 本地运行 · 实测回放与机制仿真</span>
     </header>
+    <nav class="lab-nav" aria-label="实验台模式">
+      <button id="lab-tab-replay" type="button" aria-pressed="false">
+        实测回放
+      </button>
+      <button id="lab-tab-simulation" type="button" aria-pressed="true">
+        机制仿真
+      </button>
+      <span id="lab-evidence-status">正在检查本地实测包…</span>
+    </nav>
+    <section id="lab-replay" hidden aria-label="真实实验记录">
+      <p id="lab-replay-unavailable" class="notice" hidden>
+        此预览未配置实测包。机制仿真仍可使用；本地报告可通过预览服务的 --report
+        参数加载。
+      </p>
+      <iframe
+        id="lab-replay-frame"
+        title="πR² 实测队列与信息年龄回放"
+        loading="lazy"
+      ></iframe>
+      <div class="lab-intro">
+        <h1>从真实运行记录看队列与 AoI</h1>
+        <p>
+          按实际频率、特征来源与动作执行记录回放。单卡同时改变 S1/S2
+          频率；本次双卡的 S1 约 915 MHz，S2 随档位变化。
+        </p>
+        <a href="/experiment-report.html" target="_blank" rel="noopener"
+          >独立打开实测报告 ↗</a
+        >
+      </div>
+    </section>
     <div class="layout queue-layout" id="queue-mode">
       <aside class="queue-sidebar">
         <div class="side-title">
@@ -29,7 +60,7 @@
                 id="queue-computeMode"
                 data-queue-key="computeMode"
               >
-                <option value="independent">独立资源 · 无额外争用</option>
+                <option value="independent">独立 GPU · GPU 互不争用</option>
                 <option value="shared">单卡并发 · 共享时慢化</option>
                 <option value="serial">单卡串行 · 非抢占对照</option>
               </select></label
@@ -152,8 +183,130 @@
               不等于两次 NFE。
             </p>
           </fieldset>
+          <fieldset>
+            <legend>03 <span>量化与负载假设</span><em>非实测</em></legend>
+            <label
+              >VLM 精度标签<select
+                id="scenario-visionPrecision"
+                data-scenario-key="visionPrecision"
+              >
+                <option>BF16</option>
+                <option>INT8 / W8A8</option>
+                <option>INT4 / W4A16</option>
+                <option>自定义</option>
+              </select></label
+            >
+            <label
+              >VLM GPU 部分加速倍率<input
+                id="scenario-visionSpeedup"
+                data-scenario-key="visionSpeedup"
+                type="number"
+                min="0.1"
+                max="16"
+                step="0.1"
+                value="1"
+            /></label>
+            <label
+              >VLM 新增主机／转换开销（ms）<input
+                id="scenario-visionOverheadMs"
+                data-scenario-key="visionOverheadMs"
+                type="number"
+                min="0"
+                max="1000"
+                step="0.1"
+                value="0"
+            /></label>
+            <label
+              >DiT 精度标签<select
+                id="scenario-actionPrecision"
+                data-scenario-key="actionPrecision"
+              >
+                <option>BF16</option>
+                <option>INT8 / W8A8</option>
+                <option>INT4 / W4A16</option>
+                <option>自定义</option>
+              </select></label
+            >
+            <label
+              >DiT GPU 部分加速倍率<input
+                id="scenario-actionSpeedup"
+                data-scenario-key="actionSpeedup"
+                type="number"
+                min="0.1"
+                max="16"
+                step="0.1"
+                value="1"
+            /></label>
+            <label
+              >DiT 新增主机／转换开销（ms）<input
+                id="scenario-actionOverheadMs"
+                data-scenario-key="actionOverheadMs"
+                type="number"
+                min="0"
+                max="1000"
+                step="0.1"
+                value="0"
+            /></label>
+            <p class="hint">
+              精度标签本身不会改变速度。倍率只作用于下方设置的 GPU
+              部分；主机开销与传输不会自动按位宽缩小。当前实测权重为 BF16。
+            </p>
+            <label
+              >VLM 接纳频率上限（Hz，0=不限）<input
+                id="queue-vlmRateCapHz"
+                data-queue-key="vlmRateCapHz"
+                type="number"
+                min="0"
+                max="240"
+                step="1"
+                value="0"
+            /></label>
+            <label
+              >主机资源<select id="queue-hostMode" data-queue-key="hostMode">
+                <option value="independent">各自独立的非 GPU 阶段</option>
+                <option value="shared">共享单服务台 · 非抢占</option>
+              </select></label
+            >
+            <label
+              >首个动作请求额外启动延迟（ms）<input
+                id="queue-startupActionDelayMs"
+                data-queue-key="startupActionDelayMs"
+                type="number"
+                min="0"
+                max="1000"
+                step="0.1"
+                value="0"
+            /></label>
+            <p class="hint">
+              接纳上限约束相邻 VLM
+              请求的启动间隔，摄像机仍按原频率送帧。共享主机是可选简化假设，不是
+              CPU 性能测量。
+            </p>
+          </fieldset>
           <details class="queue-advanced">
             <summary>GPU 占比、抖动与缓冲设置</summary>
+            <div id="queue-paper-controls">
+              <label
+                >论文参考初始 d<input
+                  id="queue-paperInitialDelay"
+                  data-queue-key="paperInitialDelay"
+                  type="number"
+                  min="1"
+                  max="5"
+                  step="1"
+                  value="1"
+              /></label>
+              <label
+                >滚动耗时窗口（次）<input
+                  id="queue-delayWindow"
+                  data-queue-key="delayWindow"
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  value="20"
+              /></label>
+            </div>
             <label for="queue-gpuShareA"
               >动作耗时中的 GPU 比例<input
                 id="queue-gpuShareA"
@@ -211,7 +364,7 @@
                 value="1"
             /></label>
             <label for="queue-marginMs"
-              >自适应预算余量 <span class="unit">ms</span
+              >LIBERO 预算余量 <span class="unit">ms</span
               ><input
                 id="queue-marginMs"
                 data-queue-key="marginMs"
@@ -233,7 +386,7 @@
                 value="5"
             /></label>
             <label for="queue-bootstrapSlots"
-              >初始干净动作槽 <span class="unit">个</span
+              >启动槽上限 <span class="unit">个</span
               ><input
                 id="queue-bootstrapSlots"
                 data-queue-key="bootstrapSlots"
@@ -244,7 +397,8 @@
                 value="40"
             /></label>
             <p class="hint">
-              图前已准备 F−1 和这些启动动作。设为 0 可观察执行槽不足时的
+              图前已准备 F−1 和启动动作；论文参考模式仅使用前初始 d 个，LIBERO
+              使用所填槽数。设为 0 可观察执行槽不足时的
               fallback；不模拟启动模型推理。
             </p>
           </details>
@@ -257,10 +411,150 @@
         </p>
       </aside>
       <main class="queue-main">
+        <div id="queue-error" role="alert" hidden></div>
+        <div class="queue-observation" aria-label="时序与信息年龄观察区">
+          <div class="queue-observation-controls">
+            <div class="lab-policy-controls">
+              <label
+                >调度模式<select
+                  id="queue-executionPolicy"
+                  data-queue-key="executionPolicy"
+                >
+                  <option value="paper">
+                    论文机制参考 · 旧段续播 / 末动作重复
+                  </option>
+                  <option value="libero">
+                    本地 LIBERO · 时间槽 / 保持指令
+                  </option>
+                </select></label
+              >
+              <span id="lab-policy-live" aria-live="polite"></span>
+            </div>
+            <div class="queue-playback">
+              <button id="queue-play" class="play-button" aria-label="播放时序">
+                播放</button
+              ><button id="queue-step" aria-label="前进一个控制 tick">
+                下一 tick</button
+              ><input
+                id="queue-time"
+                type="range"
+                min="0"
+                max="4000"
+                step="1"
+                value="260"
+                aria-label="模拟时间，毫秒"
+              /><output id="queue-time-label"></output
+              ><label class="speed-label"
+                >速度<select id="queue-speed" aria-label="回放速度">
+                  <option value="0.25">0.25×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="2">2×</option>
+                </select></label
+              >
+            </div>
+            <div class="lab-timeline-options">
+              <label
+                >时间范围<select id="lab-timeline-span">
+                  <option value="0" selected>完整时段</option>
+                  <option value="600">游标附近 0.6 秒</option>
+                  <option value="1500">游标附近 1.5 秒</option>
+                </select></label
+              ><span
+                >短条标签可通过悬停查看；点击 S1 请求高亮真实特征来源。</span
+              >
+            </div>
+          </div>
+          <section class="panel queue-timeline-panel">
+            <div class="panel-title">
+              <div>
+                <span class="eyebrow">机制仿真 · COMPUTE, WAIT, EXECUTE</span>
+                <h2>有来源编号的逐事件时序</h2>
+              </div>
+              <span id="queue-window-label" class="tag"></span>
+            </div>
+            <div
+              class="legend chart-legend"
+              id="queue-timeline-legend"
+              aria-label="时序图图例"
+            >
+              <span style="color: var(--s2)">■ S2 视觉</span
+              ><span style="color: var(--s1)">■ S1 动作</span
+              ><span>W 待领取</span
+              ><span style="color: var(--repeat)">↻ 重复末动作</span
+              ><span style="color: var(--red)">× 未采用</span>
+            </div>
+            <p class="chart-caption">
+              S1[n].k 使用 S2-n
+              的特征；点击追溯。执行条：蓝新段、橙续播、紫重复。
+            </p>
+            <div id="queue-timeline" class="queue-chart"></div>
+            <p class="chart-caption">
+              槽色越深，状态越旧；蓝框为最新采用批次。悬停查看耗时。
+            </p>
+          </section>
+          <section class="panel lab-aoi-panel">
+            <div class="panel-title">
+              <h2>信息年龄 AoI：缓存新，不代表正在执行的动作也新</h2>
+              <span id="lab-aoi-now" class="tag"></span>
+            </div>
+            <div
+              class="legend chart-legend"
+              id="lab-aoi-legend"
+              aria-label="AoI 图例"
+            >
+              <span style="color: var(--s2)">━ 最新缓存</span
+              ><span style="color: var(--s1)">━ 执行动作的图像</span
+              ><span style="color: var(--state)">━ 执行动作的状态</span>
+            </div>
+            <p class="chart-caption">
+              AoI＝当前时刻−来源采样时刻；重复动作不刷新，未知来源留空。
+            </p>
+            <div id="lab-aoi-chart" class="queue-chart"></div>
+            <div class="lab-delay-heading">
+              <strong>d 的运行时变化</strong><span id="lab-delay-rule"></span>
+            </div>
+            <div id="lab-delay-chart"></div>
+          </section>
+        </div>
+        <details class="panel queue-policy-notes">
+          <summary>调度口径与参考来源</summary>
+          <p id="lab-policy-description" class="notice"></p>
+          <p class="muted">
+            论文参考模式按 §3.3 和 Algorithm 2 建模滚动 d
+            与连续请求；超时兜底参考作者固定版本，重复最后的已去噪动作。可执行段宽度固定为该请求的
+            d，不向尚未去噪的尾部取动作。此处统一使用 40 格示意缓冲和可配置 d
+            上限，不是部署脚本的逐行复刻。
+          </p>
+          <p class="muted">
+            <a
+              href="https://arxiv.org/html/2607.26055v1#A3"
+              target="_blank"
+              rel="noopener"
+              >论文 Algorithm 2</a
+            >
+            ·
+            <a
+              href="https://github.com/pi-r2-flow/pi-r2-flow/blob/3af52ca400a6ec7d141416879aa531a6f62f697a/deployment/apps/run_policy.py#L896-L910"
+              target="_blank"
+              rel="noopener"
+              >作者代码的末动作重复</a
+            >
+          </p>
+        </details>
+
+        <section class="panel lab-policy-comparison">
+          <h2>相同耗时下，两种调度口径的差异</h2>
+          <div id="lab-policy-comparison" class="lab-compare-table"></div>
+          <p class="muted">
+            两列使用相同独占耗时与硬件假设；请求节奏、初始
+            d、结果接纳与兜底方式不同。论文参考列由模型推演，实测回放仍是原始
+            LIBERO 记录。
+          </p>
+        </section>
         <section class="hero">
           <div>
             <span class="eyebrow">VISION × ACTION × CONTROL</span>
-            <h1>πR² 异步队列模拟器</h1>
+            <h1>从假设参数研究资源、队列与新鲜度</h1>
             <p>
               输入 VLM 与动作推理耗时，逐 tick
               看清谁在计算、谁在等待、控制器执行了哪个动作。
@@ -269,8 +563,8 @@
           <span class="mode-badge">离散事件 · 可追溯来源</span>
         </section>
         <div class="notice queue-intro">
-          <strong>V0 先完成，I0 才能读取 F0。</strong> 同一特征可被 I0a、I0b
-          复用；动作计算慢时增大 d，由已承诺动作衔接执行。
+          <strong>S2 = VLM，S1 = DiT。</strong> S1[n].k 只有实际读取 S2-n
+          发布的缓存才与它配对；同一缓存可复用。当前模拟结果由输入假设生成，不是量化或新硬件实测。
         </div>
         <div class="presets queue-presets" aria-label="四类工作点">
           <button data-queue-preset="1">
@@ -288,7 +582,58 @@
             试试单卡争用：V 100 / I 20 ms，κ=1</button
           ><span id="queue-resource-note"></span>
         </div>
-        <div id="queue-error" role="alert" hidden></div>
+        <div class="lab-examples">
+          <button type="button" id="lab-example-repeat">
+            示例：旧段续播与末动作重复
+          </button>
+          <button type="button" id="lab-example-recover-d">
+            示例：滚动 d 升高后回落
+          </button>
+          <button type="button" id="lab-example-feedback">
+            示例：VLM 加速与接纳率反馈
+          </button>
+          <button type="button" id="lab-example-latch">
+            LIBERO 示例：微小超时让 d 只升不降
+          </button>
+          <button type="button" id="lab-compare-cap">将 VLM 限制为 5 Hz</button>
+        </div>
+        <p class="notice" id="lab-calibration-source">
+          当前为可编辑的机制假设；可从实测回放载入独占校准数据。
+        </p>
+
+        <section class="panel lab-scenario-summary">
+          <div class="panel-title">
+            <h2>实际服务假设与同策略参考</h2>
+            <span class="tag">倍率不等于位宽比</span>
+          </div>
+          <p id="lab-transform-note"></p>
+          <div class="lab-compare-table" id="lab-compare-table"></div>
+          <p id="lab-load-note" class="muted"></p>
+          <div class="lab-budgets">
+            <label
+              >VLM P95 预算（ms）<input
+                id="lab-vision-budget"
+                type="number"
+                min="1"
+                max="10000"
+                value="100"
+            /></label>
+            <label
+              >DiT P95 预算（ms）<input
+                id="lab-action-budget"
+                type="number"
+                min="1"
+                max="10000"
+                value="50"
+            /></label>
+            <strong id="lab-state-class"></strong>
+          </div>
+          <p class="muted">
+            预算分类与实际动作截止时间分开：增大 d
+            可能消除回退，但不代表恢复原来的 50 ms
+            响应目标。精度对任务质量的影响尚未模拟。
+          </p>
+        </section>
         <section class="metrics queue-metrics" aria-label="整段模拟统计">
           <article>
             <span>当前 d · 控制 tick</span><strong id="queue-delay">—</strong
@@ -337,69 +682,11 @@
           <div id="queue-resource-costs" class="chart-note"></div>
           <p class="muted">
             初始 d
-            使用独占请求样本标定；实际响应受到争用或排队影响后，运行时再调整
-            d。对照复用相同输入和种子，属于机制模拟，不是实测 GPU 性能预测。
+            与运行时更新由所选调度模式决定。对照复用相同输入、模式和种子，属于机制模拟，不是实测
+            GPU 性能预测。
           </p>
         </section>
-        <section class="panel queue-timeline-panel">
-          <div class="panel-title">
-            <div>
-              <span class="eyebrow">01 / COMPUTE, WAIT, EXECUTE</span>
-              <h2>有来源编号的逐事件时序</h2>
-            </div>
-            <span id="queue-window-label" class="tag"></span>
-          </div>
-          <div class="queue-playback">
-            <button id="queue-play" class="play-button" aria-label="播放时序">
-              播放</button
-            ><button id="queue-step" aria-label="前进一个控制 tick">
-              下一 tick</button
-            ><input
-              id="queue-time"
-              type="range"
-              min="0"
-              max="4000"
-              step="1"
-              value="260"
-              aria-label="模拟时间，毫秒"
-            /><output id="queue-time-label"></output
-            ><label class="speed-label"
-              >速度<select id="queue-speed" aria-label="回放速度">
-                <option value="0.25">0.25×</option>
-                <option value="1" selected>1×</option>
-                <option value="2">2×</option>
-              </select></label
-            >
-          </div>
-          <div id="queue-timeline" class="queue-chart"></div>
-          <div class="freshness-legend" aria-label="输出槽状态年龄图例">
-            <strong>输出槽看状态龄</strong
-            ><span><i class="freshness-recent"></i>≤1Tc</span
-            ><span><i class="freshness-middle"></i>1–2Tc</span
-            ><span><i class="freshness-older"></i>&gt;2Tc</span
-            ><span><i class="freshness-bootstrap"></i>图前初始化</span
-            ><span class="latest-legend">强蓝框：最新已采用批次</span>
-          </div>
-          <p class="freshness-explanation">
-            状态龄 = 当前播放时刻 −
-            该请求的状态采样时刻；同批动作同色。颜色深只表示更旧，不代表失效。未完成显示“待生成”；悬停查看其实际输入特征的视觉龄和完成后经过的时间。
-          </p>
-          <div class="legend">
-            <span><i class="key-vision"></i>Vn / Fn：视觉计算与特征</span
-            ><span><i class="key-inference"></i>Ina：使用 Fn 的动作计算</span
-            ><span><i class="key-action"></i>Ina[k]：可执行动作</span
-            ><span><i class="key-wait"></i>W：完成后等待领取</span
-            ><span><i class="key-bootstrap"></i>Bk：初始化动作</span
-            ><span><i class="key-sharing"></i>斜纹：共享时慢化</span
-            ><span><i class="key-gpu-wait"></i>点纹：等待 GPU</span
-            ><span><i class="key-host"></i>灰条：非 GPU 阶段</span
-            ><span><span class="unused-mark">×</span> 已确认未采用</span>
-          </div>
-          <p class="muted">
-            V/I 块表示完整请求响应，底部纹理区分非 GPU 阶段、等 GPU
-            和共享慢化。淡色是尚未发生的模拟事件；小叉在覆盖或过期确认后显示。悬停可查看独占、慢化、排队与实际耗时。
-          </p>
-        </section>
+
         <section class="queue-snapshots" aria-label="当前时刻的逐槽队列状态">
           <article class="panel">
             <div class="panel-title">
@@ -479,7 +766,8 @@
               <h3>本仓的时间槽语义</h3>
               <p>
                 自适应预算由动作响应时间加余量并向上取整；忙时跳过请求机会，领取结果时仅写入未过期、未承诺的目标格。固定
-                d 可用于观察预算不足。
+                d 可用于观察预算不足；论文参考模式按近期响应均值更新
+                d，允许回落，并在可执行段耗尽时重复最后动作。
               </p>
             </div>
             <div>
@@ -515,6 +803,8 @@
       </main>
     </div>
     <script src="model.js"></script>
+    <script src="scenarios.js"></script>
+    <script src="lab.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

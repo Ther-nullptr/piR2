@@ -11,6 +11,8 @@ The project does not redistribute model weights or training datasets. Obtain the
 
 - **Transformers 4.57.3 Qwen3-VL**: https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py. Copyright 2025 The Qwen Team and The HuggingFace Inc. team. The vision/attention paths in `coexecution/static_s2.py` adapt this Apache-2.0 code to cache static metadata; see [licenses/TRANSFORMERS_LICENSE](licenses/TRANSFORMERS_LICENSE). The RoPE/RMSNorm bindings in `coexecution/groot_fusion.py` and gated-MLP forward in `coexecution/groot_pointwise.py` also follow this pinned implementation, replacing selected operations with local inference kernels. Fusion adapters preserve the underlying source's attribution and compare against that pinned implementation.
 
+- **Source Han Sans / 思源黑体**: https://github.com/adobe-fonts/source-han-sans at `a4f7cf94edfb9d7ffbdfc4841de276358bd7e0f2`. Copyright 2014–2025 Adobe; SIL Open Font License 1.1, Reserved Font Name “Source”. [License](licenses/SOURCE_HAN_SANS_LICENSE). The unmodified CN variable WOFF2 is an optional separately downloaded local asset; its SHA-256 is recorded in `sources.lock.json`. Offline reports embed the font and its license when present.
+
 ## Optional Speedup Paradox integer dependency
 
 The `robotics-kernels` component in [sources.lock.json](sources.lock.json) fetches

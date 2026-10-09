@@ -12,6 +12,36 @@ from libero_protocol_scheduler import (
 
 
 class TimingContracts(unittest.TestCase):
+    def test_snapshot_tracks_producer_without_changing_command_ownership(self):
+        queue = CommandTimeline(np.zeros((6, 7)))
+        queue.reserve(0, 2)
+        queue.publish(3, 1, np.ones((4, 7)), next_tick=1)
+        snapshot = queue.snapshot()
+        slots = {slot["tick"]: slot for slot in snapshot["slots"]}
+        self.assertEqual(snapshot["committed_until"], 2)
+        self.assertEqual(slots[1]["status"], "committed")
+        self.assertEqual(slots[1]["producer_kind"], "bootstrap")
+        self.assertIsNone(slots[1]["producer_request_tick"])
+        self.assertEqual(slots[2]["status"], "future")
+        self.assertEqual(slots[2]["producer_request_tick"], 3)
+        slots[1]["producer_kind"] = "mutated"
+        queue.execute(1)
+        self.assertEqual(queue.last_execution["producer_kind"], "bootstrap")
+        self.assertNotIn(1, [slot["tick"] for slot in queue.snapshot()["slots"]])
+
+    def test_fallback_snapshot_never_claims_a_model_producer(self):
+        queue = CommandTimeline(np.zeros((1, 7)))
+        queue.reserve(0, 3)
+        slots = queue.snapshot()["slots"]
+        self.assertEqual(slots[2]["status"], "fallback")
+        self.assertTrue(slots[2]["committed"])
+        self.assertTrue(slots[2]["fallback"])
+        self.assertIsNone(slots[2]["producer_request_tick"])
+        self.assertEqual(slots[2]["reserved_at_tick"], 0)
+        queue.execute(5)
+        self.assertTrue(queue.last_execution["fallback"])
+        self.assertEqual(queue.last_execution["reserved_at_tick"], 5)
+
     def test_old_request_defines_which_actions_are_clean(self):
         queue = CommandTimeline(np.zeros((6, 7)))
         queue.reserve(0, 1)
