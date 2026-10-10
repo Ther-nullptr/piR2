@@ -96,7 +96,9 @@ def environment(gpu, client=False):
     env = os.environ.copy()
     env.update(
         CUDA_VISIBLE_DEVICES=str(gpu),
-        PYTHONPATH=str(ROOT / "upstream/learning/Isaac-GR00T"),
+        PYTHONPATH=os.pathsep.join(
+            [str(ROOT), str(ROOT / "upstream/learning/Isaac-GR00T")]
+        ),
         PYTHONUNBUFFERED="1",
         PYTHONHASHSEED="1000",
         OMP_NUM_THREADS="2",

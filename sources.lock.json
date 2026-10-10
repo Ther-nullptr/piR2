@@ -17,6 +17,12 @@
       "path": "third_party/mujoco_playground",
       "patches": []
     },
+    "robotics-kernels": {
+      "url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox.git",
+      "revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "path": "third_party/robotics-the-speedup-paradox",
+      "patches": []
+    },
     "source_han_sans": {
       "url": "https://github.com/adobe-fonts/source-han-sans",
       "revision": "a4f7cf94edfb9d7ffbdfc4841de276358bd7e0f2",

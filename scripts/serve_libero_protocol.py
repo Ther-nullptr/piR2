@@ -9,6 +9,12 @@ from pathlib import Path
 
 from libero_inference_backend import Backend, endpoint_layout
 
+from coexecution.groot_optimization import (
+    GrootOptimizations,
+    add_optimization_arguments,
+    optimization_config,
+)
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -45,13 +51,22 @@ def load_core(checkpoint, output, device):
     return core
 
 
-def serve(backend, spec, identity):
+def serve(backend, spec, identity, optimization=None):
     import torch
     from gr00t.policy.server_client import PolicyServer
 
     # Construct and run the ZMQ socket on its owning thread. A distinct stream per
     # endpoint permits same-context overlap on one GPU; fences are stream-local.
-    with torch.cuda.device(spec["device"]), torch.cuda.stream(backend.stream):
+    with (
+        torch.cuda.device(spec["device"]),
+        torch.cuda.stream(backend.stream),
+        GrootOptimizations(backend.core, optimization) as optimized,
+    ):
+        if optimized.config.enabled:
+            identity["inference_optimization"] = optimized.evidence()
+            (backend.output / "identity.json").write_text(
+                json.dumps(identity, indent=2) + "\n"
+            )
         server = PolicyServer(backend.core, host="127.0.0.1", port=spec["port"])
         server.register_endpoint("identity", lambda: identity, requires_input=False)
         server.register_endpoint(
@@ -101,9 +116,6 @@ def supervise_workers(workers, worker_fn=serve):
 
 
 def main():
-    import torch
-    from libero_experiment_utils import checkpoint_identity
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -116,10 +128,21 @@ def main():
     )
     parser.add_argument("--vlm-port", type=int)
     parser.add_argument("--torch-threads", type=int, default=2)
+    add_optimization_arguments(parser)
     args = parser.parse_args()
+    optimization = optimization_config(args)
+    optimization.validate_variant(args.variant)
     layout = endpoint_layout(
         args.device, args.vlm_device, args.port, args.vlm_port, args.role
     )
+    if optimization.enabled and len(layout) > 1:
+        raise ValueError(
+            "Experimental optimizations require a single worker; "
+            "paired S1/S2 integration is not validated"
+        )
+    import torch
+    from libero_experiment_utils import checkpoint_identity
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
     torch.set_num_threads(args.torch_threads)
@@ -151,7 +174,7 @@ def main():
             "feature_transport": "CPU numpy RPC, identical for single/dual layouts",
         }
         (output / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
-        workers.append((backend, spec, identity))
+        workers.append((backend, spec, identity, optimization))
     if len(workers) == 1:
         serve(*workers[0])
     else:
