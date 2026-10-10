@@ -39,12 +39,15 @@ This is a server invocation, not a completed closed-loop protocol. The existing 
 
 - `--operator-fusion`: BF16 RoPE/RMSNorm, AdaLN modulation, and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
 - `--vision-channels-last`: independently opt into channels-last-3D inputs and weights for the vision patch Conv3D. This can avoid the `SlowDilated3d` fallback; it preserves tensor values but can change BF16 rounding. The original weight storage, layout and hooks are restored on exit. Compare fusion and integer modes with the same explicit layout setting and measure its action differences separately.
+- `--norm-modulation-quant`: experimental fusion of non-affine DiT LayerNorm, AdaLN modulation, dynamic scale and integer packing, using the pinned reference Triton kernel. Requires integer precision and `--operator-fusion`; shared and per-token conditions are supported. FP32 reduction order differs from native LayerNorm, so this is not a bitwise-preserving option.
+- `--residual-norm-quant`: additionally fuse the attention-output residual addition, FFN input LayerNorm and integer packing. Requires `--norm-modulation-quant` and a quantized FFN input projection. GR00T has no gate/modulation at this boundary: unit gate and zero scale/shift reuse the reference residual kernel without changing the residual equation. The FFN output residual remains separate. Only non-affine LayerNorm and blocks without positional embeddings are supported. Both new options default off and restore original forwards on exit; checkpoint quality and GPU savings require target-device validation.
 - `--inference-precision {bf16,w8a8,w4a4}`: BF16 is the default; W4A4 is experimental and can substantially change actions.
 - `--quantization-scope transformer`: quantize selected vision/text/DiT transformer projections. `all` additionally selects other BF16 Linear modules, including conditioning and vocabulary projections; it does not skip logits or cache condition calculations.
 - `--quantization-category-id N`: with `scope=all`, quantize the fixed embodiment's category projections. Each call checks B1 and the actual ID; omitting the option leaves these projections in BF16. ID 2 is the LIBERO_PANDA mapping in the pinned model, not a universal embodiment ID.
 - `--group-conditioning`: with integer precision, fusion and `scope=all`, concatenate the DiT blocks' condition projections and final output-modulation projection using the reference `IntegerProjectionGroup`. They consume the same activated condition in this fused forward, so one preparation and GEMM serves all projections. Shared `[B,D]` and per-token `[B,T,D]` conditions retain their values; this is within one forward, with no reuse across denoising steps. Concatenated weights are packed at installation and require additional packed-weight storage. The option defaults off, requires complete coverage of the group to take effect, and records actual groups in the identity metadata. It does not establish streaming checkpoint or closed-loop quality. Measure both its complete group and full inference; the speedup of these small projections is not the speedup of every model GEMM.
 - `--quantization-coverage FILE`: optionally select ordinary Linear sites using a JSON `linears` mapping keyed by module name. Input `shape` fields are needed only for legacy shape-based tactic lookup. Without this file, the selected model inventory is used; category projections are selected separately by `--quantization-category-id`.
 - `--quantization-tactics FILE`: optional `{"8": {"module.name": 0}, "4": {...}}` mapping. `--quantization-group-tactics FILE` accepts rows with `bits`, `members` and `tactic`; legacy shape rows additionally require explicit coverage. Tactics are integers 0–7. Unmatched entries use reference tactic 0, not a measured optimum. No past experiment directory is searched automatically.
+- `--quantization-shape-tactics FILE`: optional rows such as `[{"bits": 8, "shape": [41, 6144, 1536, true], "tactic": 2}]`, with shape `[M, K, N, has_bias]`. An exact match overrides the module/group tactic for that call; other shapes retain their configured tactic. `M` is the flattened input row count, `K`/`N` are the integer projection's logical widths (a grouped projection uses its combined padded output width). This selects existing reference kernels for native, prepared-input and grouped paths without changing quantization or weights. Load the table before CUDA Graph capture; close and recreate the optimization scope to change it. Calibrate on the target device and checkpoint, then validate full streaming replay; an example row is not a recommended preset.
 
 For an already loaded eval-mode BF16 CUDA policy, the same public interface is:
 
@@ -110,6 +113,26 @@ production-model speedup:
 ```bash
 PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_groot_streaming_gpu.py
 ```
+
+Explicit checks for the experimental norm/residual options:
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_groot_norm_quant_gpu.py
+```
+
+Shape-tactic dispatch has separate opt-in CUDA checks for both precisions, prepared inputs, grouped projections and changing-shape Graph capture:
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_shape_tactics_gpu.py
+```
+
+These checks separate native-reduction control-flow equivalence from fused
+reduction error, exercise streaming/reset/Graph and restoration, and verify true
+integer and fused kernel execution. They do not establish task success. Compare
+the existing integer path, norm fusion, then residual fusion at the same precision,
+checkpoint, inputs, layout and Graph setting. Report repeated profiled GPU kernel /
+memcpy / memset duration sums separately from CUDA-event elapsed time and host
+latency; inspect action error against both the previous integer path and BF16.
 
 ## Measured LIBERO queue reports
 

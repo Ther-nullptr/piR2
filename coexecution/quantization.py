@@ -6,6 +6,7 @@ THIRD_PARTY_NOTICES.md for upstream provenance; no third-party kernel is copied.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +20,34 @@ from robotics_kernels.ampere_ada.integer import (
 from robotics_kernels.common.fused import prepare_gelu
 
 _LAUNCHERS = {}
+
+
+def selected_tactic(q, rows):
+    return getattr(q, "shape_tactics", {}).get(rows, q.tactic)
+
+
+def install_shape_tactics(q, choices):
+    """Select existing reference kernels before launch/capture, without repacking."""
+    q.shape_tactics = {
+        rows: tactic
+        for (bits, rows, k, n, bias), tactic in choices.items()
+        if (bits, k, n, bias)
+        == (q.bits, q.in_features, q.out_features, q.bias is not None)
+    }
+    original = getattr(q, "_reference_ops", q._ops)
+    q._reference_ops = original
+
+    def bind(operation):
+        def run(a, sa, b, sb, bias, bits, tactic):
+            return operation(
+                a, sa, b, sb, bias, bits, q.shape_tactics.get(a.shape[0], tactic)
+            )
+
+        return run
+
+    q._ops = SimpleNamespace(
+        gemm=bind(original.gemm), gemm_biasless=bind(original.gemm_biasless)
+    )
 
 
 def inventory(model, expanded=False):
@@ -238,7 +267,14 @@ class TransformerINT:
             return q.forward_packed(x.for_bits(q.bits))
         if self.native:
             y = torch.ops.pir2_integer_dispatch.linear(
-                x, q.packed_weight, q.weight_scale, q.bias, lut, up, q.bits, q.tactic
+                x,
+                q.packed_weight,
+                q.weight_scale,
+                q.bias,
+                lut,
+                up,
+                q.bits,
+                selected_tactic(q, x.numel() // x.shape[-1]),
             )
             return y[:, : q.out_features].reshape(*x.shape[:-1], q.out_features)
         return q.forward_packed(prepare(x, q.bits, lut, up))

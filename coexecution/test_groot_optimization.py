@@ -14,6 +14,7 @@ from coexecution.groot_optimization import (
     add_optimization_arguments,
     apply_tactics,
     optimization_config,
+    read_shape_tactics,
 )
 
 
@@ -27,6 +28,32 @@ def test_default_does_not_import_gpu_modules_or_touch_policy():
         assert not config.vision_channels_last
         assert scope.evidence()["coverage"] == {}
     assert set(sys.modules) == before
+
+
+@pytest.mark.parametrize("precision", ["w8a8", "w4a4"])
+def test_norm_residual_fusion_flags_require_integer_fusion(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            [
+                "--inference-precision",
+                precision,
+                "--operator-fusion",
+                "--norm-modulation-quant",
+                "--residual-norm-quant",
+            ]
+        )
+    )
+    assert config.norm_modulation_quant and config.residual_norm_quant
+    config.validate_variant("pir2")
+    assert not OptimizationConfig().norm_modulation_quant
+    assert not OptimizationConfig().residual_norm_quant
+    for options in ({}, {"fusion": True}, {"precision": precision}):
+        with pytest.raises(ValueError, match="fusion and integer"):
+            OptimizationConfig(norm_modulation_quant=True, **options)
+    with pytest.raises(ValueError, match="requires norm_modulation_quant"):
+        OptimizationConfig(precision=precision, fusion=True, residual_norm_quant=True)
 
 
 def test_flags_are_independent_and_streaming_allows_eager_integer_inference():
@@ -236,6 +263,63 @@ def test_explicit_tactics_and_group_defaults(tmp_path):
     )
     with pytest.raises(ValueError, match="tactic"):
         apply_tactics(controller, extra, config, {})
+
+
+def test_shape_tactics_reach_singles_categories_and_groups(tmp_path, monkeypatch):
+    path = tmp_path / "shapes.json"
+    path.write_text(
+        json.dumps([{"bits": 8, "shape": [41, 130, 64, True], "tactic": 2}])
+    )
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--quantization-shape-tactics", str(path)])
+    )
+    installed = []
+    monkeypatch.setitem(
+        sys.modules,
+        "coexecution.quantization",
+        SimpleNamespace(
+            install_shape_tactics=lambda q, shapes: installed.append((q, shapes))
+        ),
+    )
+    single, category, group = [SimpleNamespace(tactic=0) for _ in range(3)]
+    controller = SimpleNamespace(
+        quant={8: {"q": single}, 4: {}},
+        grouped={8: [(["k", "v"], SimpleNamespace(linear=group))], 4: []},
+    )
+    extra = SimpleNamespace(quant={8: {"category": category}, 4: {}})
+    apply_tactics(controller, extra, config, {})
+    assert [id(q) for q, _ in installed] == [id(single), id(category), id(group)]
+    assert all(shapes == {(8, 41, 130, 64, True): 2} for _, shapes in installed)
+    assert GrootOptimizations(object(), config).evidence()["config"]["shape_tactics"][
+        "sha256"
+    ]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"bits": True, "shape": [41, 130, 64, True], "tactic": 2},
+        {"bits": 8, "shape": [True, 130, 64, True], "tactic": 2},
+        {"bits": 8, "shape": [41, 0, 64, True], "tactic": 2},
+        {"bits": 8, "shape": [41, 130, 64, 1], "tactic": 2},
+        {"bits": 8, "shape": [41, 130, 64, True], "tactic": 8},
+    ],
+)
+def test_shape_tactics_reject_invalid_signatures(tmp_path, row):
+    path = tmp_path / "shapes.json"
+    path.write_text(json.dumps([row]))
+    with pytest.raises(ValueError):
+        read_shape_tactics(path)
+
+
+def test_shape_tactics_reject_duplicate_signatures(tmp_path):
+    path = tmp_path / "shapes.json"
+    row = {"bits": 8, "shape": [41, 130, 64, True], "tactic": 2}
+    path.write_text(json.dumps([row, row]))
+    with pytest.raises(ValueError, match="Duplicate"):
+        read_shape_tactics(path)
 
 
 def test_group_shape_tactics_require_explicit_coverage(tmp_path):
