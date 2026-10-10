@@ -22,6 +22,7 @@ def load_core(checkpoint, output, device):
     import torch
     from gr00t.policy import gr00t_policy as policy_module
     from gr00t.policy.decoupled_policy import DecoupledGr00tPolicy
+    from libero_model_loading import task_checkpoint_backbone
 
     original = policy_module.AutoModel.from_pretrained
 
@@ -42,7 +43,7 @@ def load_core(checkpoint, output, device):
 
     policy_module.AutoModel.from_pretrained = checked
     try:
-        with torch.cuda.device(device):
+        with task_checkpoint_backbone(), torch.cuda.device(device):
             core = DecoupledGr00tPolicy("LIBERO_PANDA", str(checkpoint), device=device)
             # Startup only: parameters must be ready before an endpoint owns its stream.
             torch.cuda.synchronize(device)
