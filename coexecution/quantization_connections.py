@@ -5,10 +5,21 @@ Reuses robotics-the-speedup-paradox revision
 """
 
 import torch
-from robotics_kernels.ampere_ada.modulation import PackedActivations, prepare_modulation
+from robotics_kernels.ampere_ada.modulation import (
+    PackedActivations,
+    prepare_modulation,
+    prepare_norm_modulation,
+    prepare_residual_norm_modulation,
+)
 from robotics_kernels.common.graph import CudaGraphCall
 
 from coexecution.quantization import PreparedLinear
+
+
+def packed_input(packed, shape):
+    result = PackedActivations({packed.bits: packed}).with_leading_shape(shape[:-1])
+    result.shape = shape  # Attention reads the batch size before Q projection.
+    return result
 
 
 class AdditionalConnections:
@@ -32,6 +43,8 @@ class AdditionalConnections:
                     )
                 )
             ]
+        self.all_blocks = policy.model.action_head.model.transformer_blocks
+        self.blocks, self.saved_blocks = [], []
         self.saved = [
             (m, m.forward, "forward" in m.__dict__)
             for m in [*(m for m, _ in categories.values()), *self.norms]
@@ -62,11 +75,41 @@ class AdditionalConnections:
                     linear, bits=bits, pack_reuse=True, biasless_epilogue=True
                 )
 
-    def set(self, mode, *, expanded=True, fuse=True):
+    def set(
+        self, mode, *, expanded=True, fuse=True, norm_quant=False, residual_quant=False
+    ):
         self.close()
+        if (norm_quant or residual_quant) and (not fuse or mode == "bf16"):
+            raise ValueError(
+                "Norm quantization fusion requires fusion and integer precision"
+            )
+        if residual_quant and not norm_quant:
+            raise ValueError("Residual fusion requires norm quantization fusion")
         if mode == "bf16":
             return
         bits = {"w8a8": 8, "w4a4": 4}[mode]
+        if residual_quant:
+            quantized = {id(module) for module, _, _ in self.controller.sites.values()}
+            self.blocks = [
+                b for b in self.all_blocks if id(b.ff.net[0].proj) in quantized
+            ]
+        if norm_quant:
+            if not self.norms:
+                raise ValueError(
+                    "Norm fusion selected no fully quantized attention input"
+                )
+            for norm in [
+                *(n.norm for n in self.norms),
+                *(b.norm3 for b in self.blocks if residual_quant),
+            ]:
+                if not isinstance(norm, torch.nn.LayerNorm) or norm.elementwise_affine:
+                    raise ValueError("Norm fusion requires non-affine LayerNorm")
+        if residual_quant and (
+            not self.blocks or any(b.pos_embed is not None for b in self.blocks)
+        ):
+            raise ValueError(
+                "Residual fusion requires quantized FFN inputs without position embeddings"
+            )
         if expanded:
             for name, (module, category) in self.categories.items():
                 q = self.quant[bits][name]
@@ -92,36 +135,93 @@ class AdditionalConnections:
 
                 def forward(x, temb=None, norm=norm):
                     scale, shift = norm.linear(norm.silu(temb)).chunk(2, dim=-1)
-                    normalized = norm.norm(x)
+                    normalized = x if norm_quant else norm.norm(x)
+                    prepare = (
+                        prepare_norm_modulation if norm_quant else prepare_modulation
+                    )
+                    options = {"eps": norm.norm.eps} if norm_quant else {}
                     if scale.ndim == 3:
                         width = x.shape[-1]
-                        packed = prepare_modulation(
+                        packed = prepare(
                             normalized.reshape(-1, 1, width),
                             scale.reshape(-1, 1, width),
                             shift.reshape(-1, 1, width),
                             bits,
-                        )
-                        result = PackedActivations({bits: packed}).with_leading_shape(
-                            x.shape[:-1]
+                            **options,
                         )
                     else:
-                        packed = prepare_modulation(
-                            normalized, scale[:, None], shift[:, None], bits
+                        packed = prepare(
+                            normalized, scale[:, None], shift[:, None], bits, **options
                         )
-                        result = PackedActivations({bits: packed})
-                    result.shape = (
-                        x.shape
-                    )  # GR00T attention reads the batch size before Q projection.
-                    return result
+                    return packed_input(packed, x.shape)
 
                 norm.forward = forward
+        if residual_quant:
+            self._residual_blocks(bits)
+
+    def _residual_blocks(self, bits):
+        from gr00t.model.modules.dit import _sdpa_context
+
+        for block in self.blocks:
+            self.saved_blocks.append(
+                (block, block.forward, "forward" in block.__dict__)
+            )
+            weight = block.ff.net[0].proj.weight
+            zero = torch.zeros(
+                (1, 1, block.dim), device=weight.device, dtype=weight.dtype
+            )
+            one = torch.ones_like(zero)
+
+            def forward(
+                hidden_states,
+                attention_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                temb=None,
+                block=block,
+                zero=zero,
+                one=one,
+            ):
+                x = hidden_states
+                normalized = (
+                    block.norm1(x, temb)
+                    if block.norm_type == "ada_norm"
+                    else block.norm1(x)
+                )
+                with _sdpa_context():
+                    attention = block.attn1(
+                        normalized,
+                        encoder_hidden_states=encoder_hidden_states,
+                        attention_mask=encoder_attention_mask
+                        if encoder_hidden_states is not None
+                        else attention_mask,
+                    )
+                if block.final_dropout is not None:
+                    attention = block.final_dropout(attention)
+                # GR00T's attention residual is ungated. Unit gate and zero
+                # modulation reuse the reference kernel for residual + LN + pack.
+                shape = (x.shape[0], 1, x.shape[-1])
+                residual, packed = prepare_residual_norm_modulation(
+                    x,
+                    attention,
+                    one.expand(shape),
+                    zero.expand(shape),
+                    zero.expand(shape),
+                    bits,
+                    eps=block.norm3.eps,
+                )
+                return residual + block.ff(packed_input(packed, x.shape))
+
+            block.forward = forward
 
     def close(self):
-        for module, forward, had in self.saved:
+        for module, forward, had in [*self.saved, *self.saved_blocks]:
             if had:
                 module.forward = forward
             elif "forward" in module.__dict__:
                 del module.forward
+        self.saved_blocks.clear()
+        self.blocks = []
 
 
 class DitGraphs:

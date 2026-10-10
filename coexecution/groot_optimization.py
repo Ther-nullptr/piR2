@@ -22,8 +22,11 @@ class OptimizationConfig:
     coverage: Path | None = None
     tactics: Path | None = None
     group_tactics: Path | None = None
+    shape_tactics: Path | None = None
     group_conditioning: bool = False
     vision_channels_last: bool = False
+    norm_modulation_quant: bool = False
+    residual_norm_quant: bool = False
 
     def __post_init__(self):
         if self.precision not in ("bf16", "w8a8", "w4a4"):
@@ -40,6 +43,12 @@ class OptimizationConfig:
             raise ValueError(
                 "Condition grouping requires fusion, scope=all and integer precision"
             )
+        if self.norm_modulation_quant and (not self.fusion or self.precision == "bf16"):
+            raise ValueError(
+                "Norm quantization fusion requires fusion and integer precision"
+            )
+        if self.residual_norm_quant and not self.norm_modulation_quant:
+            raise ValueError("Residual fusion requires norm_modulation_quant")
 
     @property
     def enabled(self):
@@ -68,8 +77,11 @@ def add_optimization_arguments(parser):
     parser.add_argument("--quantization-coverage", type=Path)
     parser.add_argument("--quantization-tactics", type=Path)
     parser.add_argument("--quantization-group-tactics", type=Path)
+    parser.add_argument("--quantization-shape-tactics", type=Path)
     parser.add_argument("--group-conditioning", action="store_true")
     parser.add_argument("--vision-channels-last", action="store_true")
+    parser.add_argument("--norm-modulation-quant", action="store_true")
+    parser.add_argument("--residual-norm-quant", action="store_true")
 
 
 def optimization_config(args):
@@ -82,8 +94,11 @@ def optimization_config(args):
         coverage=args.quantization_coverage,
         tactics=args.quantization_tactics,
         group_tactics=args.quantization_group_tactics,
+        shape_tactics=args.quantization_shape_tactics,
         group_conditioning=args.group_conditioning,
         vision_channels_last=args.vision_channels_last,
+        norm_modulation_quant=args.norm_modulation_quant,
+        residual_norm_quant=args.residual_norm_quant,
     )
 
 
@@ -95,6 +110,31 @@ def checked_tactic(value):
     if type(value) is not int or value not in range(8):
         raise ValueError("Integer tactic must be an integer in [0, 7]")
     return value
+
+
+def read_shape_tactics(path):
+    choices = {}
+    rows = read_json(path, [])
+    if not isinstance(rows, list):
+        raise TypeError("Shape tactics must be a JSON list")
+    for row in rows:
+        bits, shape = row["bits"], row["shape"]
+        if (
+            type(bits) is not int
+            or bits not in (4, 8)
+            or not isinstance(shape, list)
+            or len(shape) != 4
+            or any(type(size) is not int or size <= 0 for size in shape[:3])
+            or type(shape[3]) is not bool
+        ):
+            raise ValueError(
+                "Expected bits 4/8 and shape [positive M, K, N, bool bias]"
+            )
+        key = (bits, *shape)
+        if key in choices:
+            raise ValueError("Duplicate integer shape tactic")
+        choices[key] = checked_tactic(row["tactic"])
+    return choices
 
 
 def apply_tactics(controller, extra, config, coverage):
@@ -126,6 +166,18 @@ def apply_tactics(controller, extra, config, coverage):
             if len(choices) > 1:
                 raise ValueError("Conflicting grouped tactics")
             q.tactic = choices.pop() if choices else 0
+    if config.shape_tactics is not None:
+        from coexecution.quantization import install_shape_tactics
+
+        shapes = read_shape_tactics(config.shape_tactics)
+        for bits in (8, 4):
+            models = [
+                *controller.quant[bits].values(),
+                *extra.quant[bits].values(),
+                *(group.linear for _, group in controller.grouped[bits]),
+            ]
+            for q in models:
+                install_shape_tactics(q, shapes)
 
 
 class GrootOptimizations:
@@ -213,14 +265,20 @@ class GrootOptimizations:
             self.stack.callback(extra.close)
             apply_tactics(controller, extra, self.config, recorded)
             controller.set(self.config.precision)
-            extra.set(self.config.precision, expanded=expanded, fuse=self.config.fusion)
+            extra.set(
+                self.config.precision,
+                expanded=expanded,
+                fuse=self.config.fusion,
+                norm_quant=self.config.norm_modulation_quant,
+                residual_quant=self.config.residual_norm_quant,
+            )
             self.coverage = {
                 "linears": sorted(controller.sites),
                 "category_linears": sorted(categories),
                 "scope": self.config.scope,
                 "category_id": self.config.category_id,
                 "projection_groups": controller.groups,
-                "tactic_policy": "Explicit entries reused; unmatched entries use 0",
+                "tactic_policy": "Exact runtime shape, then explicit site/group, then 0",
             }
         if self.config.dit_graph:
             from coexecution.quantization_connections import DitGraphs
@@ -231,7 +289,7 @@ class GrootOptimizations:
 
     def evidence(self):
         config = asdict(self.config)
-        for key in ("coverage", "tactics", "group_tactics"):
+        for key in ("coverage", "tactics", "group_tactics", "shape_tactics"):
             path = config[key]
             config[key] = (
                 None
