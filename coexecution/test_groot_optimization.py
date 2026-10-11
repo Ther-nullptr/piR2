@@ -30,8 +30,49 @@ def test_default_does_not_import_gpu_modules_or_touch_policy():
     assert set(sys.modules) == before
 
 
-@pytest.mark.parametrize("precision", ["w8a8", "w4a4"])
-def test_norm_residual_fusion_flags_require_integer_fusion(precision):
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_floating_precision_is_opt_in_and_accepts_serial_graph(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", precision, "--dit-cuda-graph"])
+    )
+    assert config.precision == precision and config.dit_graph
+    config.validate_variant("pir2")
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_shared_floating_inputs_are_explicit_and_precision_specific(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", precision, "--fp-shared-inputs"])
+    )
+    assert config.fp_shared_inputs
+    assert not OptimizationConfig().fp_shared_inputs
+    for incompatible in ("bf16", "w8a8", "w4a4"):
+        with pytest.raises(ValueError, match="Shared floating inputs"):
+            OptimizationConfig(precision=incompatible, fp_shared_inputs=True)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"category_id": 2, "scope": "all"},
+        {"tactics": Path("integer.json")},
+        {"group_tactics": Path("integer.json")},
+        {"shape_tactics": Path("integer.json")},
+        {"group_conditioning": True, "scope": "all", "fusion": True},
+    ],
+)
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_floating_precision_rejects_integer_only_options(options, precision):
+    with pytest.raises(ValueError, match="Floating precision does not support integer"):
+        OptimizationConfig(precision=precision, **options)
+
+
+@pytest.mark.parametrize("precision", ["w8a8", "w4a4", "fp8", "fp4"])
+def test_norm_residual_fusion_flags_require_lowbit_fusion(precision):
     parser = argparse.ArgumentParser()
     add_optimization_arguments(parser)
     config = optimization_config(
@@ -50,10 +91,32 @@ def test_norm_residual_fusion_flags_require_integer_fusion(precision):
     assert not OptimizationConfig().norm_modulation_quant
     assert not OptimizationConfig().residual_norm_quant
     for options in ({}, {"fusion": True}, {"precision": precision}):
-        with pytest.raises(ValueError, match="fusion and integer"):
+        with pytest.raises(ValueError, match="fusion and low-bit"):
             OptimizationConfig(norm_modulation_quant=True, **options)
     with pytest.raises(ValueError, match="requires norm_modulation_quant"):
         OptimizationConfig(precision=precision, fusion=True, residual_norm_quant=True)
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_floating_group_and_swiglu_flags(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            [
+                "--inference-precision",
+                precision,
+                "--fp-grouped",
+                "--fp-swiglu",
+            ]
+        )
+    )
+    assert config.fp_grouped and config.fp_swiglu
+    assert not OptimizationConfig().fp_grouped and not OptimizationConfig().fp_swiglu
+    for incompatible in ("bf16", "w8a8", "w4a4"):
+        for flag in ("fp_grouped", "fp_swiglu"):
+            with pytest.raises(ValueError, match="Floating fusion requires"):
+                OptimizationConfig(precision=incompatible, **{flag: True})
 
 
 def test_flags_are_independent_and_streaming_allows_eager_integer_inference():
@@ -169,6 +232,19 @@ def test_condition_grouping_requires_shared_condition_path():
         )
     )
     assert config.group_conditioning
+
+
+def test_fast_fp8_is_opt_in_and_rejects_other_precisions():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", "fp8", "--fp8-fast-quant"])
+    )
+    assert config.fp8_fast_quant
+    assert not OptimizationConfig(precision="fp8").fp8_fast_quant
+    for precision in ("bf16", "w8a8", "w4a4", "fp4"):
+        with pytest.raises(ValueError, match="requires precision=fp8"):
+            OptimizationConfig(precision=precision, fp8_fast_quant=True)
 
 
 def test_empty_integer_coverage_is_rejected_before_gpu_install(tmp_path, monkeypatch):
