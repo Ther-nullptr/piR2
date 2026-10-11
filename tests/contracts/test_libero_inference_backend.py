@@ -6,7 +6,8 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
-from libero_inference_backend import endpoint_layout
+
+from coexecution.libero.backend import endpoint_layout
 
 
 def test_same_gpu_is_two_endpoints_on_one_device():
@@ -41,7 +42,7 @@ def test_invalid_layout_is_rejected(device, slow, port, slow_port, role):
 def test_paired_startup_failure_reaches_parent():
     import threading
 
-    from serve_libero_protocol import supervise_workers
+    from coexecution.libero.service import supervise_workers
 
     release = threading.Event()
 
@@ -65,7 +66,7 @@ def test_paired_startup_failure_reaches_parent():
 def test_optimized_paired_service_is_rejected_before_model_loading(
     monkeypatch, flags, vlm_device
 ):
-    import serve_libero_protocol as service
+    from coexecution.libero import service
 
     monkeypatch.setitem(sys.modules, "torch", None)
     monkeypatch.setattr(
@@ -95,9 +96,8 @@ def test_optimized_paired_service_is_rejected_before_model_loading(
 def test_service_optimization_owns_worker_stream_and_restores_on_exit(
     tmp_path, monkeypatch, enabled, failure
 ):
-    import serve_libero_protocol as service
-
     from coexecution.groot_optimization import OptimizationConfig
+    from coexecution.libero import service
 
     active = []
     endpoints = {}

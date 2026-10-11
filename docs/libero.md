@@ -24,6 +24,24 @@ Create a separate Python 3.12 simulator environment at `.venv-pi05/` with hf-lib
 
 The policy server uses `.venv`; the simulator client uses `.venv-pi05` and the pinned GR00T source via PYTHONPATH. Set EGL to the selected physical rendering GPU. If the host requires a libexpat preload, set `PIR2_LIBERO_LD_PRELOAD` to a local compatible library; no user's home directory is baked into the runner.
 
+## Runtime modules / 运行时模块
+
+`coexecution/libero/loading.py` owns scoped task-checkpoint backbone construction;
+`backend.py` owns feature-cache installation, rolling-buffer updates and each
+worker's private CUDA stream; `service.py` owns strict checkpoint loading, endpoint
+registration and worker supervision. Their imports use repository-qualified module
+paths. The `scripts/libero_model_loading.py`, `libero_inference_backend.py` and
+`serve_libero_protocol.py` entrypoints retain their prior imports and command line;
+direct script calls resolve the repository root without adding `scripts/` to
+`PYTHONPATH`. Keep the pinned GR00T source and environment settings described above.
+
+Evaluation provenance hashes both the compatibility entrypoints and the canonical
+runtime implementations. This source-tracking update does not change scheduling,
+episode accounting or protocol semantics. Lightweight contracts live in
+`tests/contracts/`; they use import checks and doubles rather than executing models.
+Optimizations remain restricted to one worker, including when two paired workers
+would share a single GPU.
+
 ## Training
 
 After selecting an idle GPU, train both methods with the same dataset, seed 1000, effective batch 64, H40 and 10,000-update schedule:
