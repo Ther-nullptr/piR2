@@ -1,6 +1,6 @@
 """CUDA Conv3d layout contracts; no checkpoint or task-quality claim.
 
-PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_groot_vision_layout_gpu.py
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_groot_vision_layout_gpu.py
 """
 
 import os
@@ -15,7 +15,8 @@ if os.environ.get("PIR2_GPU_TESTS") != "1":
 import torch
 import torch.nn.functional as F
 
-from coexecution.groot_optimization import GrootOptimizations, OptimizationConfig
+from coexecution.optimization.config import OptimizationConfig
+from coexecution.optimization.session import GrootOptimizations
 
 
 @pytest.mark.parametrize("channels_last_before", [False, True])

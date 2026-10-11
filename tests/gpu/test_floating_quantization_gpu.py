@@ -12,7 +12,9 @@ if os.environ.get("PIR2_GPU_TESTS") != "1":
 
 import torch
 
-from coexecution.floating_quantization import FloatingLinear, FloatingProjections
+from coexecution.optimization.backends.thor.linear import FloatingLinear
+from coexecution.optimization.groot.floating import FloatingProjections
+from tests.helpers.projection_models import Qwen3VLTextAttention
 
 
 @torch.inference_mode()
@@ -81,7 +83,7 @@ def test_graph_refreshes_scale_and_adapter_restores_after_exception(precision, f
 @pytest.mark.parametrize("factor", [0.0, 1.0e-14, 1.0, 100.0])
 @torch.inference_mode()
 def test_fast_fp8_packing_matches_reference(factor):
-    from coexecution.floating_packing import prepare_fp8
+    from coexecution.optimization.backends.thor.packing import prepare_fp8
 
     torch.manual_seed(1000)
     linear = torch.nn.Linear(256, 128, device="cuda", dtype=torch.bfloat16).eval()
@@ -117,24 +119,6 @@ def test_unaligned_projection_is_explicit_bf16_fallback(precision):
         assert "forward" not in model[1].__dict__
     finally:
         controller.close()
-
-
-class Qwen3VLTextAttention(torch.nn.Module):
-    """Small inventory-compatible fixture with the real shared-input call order."""
-
-    def __init__(self):
-        super().__init__()
-        self.q_proj = torch.nn.Linear(256, 128)
-        self.k_proj = torch.nn.Linear(256, 64)
-        self.v_proj = torch.nn.Linear(256, 64)
-        self.o_proj = torch.nn.Linear(128, 256)
-
-    def forward(self, x, *, fail=False, other=None):
-        q = self.q_proj(x)
-        if fail:
-            raise RuntimeError("partial group")
-        k = self.k_proj(x if other is None else other)
-        return q, k, self.v_proj(x)
 
 
 @pytest.mark.parametrize(

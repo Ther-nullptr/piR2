@@ -1,4 +1,4 @@
-"""Explicit GPU checks: PIR2_GPU_TESTS=1 pytest coexecution/test_groot_fusion_gpu.py.
+"""Explicit GPU checks: PIR2_GPU_TESTS=1 pytest tests/gpu/test_groot_fusion_gpu.py.
 
 Synthetic adapter checks do not establish GR00T policy or closed-loop quality.
 """

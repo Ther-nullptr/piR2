@@ -1,0 +1,124 @@
+"""Opt-in GR00T configuration and CLI flags; no GPU imports or kernel loading."""
+
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    precision: str = "bf16"
+    fusion: bool = False
+    dit_graph: bool = False
+    scope: str = "transformer"
+    category_id: int | None = None
+    coverage: Path | None = None
+    tactics: Path | None = None
+    group_tactics: Path | None = None
+    shape_tactics: Path | None = None
+    group_conditioning: bool = False
+    vision_channels_last: bool = False
+    norm_modulation_quant: bool = False
+    residual_norm_quant: bool = False
+    fp8_fast_quant: bool = False
+    fp_shared_inputs: bool = False
+    fp_grouped: bool = False
+    fp_swiglu: bool = False
+
+    def __post_init__(self):
+        if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
+            raise ValueError("Precision must be bf16, w8a8, w4a4, fp8 or fp4")
+        if self.fp8_fast_quant and self.precision != "fp8":
+            raise ValueError("Fast FP8 quantization requires precision=fp8")
+        if self.fp_shared_inputs and self.precision not in ("fp8", "fp4"):
+            raise ValueError("Shared floating inputs require precision=fp8 or fp4")
+        if (self.fp_grouped or self.fp_swiglu) and self.precision not in ("fp8", "fp4"):
+            raise ValueError("Floating fusion requires precision=fp8 or fp4")
+        if self.scope not in ("transformer", "all"):
+            raise ValueError("Quantization scope must be transformer or all")
+        if self.category_id is not None and self.category_id < 0:
+            raise ValueError("Category ID must be nonnegative")
+        if self.category_id is not None and self.scope != "all":
+            raise ValueError("Category projections require scope=all")
+        if self.precision in ("fp8", "fp4") and (
+            self.category_id is not None
+            or self.tactics is not None
+            or self.group_tactics is not None
+            or self.shape_tactics is not None
+            or self.group_conditioning
+        ):
+            raise ValueError(
+                "Floating precision does not support integer tactic, category or condition grouping flags"
+            )
+        if self.group_conditioning and (
+            not self.fusion or self.scope != "all" or self.precision == "bf16"
+        ):
+            raise ValueError(
+                "Condition grouping requires fusion, scope=all and integer precision"
+            )
+        if self.norm_modulation_quant and (not self.fusion or self.precision == "bf16"):
+            raise ValueError(
+                "Norm quantization fusion requires fusion and low-bit precision"
+            )
+        if self.residual_norm_quant and not self.norm_modulation_quant:
+            raise ValueError("Residual fusion requires norm_modulation_quant")
+
+    @property
+    def enabled(self):
+        return (
+            self.precision != "bf16"
+            or self.fusion
+            or self.dit_graph
+            or self.vision_channels_last
+        )
+
+    def validate_variant(self, variant):
+        if variant == "pir2" and self.group_conditioning:
+            raise ValueError("Streaming piR2 condition grouping is not validated")
+
+
+def add_optimization_arguments(parser):
+    parser.add_argument(
+        "--inference-precision",
+        choices=["bf16", "w8a8", "w4a4", "fp8", "fp4"],
+        default="bf16",
+    )
+    parser.add_argument("--operator-fusion", action="store_true")
+    parser.add_argument("--dit-cuda-graph", action="store_true")
+    parser.add_argument(
+        "--quantization-scope", choices=["transformer", "all"], default="transformer"
+    )
+    parser.add_argument("--quantization-category-id", type=int)
+    parser.add_argument("--quantization-coverage", type=Path)
+    parser.add_argument("--quantization-tactics", type=Path)
+    parser.add_argument("--quantization-group-tactics", type=Path)
+    parser.add_argument("--quantization-shape-tactics", type=Path)
+    parser.add_argument("--group-conditioning", action="store_true")
+    parser.add_argument("--vision-channels-last", action="store_true")
+    parser.add_argument("--norm-modulation-quant", action="store_true")
+    parser.add_argument("--residual-norm-quant", action="store_true")
+    parser.add_argument("--fp8-fast-quant", action="store_true")
+    parser.add_argument("--fp-shared-inputs", action="store_true")
+    parser.add_argument("--fp-grouped", action="store_true")
+    parser.add_argument("--fp-swiglu", action="store_true")
+
+
+def optimization_config(args):
+    return OptimizationConfig(
+        precision=args.inference_precision,
+        fusion=args.operator_fusion,
+        dit_graph=args.dit_cuda_graph,
+        scope=args.quantization_scope,
+        category_id=args.quantization_category_id,
+        coverage=args.quantization_coverage,
+        tactics=args.quantization_tactics,
+        group_tactics=args.quantization_group_tactics,
+        shape_tactics=args.quantization_shape_tactics,
+        group_conditioning=args.group_conditioning,
+        vision_channels_last=args.vision_channels_last,
+        norm_modulation_quant=args.norm_modulation_quant,
+        residual_norm_quant=args.residual_norm_quant,
+        fp8_fast_quant=args.fp8_fast_quant,
+        fp_shared_inputs=args.fp_shared_inputs,
+        fp_grouped=args.fp_grouped,
+        fp_swiglu=args.fp_swiglu,
+    )

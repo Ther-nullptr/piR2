@@ -1,7 +1,7 @@
 """Opt-in integer adapter contracts; no checkpoints or task-quality evaluation.
 
 Run with PIR2_GPU_TESTS=1 and the pinned robotics_kernels source installed:
-python -m pytest -q coexecution/test_quantization_gpu.py
+python -m pytest -q tests/gpu/test_quantization_gpu.py
 """
 
 import os
@@ -17,43 +17,12 @@ import torch
 from robotics_kernels.ampere_ada.integer import prepare_activation
 from robotics_kernels.common.fused import prepare_gelu
 
-from coexecution.quantization import TransformerINT, inventory, prepare
-from coexecution.quantization_connections import AdditionalConnections, DitGraphs
-
-
-def equal(actual, expected):
-    assert actual.shape == expected.shape and actual.dtype == expected.dtype
-    assert torch.equal(
-        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
-    )
-
-
-def policy_for(blocks):
-    return SimpleNamespace(
-        model=SimpleNamespace(
-            action_head=SimpleNamespace(
-                model=SimpleNamespace(transformer_blocks=blocks)
-            )
-        )
-    )
-
-
-class Norm(torch.nn.Module):
-    def __init__(self, width):
-        super().__init__()
-        self.norm = torch.nn.LayerNorm(
-            width, elementwise_affine=False, device="cuda", dtype=torch.bfloat16
-        )
-        self.silu = torch.nn.SiLU()
-        self.linear = torch.nn.Linear(
-            width, 2 * width, device="cuda", dtype=torch.bfloat16
-        )
-
-    def forward(self, x, temb):
-        scale, shift = self.linear(self.silu(temb)).chunk(2, dim=-1)
-        if scale.ndim == 2:
-            scale, shift = scale[:, None], shift[:, None]
-        return self.norm(x) * (1 + scale) + shift
+from coexecution.optimization.backends.integer.linear import prepare
+from coexecution.optimization.execution.graph import DitGraphs
+from coexecution.optimization.groot.integer import TransformerINT, inventory
+from coexecution.optimization.groot.integer_connections import AdditionalConnections
+from tests.helpers.cuda_assertions import equal
+from tests.helpers.projection_models import Norm, policy_for
 
 
 @pytest.mark.parametrize("bits", [8, 4])
@@ -283,7 +252,7 @@ def test_graph_masks_updates_shapes_history_and_restore():
 
 
 def test_graph_capture_failure_restores_original_forward(monkeypatch):
-    from coexecution import quantization_connections
+    from coexecution.optimization.execution import graph
 
     class FailedGraph:
         def __init__(self, function):
@@ -292,7 +261,7 @@ def test_graph_capture_failure_restores_original_forward(monkeypatch):
         def __call__(self, *inputs):
             raise RuntimeError("capture failed")
 
-    monkeypatch.setattr(quantization_connections, "CudaGraphCall", FailedGraph)
+    monkeypatch.setattr(graph, "CudaGraphCall", FailedGraph)
     model = GraphModel()
     adapter = DitGraphs(model)
     adapter.set("test")
