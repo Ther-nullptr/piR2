@@ -1,4 +1,4 @@
-"""Opt-in, reversible GR00T fusion and integer inference configuration.
+"""Opt-in, reversible GR00T fusion and low-bit inference configuration.
 
 Importing this module does not import Torch or compile kernels. GPU dependencies
 are loaded only when an enabled configuration enters its scope.
@@ -22,39 +22,73 @@ class OptimizationConfig:
     coverage: Path | None = None
     tactics: Path | None = None
     group_tactics: Path | None = None
+    shape_tactics: Path | None = None
     group_conditioning: bool = False
+    vision_channels_last: bool = False
+    norm_modulation_quant: bool = False
+    residual_norm_quant: bool = False
+    fp8_fast_quant: bool = False
+    fp_shared_inputs: bool = False
+    fp_grouped: bool = False
+    fp_swiglu: bool = False
 
     def __post_init__(self):
-        if self.precision not in ("bf16", "w8a8", "w4a4"):
-            raise ValueError("Precision must be bf16, w8a8 or w4a4")
+        if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
+            raise ValueError("Precision must be bf16, w8a8, w4a4, fp8 or fp4")
+        if self.fp8_fast_quant and self.precision != "fp8":
+            raise ValueError("Fast FP8 quantization requires precision=fp8")
+        if self.fp_shared_inputs and self.precision not in ("fp8", "fp4"):
+            raise ValueError("Shared floating inputs require precision=fp8 or fp4")
+        if (self.fp_grouped or self.fp_swiglu) and self.precision not in ("fp8", "fp4"):
+            raise ValueError("Floating fusion requires precision=fp8 or fp4")
         if self.scope not in ("transformer", "all"):
             raise ValueError("Quantization scope must be transformer or all")
         if self.category_id is not None and self.category_id < 0:
             raise ValueError("Category ID must be nonnegative")
         if self.category_id is not None and self.scope != "all":
             raise ValueError("Category projections require scope=all")
+        if self.precision in ("fp8", "fp4") and (
+            self.category_id is not None
+            or self.tactics is not None
+            or self.group_tactics is not None
+            or self.shape_tactics is not None
+            or self.group_conditioning
+        ):
+            raise ValueError(
+                "Floating precision does not support integer tactic, category or condition grouping flags"
+            )
         if self.group_conditioning and (
             not self.fusion or self.scope != "all" or self.precision == "bf16"
         ):
             raise ValueError(
                 "Condition grouping requires fusion, scope=all and integer precision"
             )
+        if self.norm_modulation_quant and (not self.fusion or self.precision == "bf16"):
+            raise ValueError(
+                "Norm quantization fusion requires fusion and low-bit precision"
+            )
+        if self.residual_norm_quant and not self.norm_modulation_quant:
+            raise ValueError("Residual fusion requires norm_modulation_quant")
 
     @property
     def enabled(self):
-        return self.precision != "bf16" or self.fusion or self.dit_graph
+        return (
+            self.precision != "bf16"
+            or self.fusion
+            or self.dit_graph
+            or self.vision_channels_last
+        )
 
     def validate_variant(self, variant):
-        if self.enabled and variant != "flow":
-            raise ValueError(
-                "Experimental optimizations currently support standard Flow only; "
-                "streaming piR2 integration is not validated"
-            )
+        if variant == "pir2" and self.group_conditioning:
+            raise ValueError("Streaming piR2 condition grouping is not validated")
 
 
 def add_optimization_arguments(parser):
     parser.add_argument(
-        "--inference-precision", choices=["bf16", "w8a8", "w4a4"], default="bf16"
+        "--inference-precision",
+        choices=["bf16", "w8a8", "w4a4", "fp8", "fp4"],
+        default="bf16",
     )
     parser.add_argument("--operator-fusion", action="store_true")
     parser.add_argument("--dit-cuda-graph", action="store_true")
@@ -65,7 +99,15 @@ def add_optimization_arguments(parser):
     parser.add_argument("--quantization-coverage", type=Path)
     parser.add_argument("--quantization-tactics", type=Path)
     parser.add_argument("--quantization-group-tactics", type=Path)
+    parser.add_argument("--quantization-shape-tactics", type=Path)
     parser.add_argument("--group-conditioning", action="store_true")
+    parser.add_argument("--vision-channels-last", action="store_true")
+    parser.add_argument("--norm-modulation-quant", action="store_true")
+    parser.add_argument("--residual-norm-quant", action="store_true")
+    parser.add_argument("--fp8-fast-quant", action="store_true")
+    parser.add_argument("--fp-shared-inputs", action="store_true")
+    parser.add_argument("--fp-grouped", action="store_true")
+    parser.add_argument("--fp-swiglu", action="store_true")
 
 
 def optimization_config(args):
@@ -78,7 +120,15 @@ def optimization_config(args):
         coverage=args.quantization_coverage,
         tactics=args.quantization_tactics,
         group_tactics=args.quantization_group_tactics,
+        shape_tactics=args.quantization_shape_tactics,
         group_conditioning=args.group_conditioning,
+        vision_channels_last=args.vision_channels_last,
+        norm_modulation_quant=args.norm_modulation_quant,
+        residual_norm_quant=args.residual_norm_quant,
+        fp8_fast_quant=args.fp8_fast_quant,
+        fp_shared_inputs=args.fp_shared_inputs,
+        fp_grouped=args.fp_grouped,
+        fp_swiglu=args.fp_swiglu,
     )
 
 
@@ -92,11 +142,37 @@ def checked_tactic(value):
     return value
 
 
+def read_shape_tactics(path):
+    choices = {}
+    rows = read_json(path, [])
+    if not isinstance(rows, list):
+        raise TypeError("Shape tactics must be a JSON list")
+    for row in rows:
+        bits, shape = row["bits"], row["shape"]
+        if (
+            type(bits) is not int
+            or bits not in (4, 8)
+            or not isinstance(shape, list)
+            or len(shape) != 4
+            or any(type(size) is not int or size <= 0 for size in shape[:3])
+            or type(shape[3]) is not bool
+        ):
+            raise ValueError(
+                "Expected bits 4/8 and shape [positive M, K, N, bool bias]"
+            )
+        key = (bits, *shape)
+        if key in choices:
+            raise ValueError("Duplicate integer shape tactic")
+        choices[key] = checked_tactic(row["tactic"])
+    return choices
+
+
 def apply_tactics(controller, extra, config, coverage):
     singles = read_json(config.tactics, {})
     groups = read_json(config.group_tactics, [])
     for bits in (8, 4):
         models = {**controller.quant[bits], **extra.quant[bits]}
+        legacy = [row for row in groups if row["bits"] == bits and "shape" in row]
         for name, tactic in singles.get(str(bits), {}).items():
             if name in models:
                 models[name].tactic = checked_tactic(tactic)
@@ -107,7 +183,7 @@ def apply_tactics(controller, extra, config, coverage):
                 for row in groups
                 if row["bits"] == bits and row.get("members") == list(names)
             ]
-            if not matching and names[0] in coverage:
+            if not matching and legacy and names[0] in coverage:
                 shape = coverage[names[0]]["shape"]
                 signature = [
                     math.prod(shape[:-1]),
@@ -115,22 +191,31 @@ def apply_tactics(controller, extra, config, coverage):
                     q.out_features,
                     q.bias is not None,
                 ]
-                matching = [
-                    row
-                    for row in groups
-                    if row["bits"] == bits and row.get("shape") == signature
-                ]
+                matching = [row for row in legacy if row["shape"] == signature]
             choices = {checked_tactic(row["tactic"]) for row in matching}
             if len(choices) > 1:
                 raise ValueError("Conflicting grouped tactics")
             q.tactic = choices.pop() if choices else 0
+    if config.shape_tactics is not None:
+        from coexecution.quantization import install_shape_tactics
+
+        shapes = read_shape_tactics(config.shape_tactics)
+        for bits in (8, 4):
+            models = [
+                *controller.quant[bits].values(),
+                *extra.quant[bits].values(),
+                *(group.linear for _, group in controller.grouped[bits]),
+            ]
+            for q in models:
+                install_shape_tactics(q, shapes)
 
 
 class GrootOptimizations:
     """One serial, frozen BF16 CUDA policy; close before replacing its weights.
 
-    This scope neither selects a checkpoint nor changes Conv3D layout, sampling,
-    observations or the policy's VLM cache. No optimization is enabled by default.
+    This scope neither selects a checkpoint nor changes sampling, observations
+    or the policy's VLM cache. No optimization is enabled by default.
+    Vision Conv3D layout conversion requires the explicit vision_channels_last flag.
     """
 
     def __init__(self, policy, config=None):
@@ -157,8 +242,21 @@ class GrootOptimizations:
             raise ValueError("Optimizations require an eval-mode BF16 model")
         if next(model.parameters()).device.type != "cuda":
             raise ValueError("Optimizations require CUDA")
-        if getattr(model.config, "streaming", False):
-            raise ValueError("Streaming checkpoint optimization is not validated")
+        self.config.validate_variant(
+            "pir2" if getattr(model.config, "streaming", False) else "flow"
+        )
+        if self.config.vision_channels_last:
+            proj = model.backbone.model.visual.patch_embed.proj
+            self.stack.callback(setattr, proj.weight, "data", proj.weight.data)
+            proj.weight.data = proj.weight.data.contiguous(
+                memory_format=torch.channels_last_3d
+            )
+            hook = proj.register_forward_pre_hook(
+                lambda _module, inputs: (
+                    inputs[0].contiguous(memory_format=torch.channels_last_3d),
+                )
+            )
+            self.stack.callback(hook.remove)
         if self.config.fusion:
             from coexecution.groot_fusion import NonGemmAdapters
             from coexecution.groot_pointwise import PointwiseFusion
@@ -169,7 +267,34 @@ class GrootOptimizations:
             pointwise = PointwiseFusion(self.policy)
             self.stack.callback(pointwise.close)
             pointwise.set("dit")
-        if self.config.precision != "bf16":
+        if self.config.precision in ("fp8", "fp4"):
+            from coexecution.floating_quantization import FloatingProjections
+
+            recorded = (
+                None
+                if self.config.coverage is None
+                else read_json(self.config.coverage, {}).get("linears", {})
+            )
+            floating = FloatingProjections(
+                model,
+                recorded,
+                expanded=self.config.scope == "all",
+                precision=self.config.precision,
+                fast_fp8=self.config.fp8_fast_quant,
+                shared_inputs=self.config.fp_shared_inputs,
+                grouped=self.config.fp_grouped,
+                swiglu=self.config.fp_swiglu,
+            )
+            self.stack.callback(floating.close)
+            self.coverage = floating.coverage
+            if self.config.norm_modulation_quant:
+                from coexecution.floating_connections import FloatingConnections
+
+                connections = FloatingConnections(
+                    self.policy, floating, residual=self.config.residual_norm_quant
+                )
+                self.stack.callback(connections.close)
+        elif self.config.precision != "bf16":
             from coexecution.quantization import TransformerINT, inventory
             from coexecution.quantization_connections import AdditionalConnections
 
@@ -197,17 +322,23 @@ class GrootOptimizations:
             self.stack.callback(extra.close)
             apply_tactics(controller, extra, self.config, recorded)
             controller.set(self.config.precision)
-            extra.set(self.config.precision, expanded=expanded, fuse=self.config.fusion)
+            extra.set(
+                self.config.precision,
+                expanded=expanded,
+                fuse=self.config.fusion,
+                norm_quant=self.config.norm_modulation_quant,
+                residual_quant=self.config.residual_norm_quant,
+            )
             self.coverage = {
                 "linears": sorted(controller.sites),
                 "category_linears": sorted(categories),
                 "scope": self.config.scope,
                 "category_id": self.config.category_id,
                 "projection_groups": controller.groups,
-                "tactic_policy": "Explicit entries reused; unmatched entries use 0",
+                "tactic_policy": "Exact runtime shape, then explicit site/group, then 0",
             }
         if self.config.dit_graph:
-            from coexecution.quantization_connections import DitGraphs
+            from coexecution.groot_graph import DitGraphs
 
             graphs = DitGraphs(model.action_head.model)
             self.stack.callback(graphs.close)
@@ -215,7 +346,7 @@ class GrootOptimizations:
 
     def evidence(self):
         config = asdict(self.config)
-        for key in ("coverage", "tactics", "group_tactics"):
+        for key in ("coverage", "tactics", "group_tactics", "shape_tactics"):
             path = config[key]
             config[key] = (
                 None
@@ -225,7 +356,7 @@ class GrootOptimizations:
         return {
             "config": config,
             "coverage": self.coverage,
-            "scope": "Experimental standard Flow; streaming and task quality unvalidated",
+            "scope": "Experimental serial inference; replay checks do not establish task quality",
         }
 
     def close(self):

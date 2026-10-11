@@ -14,6 +14,7 @@ from coexecution.groot_optimization import (
     add_optimization_arguments,
     apply_tactics,
     optimization_config,
+    read_shape_tactics,
 )
 
 
@@ -24,11 +25,101 @@ def test_default_does_not_import_gpu_modules_or_touch_policy():
     before = set(sys.modules)
     with GrootOptimizations(object(), config) as scope:
         assert not scope.config.enabled
+        assert not config.vision_channels_last
         assert scope.evidence()["coverage"] == {}
     assert set(sys.modules) == before
 
 
-def test_flags_are_independent_and_streaming_is_explicitly_unsupported():
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_floating_precision_is_opt_in_and_accepts_serial_graph(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", precision, "--dit-cuda-graph"])
+    )
+    assert config.precision == precision and config.dit_graph
+    config.validate_variant("pir2")
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_shared_floating_inputs_are_explicit_and_precision_specific(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", precision, "--fp-shared-inputs"])
+    )
+    assert config.fp_shared_inputs
+    assert not OptimizationConfig().fp_shared_inputs
+    for incompatible in ("bf16", "w8a8", "w4a4"):
+        with pytest.raises(ValueError, match="Shared floating inputs"):
+            OptimizationConfig(precision=incompatible, fp_shared_inputs=True)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"category_id": 2, "scope": "all"},
+        {"tactics": Path("integer.json")},
+        {"group_tactics": Path("integer.json")},
+        {"shape_tactics": Path("integer.json")},
+        {"group_conditioning": True, "scope": "all", "fusion": True},
+    ],
+)
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_floating_precision_rejects_integer_only_options(options, precision):
+    with pytest.raises(ValueError, match="Floating precision does not support integer"):
+        OptimizationConfig(precision=precision, **options)
+
+
+@pytest.mark.parametrize("precision", ["w8a8", "w4a4", "fp8", "fp4"])
+def test_norm_residual_fusion_flags_require_lowbit_fusion(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            [
+                "--inference-precision",
+                precision,
+                "--operator-fusion",
+                "--norm-modulation-quant",
+                "--residual-norm-quant",
+            ]
+        )
+    )
+    assert config.norm_modulation_quant and config.residual_norm_quant
+    config.validate_variant("pir2")
+    assert not OptimizationConfig().norm_modulation_quant
+    assert not OptimizationConfig().residual_norm_quant
+    for options in ({}, {"fusion": True}, {"precision": precision}):
+        with pytest.raises(ValueError, match="fusion and low-bit"):
+            OptimizationConfig(norm_modulation_quant=True, **options)
+    with pytest.raises(ValueError, match="requires norm_modulation_quant"):
+        OptimizationConfig(precision=precision, fusion=True, residual_norm_quant=True)
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_floating_group_and_swiglu_flags(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            [
+                "--inference-precision",
+                precision,
+                "--fp-grouped",
+                "--fp-swiglu",
+            ]
+        )
+    )
+    assert config.fp_grouped and config.fp_swiglu
+    assert not OptimizationConfig().fp_grouped and not OptimizationConfig().fp_swiglu
+    for incompatible in ("bf16", "w8a8", "w4a4"):
+        for flag in ("fp_grouped", "fp_swiglu"):
+            with pytest.raises(ValueError, match="Floating fusion requires"):
+                OptimizationConfig(precision=incompatible, **{flag: True})
+
+
+def test_flags_are_independent_and_streaming_allows_eager_integer_inference():
     parser = argparse.ArgumentParser()
     add_optimization_arguments(parser)
     config = optimization_config(
@@ -39,9 +130,80 @@ def test_flags_are_independent_and_streaming_is_explicitly_unsupported():
     assert config.precision == "w4a4"
     assert not config.fusion and not config.dit_graph
     config.validate_variant("flow")
-    with pytest.raises(ValueError, match="streaming"):
-        config.validate_variant("pir2")
+    config.validate_variant("pir2")
     OptimizationConfig().validate_variant("pir2")
+
+
+def test_vision_layout_is_independent_and_opt_in():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(parser.parse_args(["--vision-channels-last"]))
+    assert config.vision_channels_last and config.enabled
+    assert config.precision == "bf16" and not config.fusion and not config.dit_graph
+    config.validate_variant("pir2")
+    config.validate_variant("flow")
+
+
+@pytest.mark.parametrize(
+    "training,dtype,device,message",
+    [
+        (True, "bf16", "cuda", "eval-mode BF16"),
+        (False, "fp32", "cuda", "eval-mode BF16"),
+        (False, "bf16", "cpu", "require CUDA"),
+    ],
+)
+def test_vision_layout_preserves_model_guards(
+    monkeypatch, training, dtype, device, message
+):
+    model = SimpleNamespace(
+        training=training,
+        parameters=lambda: iter(
+            [SimpleNamespace(dtype=dtype, device=SimpleNamespace(type=device))]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
+    with (
+        pytest.raises(ValueError, match=message),
+        GrootOptimizations(
+            SimpleNamespace(model=model), OptimizationConfig(vision_channels_last=True)
+        ),
+    ):
+        pytest.fail("Layout conversion cannot bypass the model guards")
+
+
+def test_streaming_allows_serial_dit_graph_and_rejects_condition_grouping():
+    OptimizationConfig(dit_graph=True).validate_variant("pir2")
+    config = OptimizationConfig(
+        precision="w8a8", fusion=True, scope="all", group_conditioning=True
+    )
+    config.validate_variant("flow")
+    with pytest.raises(ValueError, match="Streaming piR2"):
+        config.validate_variant("pir2")
+
+
+def test_streaming_condition_guard_also_applies_to_direct_scope(monkeypatch):
+    model = SimpleNamespace(
+        training=False,
+        config=SimpleNamespace(streaming=True),
+        parameters=lambda: iter(
+            [SimpleNamespace(dtype="bf16", device=SimpleNamespace(type="cuda"))]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
+    with (
+        pytest.raises(ValueError, match="Streaming piR2"),
+        GrootOptimizations(
+            SimpleNamespace(model=model),
+            OptimizationConfig(
+                precision="w8a8",
+                fusion=True,
+                scope="all",
+                group_conditioning=True,
+                vision_channels_last=True,
+            ),
+        ),
+    ):
+        pytest.fail("A direct scope cannot bypass the streaming condition restriction")
 
 
 def test_category_requires_expanded_scope():
@@ -70,6 +232,19 @@ def test_condition_grouping_requires_shared_condition_path():
         )
     )
     assert config.group_conditioning
+
+
+def test_fast_fp8_is_opt_in_and_rejects_other_precisions():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", "fp8", "--fp8-fast-quant"])
+    )
+    assert config.fp8_fast_quant
+    assert not OptimizationConfig(precision="fp8").fp8_fast_quant
+    for precision in ("bf16", "w8a8", "w4a4", "fp4"):
+        with pytest.raises(ValueError, match="requires precision=fp8"):
+            OptimizationConfig(precision=precision, fp8_fast_quant=True)
 
 
 def test_empty_integer_coverage_is_rejected_before_gpu_install(tmp_path, monkeypatch):
@@ -166,6 +341,63 @@ def test_explicit_tactics_and_group_defaults(tmp_path):
         apply_tactics(controller, extra, config, {})
 
 
+def test_shape_tactics_reach_singles_categories_and_groups(tmp_path, monkeypatch):
+    path = tmp_path / "shapes.json"
+    path.write_text(
+        json.dumps([{"bits": 8, "shape": [41, 130, 64, True], "tactic": 2}])
+    )
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--quantization-shape-tactics", str(path)])
+    )
+    installed = []
+    monkeypatch.setitem(
+        sys.modules,
+        "coexecution.quantization",
+        SimpleNamespace(
+            install_shape_tactics=lambda q, shapes: installed.append((q, shapes))
+        ),
+    )
+    single, category, group = [SimpleNamespace(tactic=0) for _ in range(3)]
+    controller = SimpleNamespace(
+        quant={8: {"q": single}, 4: {}},
+        grouped={8: [(["k", "v"], SimpleNamespace(linear=group))], 4: []},
+    )
+    extra = SimpleNamespace(quant={8: {"category": category}, 4: {}})
+    apply_tactics(controller, extra, config, {})
+    assert [id(q) for q, _ in installed] == [id(single), id(category), id(group)]
+    assert all(shapes == {(8, 41, 130, 64, True): 2} for _, shapes in installed)
+    assert GrootOptimizations(object(), config).evidence()["config"]["shape_tactics"][
+        "sha256"
+    ]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"bits": True, "shape": [41, 130, 64, True], "tactic": 2},
+        {"bits": 8, "shape": [True, 130, 64, True], "tactic": 2},
+        {"bits": 8, "shape": [41, 0, 64, True], "tactic": 2},
+        {"bits": 8, "shape": [41, 130, 64, 1], "tactic": 2},
+        {"bits": 8, "shape": [41, 130, 64, True], "tactic": 8},
+    ],
+)
+def test_shape_tactics_reject_invalid_signatures(tmp_path, row):
+    path = tmp_path / "shapes.json"
+    path.write_text(json.dumps([row]))
+    with pytest.raises(ValueError):
+        read_shape_tactics(path)
+
+
+def test_shape_tactics_reject_duplicate_signatures(tmp_path):
+    path = tmp_path / "shapes.json"
+    row = {"bits": 8, "shape": [41, 130, 64, True], "tactic": 2}
+    path.write_text(json.dumps([row, row]))
+    with pytest.raises(ValueError, match="Duplicate"):
+        read_shape_tactics(path)
+
+
 def test_group_shape_tactics_require_explicit_coverage(tmp_path):
     groups = tmp_path / "groups.json"
     groups.write_text(
@@ -190,6 +422,24 @@ def test_group_shape_tactics_require_explicit_coverage(tmp_path):
     apply_tactics(controller, extra, config, {"q": {"shape": [1, 41, 1536]}})
     assert grouped[4][0][1].linear.tactic == 3
     apply_tactics(controller, extra, config, {})
+    assert grouped[4][0][1].linear.tactic == 0
+
+
+@pytest.mark.parametrize("named_tactics", [False, True])
+def test_name_only_coverage_does_not_require_legacy_shapes(tmp_path, named_tactics):
+    groups = tmp_path / "groups.json"
+    groups.write_text(
+        json.dumps([{"bits": 8, "members": ["q", "k", "v"], "tactic": 2}])
+    )
+    grouped = {
+        bits: [(["q", "k", "v"], SimpleNamespace(linear=SimpleNamespace(tactic=7)))]
+        for bits in (8, 4)
+    }
+    controller = SimpleNamespace(quant={8: {}, 4: {}}, grouped=grouped)
+    extra = SimpleNamespace(quant={8: {}, 4: {}})
+    config = OptimizationConfig(group_tactics=groups if named_tactics else None)
+    apply_tactics(controller, extra, config, {name: {} for name in ("q", "k", "v")})
+    assert grouped[8][0][1].linear.tactic == (2 if named_tactics else 0)
     assert grouped[4][0][1].linear.tactic == 0
 
 
