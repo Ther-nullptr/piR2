@@ -195,6 +195,45 @@ def test_captured_original_preprocessing_and_options_are_preserved(interface):
     assert batch["pixel_values"] is pixel
 
 
+def test_explicit_scoped_prepare_wrapper_chain_can_compose(interface):
+    model = interface.model
+    with scope(interface.policy):
+        original = model.backbone.prepare_input
+
+        def wrapper(batch):
+            return original(batch)
+
+        wrapper.__pir2_prepare_original__ = original
+
+        def outer(batch):
+            return wrapper(batch)
+
+        outer.__pir2_prepare_original__ = wrapper
+        model.backbone.prepare_input = outer
+        backbone, action = model.prepare_input(inputs())
+        assert tuple(backbone) == BACKBONE_KEYS
+        assert tuple(action) == ACTION_KEYS[:2]
+
+
+@pytest.mark.parametrize("invalid", ["unrelated", "cycle"])
+def test_prepare_wrapper_marker_does_not_admit_unrelated_or_cyclic_changes(
+    interface, invalid
+):
+    model = interface.model
+    with scope(interface.policy):
+        original = model.backbone.prepare_input
+
+        def wrapper(batch):
+            return original(batch)
+
+        wrapper.__pir2_prepare_original__ = (
+            wrapper if invalid == "cycle" else lambda value: value
+        )
+        model.backbone.prepare_input = wrapper
+        with pytest.raises(RuntimeError, match="method changed"):
+            model.prepare_input(inputs())
+
+
 def test_original_conditional_collation_does_not_mutate_caller(interface):
     batch = inputs()
     content = {key: batch.pop(key) for key in BACKBONE_KEYS}

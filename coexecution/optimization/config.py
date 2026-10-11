@@ -26,8 +26,12 @@ class OptimizationConfig:
     component: str = "all"
     input_preparation: bool = False
     tokenizer_cache: bool = False
+    static_vlm: bool = False
+    vlm_graph: bool = False
 
     def __post_init__(self):
+        if self.vlm_graph and not self.static_vlm:
+            raise ValueError("VLM graph requires static_vlm")
         if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
             raise ValueError("Precision must be bf16, w8a8, w4a4, fp8 or fp4")
         if self.fp8_fast_quant and self.precision != "fp8":
@@ -84,6 +88,8 @@ class OptimizationConfig:
             or self.vision_channels_last
             or self.input_preparation
             or self.tokenizer_cache
+            or self.static_vlm
+            or self.vlm_graph
         )
 
     def validate_variant(self, variant):
@@ -114,6 +120,8 @@ def add_optimization_arguments(parser):
     parser.add_argument("--vision-channels-last", action="store_true")
     parser.add_argument("--input-preparation", action="store_true")
     parser.add_argument("--tokenizer-cache", action="store_true")
+    parser.add_argument("--static-vlm", action="store_true")
+    parser.add_argument("--vlm-cuda-graph", action="store_true")
     parser.add_argument("--norm-modulation-quant", action="store_true")
     parser.add_argument("--residual-norm-quant", action="store_true")
     parser.add_argument("--fp8-fast-quant", action="store_true")
@@ -138,6 +146,8 @@ def optimization_config(args):
         vision_channels_last=args.vision_channels_last,
         input_preparation=args.input_preparation,
         tokenizer_cache=args.tokenizer_cache,
+        static_vlm=args.static_vlm,
+        vlm_graph=args.vlm_cuda_graph,
         norm_modulation_quant=args.norm_modulation_quant,
         residual_norm_quant=args.residual_norm_quant,
         fp8_fast_quant=args.fp8_fast_quant,

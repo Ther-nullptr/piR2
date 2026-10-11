@@ -25,6 +25,17 @@ def _restore(module, name, original, had):
         delattr(module, name)
 
 
+def _prepare_wraps(current, original):
+    """Admit only an explicitly declared scoped chain ending at this wrapper."""
+    seen = set()
+    while current is not original:
+        if id(current) in seen or not callable(current):
+            return False
+        seen.add(id(current))
+        current = getattr(current, "__pir2_prepare_original__", None)
+    return True
+
+
 class InputPreparation:
     """One serial eval CUDA policy with fresh component input trees.
 
@@ -145,7 +156,8 @@ class InputPreparation:
             raise RuntimeError("Input preparation model or component was replaced")
         self._validate_model()
         if any(
-            module.prepare_input is not wrapper for module, wrapper in self._methods
+            not _prepare_wraps(module.prepare_input, wrapper)
+            for module, wrapper in self._methods
         ):
             raise RuntimeError("Input preparation method changed inside the scope")
         if any(

@@ -229,6 +229,15 @@ def runtime_interface(monkeypatch):
     class Tokenizer(Adapter):
         label = "tokenizer"
 
+    class Static(Adapter):
+        label = "static"
+
+        def __init__(
+            self, actual_policy, *, cuda_graph=False, vision_rope=None, **kwargs
+        ):
+            super().__init__(actual_policy)
+            self.cuda_graph, self.vision_rope = cuda_graph, vision_rope
+
     class Boundary:
         def __init__(self, *args, **kwargs):
             self.closed = False
@@ -275,6 +284,7 @@ def runtime_interface(monkeypatch):
             "coexecution.optimization.execution.tokenization",
             {"TokenizerCacheScope": Tokenizer},
         ),
+        ("coexecution.optimization.groot.vlm", {"PolicyStaticS2": Static}),
         ("coexecution.optimization.execution.graph", {"DitGraphs": Graphs}),
         ("coexecution.optimization.groot.floating", {"FloatingProjections": Floating}),
         (
@@ -522,15 +532,176 @@ def test_default_active_session_can_switch_runtime_without_precision_install(
         assert session.boundary is None
 
 
-@pytest.mark.parametrize("field", ["static_vlm", "vlm_graph"])
-def test_runtime_switch_accepts_disabled_future_options_but_rejects_enabled(
-    runtime_interface, field
+def test_runtime_switch_accepts_disabled_vlm_options_without_installing(
+    runtime_interface,
 ):
     with GrootOptimizations(runtime_interface.policy) as session:
-        assert session.set_runtime(**{field: False}) is session
-        with pytest.raises(ValueError, match="not implemented"):
-            session.set_runtime(**{field: True})
+        assert session.set_runtime(static_vlm=False, vlm_graph=False) is session
         assert not runtime_interface.events
+
+
+@pytest.mark.parametrize("precision", ["bf16", "w8a8", "w4a4", "fp8", "fp4"])
+def test_static_vlm_and_graph_flags_are_opt_in_and_precision_independent(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            ["--inference-precision", precision, "--static-vlm", "--vlm-cuda-graph"]
+        )
+    )
+    assert config.static_vlm and config.vlm_graph and config.enabled
+    assert not OptimizationConfig().static_vlm and not OptimizationConfig().vlm_graph
+    config.validate_variant("flow")
+    config.validate_variant("pir2")
+    assert GrootOptimizations(object(), config).evidence()["config"]["vlm_graph"]
+
+
+def test_vlm_graph_requires_static_metadata_before_any_installation():
+    with pytest.raises(ValueError, match="requires static_vlm"):
+        OptimizationConfig(vlm_graph=True)
+
+
+def test_static_vlm_installs_after_fixed_precision_before_outer_boundary(
+    runtime_interface,
+):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            precision="fp8", dit_graph=True, static_vlm=True, vlm_graph=True
+        ),
+    ) as session:
+        assert runtime_interface.events == [
+            "created floating",
+            "created graphs",
+            "set graphs fp8",
+            "created static",
+            "entered static",
+            "created boundary",
+        ]
+        assert session.static_vlm.cuda_graph
+        assert session.evidence()["static_vlm"] == {"adapter": "static"}
+    assert runtime_interface.events[-4:] == [
+        "closed boundary",
+        "closed static",
+        "closed graphs",
+        "closed floating",
+    ]
+
+
+def test_static_vlm_preserves_the_installed_fused_vision_rope(
+    runtime_interface, monkeypatch
+):
+    events = runtime_interface.events
+
+    class Fusion:
+        def __init__(self, *args):
+            self.vision = lambda *values: values
+            events.append("created fusion")
+
+        def set(self, mode):
+            events.append("set fusion " + mode)
+
+        def close(self):
+            events.append("closed fusion")
+
+    class Pointwise:
+        def __init__(self, *args):
+            events.append("created pointwise")
+
+        def set(self, mode):
+            events.append("set pointwise " + mode)
+
+        def close(self):
+            events.append("closed pointwise")
+
+    monkeypatch.setitem(
+        sys.modules, "coexecution.groot_fusion", SimpleNamespace(NonGemmAdapters=Fusion)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "coexecution.groot_pointwise",
+        SimpleNamespace(PointwiseFusion=Pointwise),
+    )
+    with GrootOptimizations(
+        runtime_interface.policy, OptimizationConfig(fusion=True, static_vlm=True)
+    ) as session:
+        assert session.static_vlm.vision_rope is session.fusion.vision
+        assert events.index("set pointwise dit") < events.index("entered static")
+        fusion = session.fusion
+        session.set_runtime(vlm_graph=True)
+        assert (
+            session.fusion is fusion and session.static_vlm.vision_rope is fusion.vision
+        )
+        assert events.count("created fusion") == 1
+
+
+def test_static_vlm_runtime_switch_retains_dit_graph_and_recreates_graph_mode(
+    runtime_interface,
+):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(precision="fp8", dit_graph=True, static_vlm=True),
+    ) as session:
+        graphs, static = session.graphs, session.static_vlm
+        session.set_runtime(vlm_graph=True)
+        assert session.static_vlm.cuda_graph and static.closed
+        session.set_runtime(static_vlm=False, vlm_graph=False)
+        assert (
+            not session.config.static_vlm and session.evidence()["static_vlm"] is None
+        )
+        session.set_runtime(static_vlm=True, vlm_graph=True)
+        assert session.static_vlm.cuda_graph
+        assert session.graphs is graphs
+        assert runtime_interface.events.count("created floating") == 1
+        assert runtime_interface.events.count("created graphs") == 1
+
+
+def test_static_vlm_runtime_failure_rolls_back_all_four_adapters(runtime_interface):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(input_preparation=True, tokenizer_cache=True),
+    ) as session:
+        runtime_interface.failures.append("static")
+        with pytest.raises(RuntimeError, match="static installation failed"):
+            session.set_runtime(static_vlm=True, vlm_graph=True)
+        assert session.config.input_preparation and session.config.tokenizer_cache
+        assert not session.config.static_vlm and not session.config.vlm_graph
+        assert not session.preparation.closed and not session.tokenizer_cache.closed
+        assert not session.boundary.closed
+
+
+@pytest.mark.parametrize("operation", ["set_runtime", "close"])
+def test_static_busy_guard_rejects_before_any_other_restoration(
+    runtime_interface, operation
+):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(input_preparation=True, static_vlm=True),
+    ) as session:
+        session.static_vlm.active_call = True
+        before = list(runtime_interface.events)
+        try:
+            with pytest.raises(RuntimeError, match="active call"):
+                if operation == "close":
+                    session.close()
+                else:
+                    session.set_runtime(static_vlm=False)
+            assert runtime_interface.events == before
+            assert not session.preparation.closed and not session.boundary.closed
+        finally:
+            session.static_vlm.active_call = False
+
+
+def test_runtime_rejects_disabling_static_while_graph_remains_enabled(
+    runtime_interface,
+):
+    with GrootOptimizations(
+        runtime_interface.policy, OptimizationConfig(static_vlm=True, vlm_graph=True)
+    ) as session:
+        before = list(runtime_interface.events)
+        with pytest.raises(ValueError, match="requires static_vlm"):
+            session.set_runtime(static_vlm=False)
+        assert runtime_interface.events == before
 
 
 def test_runtime_switch_requires_active_scope_and_fixed_model(runtime_interface):

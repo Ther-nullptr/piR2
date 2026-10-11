@@ -36,6 +36,8 @@ class GrootOptimizations:
         self.preparation = None
         self.tokenizer_cache = None
         self.graphs = None
+        self.static_vlm = None
+        self.fusion = None
         self._active = False
         self._model = None
         self._runtime_refs = []
@@ -92,7 +94,6 @@ class GrootOptimizations:
         # or weight layouts. Dependency loading is allowed, patching is not.
         self.backend = preflight_backend(self.config, next(model.parameters()).device)
         self._bind_runtime_model(model)
-        self._install_runtime_adapters()
 
         def clear_cache():
             pass
@@ -114,6 +115,7 @@ class GrootOptimizations:
             from coexecution.groot_pointwise import PointwiseFusion
 
             fusion = NonGemmAdapters(self.policy, "native")
+            self.fusion = fusion
             self.stack.callback(fusion.close)
             fusion.set("all")
             pointwise = PointwiseFusion(self.policy)
@@ -193,6 +195,7 @@ class GrootOptimizations:
             self.stack.callback(graphs.close)
             graphs.set(self.config.precision)
         self._clear_cache = clear_cache
+        self._install_runtime_adapters()
         self._install_boundary()
 
     def _bind_runtime_model(self, model):
@@ -264,6 +267,20 @@ class GrootOptimizations:
                 self.tokenizer_cache = TokenizerCacheScope(self.policy)
             self.runtime_stack.callback(self.tokenizer_cache.close)
             self.tokenizer_cache.__enter__()
+        if self.config.static_vlm:
+            from coexecution.optimization.groot.vlm import PolicyStaticS2
+
+            if (
+                self.static_vlm is None
+                or self.static_vlm.cuda_graph != self.config.vlm_graph
+            ):
+                self.static_vlm = PolicyStaticS2(
+                    self.policy,
+                    cuda_graph=self.config.vlm_graph,
+                    vision_rope=None if self.fusion is None else self.fusion.vision,
+                )
+            self.runtime_stack.callback(self.static_vlm.close)
+            self.static_vlm.__enter__()
 
     def _install_boundary(self):
         self.boundary = None
@@ -276,7 +293,7 @@ class GrootOptimizations:
     @contextmanager
     def _runtime_guard(self):
         with ExitStack() as guards:
-            for adapter in (self.preparation, self.tokenizer_cache):
+            for adapter in (self.preparation, self.tokenizer_cache, self.static_vlm):
                 if adapter is not None:
                     guards.enter_context(adapter.close_guard())
             yield
@@ -289,7 +306,7 @@ class GrootOptimizations:
         static_vlm=None,
         vlm_graph=None,
     ):
-        """Switch preparation/cache only; retain fixed precision, layouts and graphs."""
+        """Switch common runtime scopes; retain fixed precision, layouts and DiT graphs."""
         if not self._active:
             raise RuntimeError(
                 "Runtime switching requires an active optimization session"
@@ -302,10 +319,6 @@ class GrootOptimizations:
         ):
             if value is not None and type(value) is not bool:
                 raise ValueError(f"Runtime {name} must be a bool or None")
-        if static_vlm or vlm_graph:
-            raise ValueError(
-                "Static VLM and VLM graph runtime adapters are not implemented"
-            )
         config = replace(
             self.config,
             **{
@@ -313,6 +326,8 @@ class GrootOptimizations:
                 for name, value in (
                     ("input_preparation", input_preparation),
                     ("tokenizer_cache", tokenizer_cache),
+                    ("static_vlm", static_vlm),
+                    ("vlm_graph", vlm_graph),
                 )
                 if value is not None
             },
@@ -376,6 +391,11 @@ class GrootOptimizations:
                 else self.tokenizer_cache.evidence()
             ),
             "dit_graph": None if self.graphs is None else self.graphs.evidence(),
+            "static_vlm": (
+                None
+                if self.static_vlm is None or not self.config.static_vlm
+                else self.static_vlm.evidence()
+            ),
             "scope": "Experimental serial inference; replay checks do not establish task quality",
         }
 
