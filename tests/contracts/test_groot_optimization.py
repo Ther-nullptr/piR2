@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -142,6 +143,517 @@ def test_vision_layout_is_independent_and_opt_in():
     assert config.precision == "bf16" and not config.fusion and not config.dit_graph
     config.validate_variant("pir2")
     config.validate_variant("flow")
+
+
+@pytest.mark.parametrize("precision", ["bf16", "w8a8", "w4a4", "fp8", "fp4"])
+def test_input_preparation_is_opt_in_and_precision_independent(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", precision, "--input-preparation"])
+    )
+    assert config.input_preparation and config.enabled
+    assert not OptimizationConfig().input_preparation
+    assert not config.fusion and not config.dit_graph
+    config.validate_variant("flow")
+    config.validate_variant("pir2")
+    assert GrootOptimizations(object(), config).evidence()["config"][
+        "input_preparation"
+    ]
+
+
+@pytest.mark.parametrize("precision", ["bf16", "w8a8", "w4a4", "fp8", "fp4"])
+def test_tokenizer_cache_is_opt_in_and_precision_independent(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", precision, "--tokenizer-cache"])
+    )
+    assert config.tokenizer_cache and config.enabled
+    assert not OptimizationConfig().tokenizer_cache
+    assert not config.fusion and not config.dit_graph
+    config.validate_variant("flow")
+    config.validate_variant("pir2")
+    assert GrootOptimizations(object(), config).evidence()["config"]["tokenizer_cache"]
+
+
+@pytest.fixture
+def runtime_interface(monkeypatch):
+    """Lifecycle sentinels; no real tensors, tokenizers, neural modules or kernels."""
+    events, failures = [], []
+    model = SimpleNamespace(
+        training=False,
+        config=SimpleNamespace(streaming=False),
+        parameters=lambda: iter(
+            [SimpleNamespace(dtype="bf16", device=SimpleNamespace(type="cuda"))]
+        ),
+        named_modules=lambda: iter([]),
+        backbone=SimpleNamespace(forward=lambda inputs: inputs),
+        action_head=SimpleNamespace(
+            model=SimpleNamespace(forward=lambda inputs: inputs)
+        ),
+    )
+    policy = SimpleNamespace(model=model)
+
+    class Adapter:
+        label = "preparation"
+
+        def __init__(self, actual_policy):
+            assert actual_policy is policy
+            self.closed = True
+            self.active_call = False
+            events.append("created " + self.label)
+
+        def __enter__(self):
+            events.append("entered " + self.label)
+            if failures and failures[0] == self.label:
+                failures.pop(0)
+                raise RuntimeError(self.label + " installation failed")
+            self.closed = False
+            return self
+
+        def close(self):
+            if not self.closed:
+                events.append("closed " + self.label)
+                self.closed = True
+
+        def evidence(self):
+            return {"adapter": self.label}
+
+        @contextmanager
+        def close_guard(self):
+            if self.active_call:
+                raise RuntimeError("Cannot change runtime during an active call")
+            yield
+
+    class Tokenizer(Adapter):
+        label = "tokenizer"
+
+    class Boundary:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            self.active_call = False
+            events.append("created boundary")
+
+        def close(self):
+            if self.active_call:
+                raise RuntimeError("Cannot close boundary during an active call")
+            if not self.closed:
+                events.append("closed boundary")
+                self.closed = True
+
+    class Graphs:
+        def __init__(self, head):
+            self.cache = object()
+            events.append("created graphs")
+
+        def set(self, precision):
+            events.append("set graphs " + precision)
+
+        def close(self):
+            events.append("closed graphs")
+
+        def evidence(self):
+            return {"captures": 0}
+
+    class Floating:
+        def __init__(self, *args, **kwargs):
+            self.groups = []
+            self.coverage = {}
+            events.append("created floating")
+
+        def close(self):
+            events.append("closed floating")
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
+    for name, exports in (
+        (
+            "coexecution.optimization.execution.preparation",
+            {"InputPreparation": Adapter},
+        ),
+        (
+            "coexecution.optimization.execution.tokenization",
+            {"TokenizerCacheScope": Tokenizer},
+        ),
+        ("coexecution.optimization.execution.graph", {"DitGraphs": Graphs}),
+        ("coexecution.optimization.groot.floating", {"FloatingProjections": Floating}),
+        (
+            "coexecution.optimization.groot.projections",
+            {"inventory": lambda *a, **k: ({"backbone.linear": {}}, [], [], [])},
+        ),
+    ):
+        monkeypatch.setitem(sys.modules, name, SimpleNamespace(**exports))
+    monkeypatch.setattr(
+        "coexecution.optimization.session.SerialForwardBoundary", Boundary
+    )
+    monkeypatch.setattr(
+        "coexecution.optimization.session.preflight_backend", lambda *args: {}
+    )
+    return SimpleNamespace(policy=policy, model=model, events=events, failures=failures)
+
+
+def test_tokenizer_and_preparation_install_before_outer_boundary(runtime_interface):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            input_preparation=True,
+            tokenizer_cache=True,
+        ),
+    ) as session:
+        assert runtime_interface.events == [
+            "created preparation",
+            "entered preparation",
+            "created tokenizer",
+            "entered tokenizer",
+            "created boundary",
+        ]
+        assert session.evidence()["tokenizer_cache"] == {"adapter": "tokenizer"}
+    assert runtime_interface.events[-3:] == [
+        "closed boundary",
+        "closed tokenizer",
+        "closed preparation",
+    ]
+
+
+def test_runtime_switch_retains_fixed_precision_controller_and_dit_graph(
+    runtime_interface,
+):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            precision="fp8",
+            input_preparation=True,
+            dit_graph=True,
+        ),
+    ) as session:
+        graphs, graph_cache = session.graphs, session.graphs.cache
+        public_cleanup = []
+        session.stack.callback(public_cleanup.append, "fixed cleanup")
+        for _ in range(3):
+            session.set_runtime(
+                input_preparation=False,
+                tokenizer_cache=True,
+                static_vlm=False,
+                vlm_graph=False,
+            )
+            session.set_runtime(input_preparation=True, tokenizer_cache=False)
+        assert session.graphs is graphs and graphs.cache is graph_cache
+        assert session.config.precision == "fp8" and session.config.dit_graph
+        assert session.evidence()["dit_graph"] == {"captures": 0}
+        assert runtime_interface.events.count("created floating") == 1
+        assert runtime_interface.events.count("created graphs") == 1
+        assert "closed floating" not in runtime_interface.events
+        assert "closed graphs" not in runtime_interface.events
+        assert not public_cleanup
+    assert public_cleanup == ["fixed cleanup"]
+    assert runtime_interface.events.count("closed floating") == 1
+    assert runtime_interface.events.count("closed graphs") == 1
+    assert runtime_interface.events.count("closed preparation") == 4
+    assert runtime_interface.events.count("closed tokenizer") == 3
+
+
+def test_runtime_switch_closes_boundary_first_and_reinstalls_it_last(runtime_interface):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            input_preparation=True,
+        ),
+    ) as session:
+        runtime_interface.events.clear()
+        session.set_runtime(input_preparation=False, tokenizer_cache=True)
+        assert runtime_interface.events == [
+            "closed boundary",
+            "closed preparation",
+            "created tokenizer",
+            "entered tokenizer",
+            "created boundary",
+        ]
+
+
+def test_runtime_switch_failure_rolls_back_to_previous_adapters(runtime_interface):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            input_preparation=True,
+        ),
+    ) as session:
+        runtime_interface.failures.append("tokenizer")
+        with pytest.raises(RuntimeError, match="tokenizer installation failed"):
+            session.set_runtime(input_preparation=False, tokenizer_cache=True)
+        assert session.config.input_preparation and not session.config.tokenizer_cache
+        assert not session.preparation.closed and not session.boundary.closed
+        session.set_runtime(input_preparation=False, tokenizer_cache=True)
+        assert session.config.tokenizer_cache and not session.tokenizer_cache.closed
+
+
+def test_runtime_switch_restores_serial_boundary_after_partial_cleanup_failure(
+    runtime_interface,
+    monkeypatch,
+):
+    from coexecution.optimization.execution.cache import SerialForwardBoundary
+
+    monkeypatch.setattr(
+        "coexecution.optimization.session.SerialForwardBoundary", SerialForwardBoundary
+    )
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            precision="fp8",
+            input_preparation=True,
+            dit_graph=True,
+        ),
+    ) as session:
+        previous_boundary = session.boundary
+        graphs, graph_cache = session.graphs, session.graphs.cache
+        fail_once = True
+
+        def clear():
+            nonlocal fail_once
+            if fail_once:
+                fail_once = False
+                raise RuntimeError("one-shot boundary cleanup failed")
+
+        session._clear_cache = previous_boundary.clear = clear
+        with pytest.raises(RuntimeError, match="one-shot boundary cleanup failed"):
+            session.set_runtime(input_preparation=False, tokenizer_cache=True)
+        assert previous_boundary.closed
+        assert session.boundary is not previous_boundary and not session.boundary.closed
+        assert session.config.input_preparation and not session.config.tokenizer_cache
+        assert not session.preparation.closed
+        assert session.graphs is graphs and graphs.cache is graph_cache
+        assert runtime_interface.events.count("created floating") == 1
+        assert "closed floating" not in runtime_interface.events
+        assert "closed graphs" not in runtime_interface.events
+        assert session.boundary.lock.acquire(blocking=False)
+        try:
+            with pytest.raises(RuntimeError, match="serial submissions"):
+                runtime_interface.model.backbone.forward("overlap")
+        finally:
+            session.boundary.lock.release()
+        assert (
+            runtime_interface.model.backbone.forward("still guarded") == "still guarded"
+        )
+
+
+def test_runtime_switch_live_real_boundary_preserves_every_installed_adapter(
+    runtime_interface,
+    monkeypatch,
+):
+    from coexecution.optimization.execution.cache import SerialForwardBoundary
+
+    monkeypatch.setattr(
+        "coexecution.optimization.session.SerialForwardBoundary", SerialForwardBoundary
+    )
+    runtime_interface.model.backbone.forward = lambda callback: callback()
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            input_preparation=True,
+            tokenizer_cache=True,
+        ),
+    ) as session:
+        boundary = session.boundary
+        before = list(runtime_interface.events)
+        with pytest.raises(RuntimeError, match="active call"):
+            runtime_interface.model.backbone.forward(
+                lambda: session.set_runtime(
+                    input_preparation=False,
+                    tokenizer_cache=False,
+                )
+            )
+        assert session.boundary is boundary and not boundary.closed
+        assert session.config.input_preparation and session.config.tokenizer_cache
+        assert not session.preparation.closed and not session.tokenizer_cache.closed
+        assert runtime_interface.events == before
+
+
+def test_failed_runtime_rollback_closes_fixed_controllers_and_session(
+    runtime_interface,
+):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            precision="fp8",
+            input_preparation=True,
+            dit_graph=True,
+        ),
+    ) as session:
+        runtime_interface.failures.extend(["tokenizer", "preparation"])
+        with pytest.raises(RuntimeError, match="rollback.*closed"):
+            session.set_runtime(input_preparation=False, tokenizer_cache=True)
+        assert runtime_interface.events.count("closed floating") == 1
+        assert runtime_interface.events.count("closed graphs") == 1
+        with pytest.raises(RuntimeError, match="active"):
+            session.set_runtime(input_preparation=True)
+
+
+@pytest.mark.parametrize("active", ["preparation", "tokenizer_cache", "boundary"])
+def test_runtime_switch_rejects_active_call_before_any_restoration(
+    runtime_interface, active
+):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(
+            input_preparation=True,
+            tokenizer_cache=True,
+        ),
+    ) as session:
+        target = getattr(session, active)
+        target.active_call = True
+        before = list(runtime_interface.events)
+        try:
+            with pytest.raises(RuntimeError, match="active call"):
+                session.set_runtime(input_preparation=False, tokenizer_cache=False)
+            assert runtime_interface.events == before
+            assert session.config.input_preparation and session.config.tokenizer_cache
+        finally:
+            target.active_call = False
+
+
+def test_default_active_session_can_switch_runtime_without_precision_install(
+    runtime_interface,
+):
+    with GrootOptimizations(runtime_interface.policy) as session:
+        assert not runtime_interface.events
+        session.set_runtime(input_preparation=True)
+        assert session.config.precision == "bf16" and session.config.input_preparation
+        session.set_runtime(input_preparation=False)
+        assert not session.config.enabled
+        assert session.boundary is None
+
+
+@pytest.mark.parametrize("field", ["static_vlm", "vlm_graph"])
+def test_runtime_switch_accepts_disabled_future_options_but_rejects_enabled(
+    runtime_interface, field
+):
+    with GrootOptimizations(runtime_interface.policy) as session:
+        assert session.set_runtime(**{field: False}) is session
+        with pytest.raises(ValueError, match="not implemented"):
+            session.set_runtime(**{field: True})
+        assert not runtime_interface.events
+
+
+def test_runtime_switch_requires_active_scope_and_fixed_model(runtime_interface):
+    session = GrootOptimizations(
+        runtime_interface.policy, OptimizationConfig(input_preparation=True)
+    )
+    with pytest.raises(RuntimeError, match="active"):
+        session.set_runtime(tokenizer_cache=True)
+    with session:
+        runtime_interface.policy.model = object()
+        with pytest.raises(RuntimeError, match="replaced"):
+            session.set_runtime(tokenizer_cache=True)
+    with pytest.raises(RuntimeError, match="active"):
+        session.set_runtime(tokenizer_cache=True)
+
+
+def test_input_preparation_enters_before_boundary_and_closes_after_it(monkeypatch):
+    calls = []
+    model = SimpleNamespace(
+        training=False,
+        config=SimpleNamespace(streaming=False),
+        parameters=lambda: iter(
+            [SimpleNamespace(dtype="bf16", device=SimpleNamespace(type="cuda"))]
+        ),
+    )
+    policy = SimpleNamespace(model=model)
+
+    class Preparation:
+        def __init__(self, actual_policy):
+            assert actual_policy is policy
+            calls.append("created preparation")
+
+        def __enter__(self):
+            calls.append("entered preparation")
+            return self
+
+        def close(self):
+            calls.append("closed preparation")
+
+        def evidence(self):
+            return {"backbone_keys": ["pixel_values"]}
+
+        def close_guard(self):
+            return nullcontext()
+
+    class Boundary:
+        closed = False
+
+        def __init__(self, *args, **kwargs):
+            calls.append("created boundary")
+
+        def close(self):
+            if not self.closed:
+                calls.append("closed boundary")
+                self.closed = True
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
+    monkeypatch.setitem(
+        sys.modules,
+        "coexecution.optimization.execution.preparation",
+        SimpleNamespace(InputPreparation=Preparation),
+    )
+    monkeypatch.setattr(
+        "coexecution.optimization.session.SerialForwardBoundary", Boundary
+    )
+    monkeypatch.setattr(
+        "coexecution.optimization.session.preflight_backend", lambda *args: {}
+    )
+    with GrootOptimizations(
+        policy, OptimizationConfig(input_preparation=True)
+    ) as session:
+        assert calls[:3] == [
+            "created preparation",
+            "entered preparation",
+            "created boundary",
+        ]
+        assert session.evidence()["input_preparation"] == {
+            "backbone_keys": ["pixel_values"]
+        }
+    assert calls[-2:] == ["closed boundary", "closed preparation"]
+
+
+def test_preparation_entry_failure_is_registered_for_cleanup_immediately(monkeypatch):
+    calls = []
+    model = SimpleNamespace(
+        training=False,
+        config=SimpleNamespace(streaming=False),
+        parameters=lambda: iter(
+            [SimpleNamespace(dtype="bf16", device=SimpleNamespace(type="cuda"))]
+        ),
+    )
+
+    class Preparation:
+        def __init__(self, policy):
+            pass
+
+        def __enter__(self):
+            raise RuntimeError("preparation entry failed")
+
+        def close(self):
+            calls.append("closed preparation")
+
+        def close_guard(self):
+            return nullcontext()
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
+    monkeypatch.setitem(
+        sys.modules,
+        "coexecution.optimization.execution.preparation",
+        SimpleNamespace(InputPreparation=Preparation),
+    )
+    monkeypatch.setattr(
+        "coexecution.optimization.session.preflight_backend", lambda *args: {}
+    )
+    with (
+        pytest.raises(RuntimeError, match="preparation entry"),
+        GrootOptimizations(
+            SimpleNamespace(model=model),
+            OptimizationConfig(input_preparation=True),
+        ),
+    ):
+        pytest.fail("A failed preparation installation cannot enter the session")
+    assert calls == ["closed preparation"]
 
 
 @pytest.mark.parametrize(

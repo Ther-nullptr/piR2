@@ -4,8 +4,8 @@ GPU dependencies are loaded only when an enabled configuration enters its scope.
 """
 
 import hashlib
-from contextlib import ExitStack
-from dataclasses import asdict
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from coexecution.optimization.capabilities import preflight_backend
@@ -29,11 +29,24 @@ class GrootOptimizations:
         self.policy = policy
         self.config = OptimizationConfig() if config is None else config
         self.stack = ExitStack()
+        self.runtime_stack = ExitStack()
         self.coverage = {}
         self.backend = {}
         self.boundary = None
+        self.preparation = None
+        self.tokenizer_cache = None
+        self.graphs = None
+        self._active = False
+        self._model = None
+        self._runtime_refs = []
+        self._clear_cache = lambda: None
+        self._roots = []
+        self._resets = []
 
     def __enter__(self):
+        if self._active:
+            raise RuntimeError("Optimization session is already active")
+        self._active = True
         if not self.config.enabled:
             return self
         try:
@@ -78,7 +91,12 @@ class GrootOptimizations:
         # Validate the selected backend/profile before modifying model methods
         # or weight layouts. Dependency loading is allowed, patching is not.
         self.backend = preflight_backend(self.config, next(model.parameters()).device)
-        clear_cache = lambda: None
+        self._bind_runtime_model(model)
+        self._install_runtime_adapters()
+
+        def clear_cache():
+            pass
+
         if self.config.vision_channels_last:
             proj = model.backbone.model.visual.patch_embed.proj
             self.stack.callback(setattr, proj.weight, "data", proj.weight.data)
@@ -117,7 +135,10 @@ class GrootOptimizations:
             self.stack.callback(floating.close)
             self.coverage = floating.coverage
             self.coverage["component"] = self.config.component
-            clear_cache = lambda: clear_floating_projection_cache(floating.groups)
+
+            def clear_cache():
+                clear_floating_projection_cache(floating.groups)
+
             if self.config.norm_modulation_quant:
                 from coexecution.optimization.groot.floating_connections import (
                     FloatingConnections,
@@ -168,10 +189,27 @@ class GrootOptimizations:
             from coexecution.optimization.execution.graph import DitGraphs
 
             graphs = DitGraphs(model.action_head.model)
+            self.graphs = graphs
             self.stack.callback(graphs.close)
             graphs.set(self.config.precision)
+        self._clear_cache = clear_cache
+        self._install_boundary()
+
+    def _bind_runtime_model(self, model):
+        if self._model is not None:
+            self._validate_runtime_model()
+            return
+        self._model = model
         head = getattr(model, "action_head", None)
-        roots = [
+        self._runtime_refs = [(self.policy, "model", model)]
+        for owner, name in (
+            (model, "backbone"),
+            (model, "action_head"),
+            (head, "model"),
+        ):
+            if owner is not None and hasattr(owner, name):
+                self._runtime_refs.append((owner, name, getattr(owner, name)))
+        self._roots = [
             root
             for root in (
                 getattr(model, "backbone", None),
@@ -180,11 +218,139 @@ class GrootOptimizations:
             )
             if root is not None
         ]
-        resets = (
+        self._resets = (
             [head] if callable(getattr(head, "reset_streaming_buffer", None)) else []
         )
-        self.boundary = SerialForwardBoundary(roots, clear_cache, reset_modules=resets)
-        self.stack.callback(self.boundary.close)
+
+    def _validate_runtime_model(self):
+        if any(
+            getattr(owner, name, None) is not original
+            for owner, name, original in self._runtime_refs
+        ):
+            raise RuntimeError("Optimization model or component was replaced")
+
+    def _admit_runtime_model(self):
+        if self._model is not None:
+            self._validate_runtime_model()
+            return
+        import torch
+
+        model = self.policy.model
+        parameter = next(model.parameters())
+        if model.training or parameter.dtype != torch.bfloat16:
+            raise ValueError("Optimizations require an eval-mode BF16 model")
+        if parameter.device.type != "cuda":
+            raise ValueError("Optimizations require CUDA")
+        self.config.validate_variant(
+            "pir2" if getattr(model.config, "streaming", False) else "flow"
+        )
+        self.backend = preflight_backend(self.config, parameter.device)
+        self._bind_runtime_model(model)
+
+    def _install_runtime_adapters(self):
+        if self.config.input_preparation:
+            from coexecution.optimization.execution.preparation import InputPreparation
+
+            if self.preparation is None:
+                self.preparation = InputPreparation(self.policy)
+            self.runtime_stack.callback(self.preparation.close)
+            self.preparation.__enter__()
+        if self.config.tokenizer_cache:
+            from coexecution.optimization.execution.tokenization import (
+                TokenizerCacheScope,
+            )
+
+            if self.tokenizer_cache is None:
+                self.tokenizer_cache = TokenizerCacheScope(self.policy)
+            self.runtime_stack.callback(self.tokenizer_cache.close)
+            self.tokenizer_cache.__enter__()
+
+    def _install_boundary(self):
+        self.boundary = None
+        if self.config.enabled:
+            self.boundary = SerialForwardBoundary(
+                self._roots, self._clear_cache, reset_modules=self._resets
+            )
+            self.runtime_stack.callback(self.boundary.close)
+
+    @contextmanager
+    def _runtime_guard(self):
+        with ExitStack() as guards:
+            for adapter in (self.preparation, self.tokenizer_cache):
+                if adapter is not None:
+                    guards.enter_context(adapter.close_guard())
+            yield
+
+    def set_runtime(
+        self,
+        *,
+        input_preparation=None,
+        tokenizer_cache=None,
+        static_vlm=None,
+        vlm_graph=None,
+    ):
+        """Switch preparation/cache only; retain fixed precision, layouts and graphs."""
+        if not self._active:
+            raise RuntimeError(
+                "Runtime switching requires an active optimization session"
+            )
+        for name, value in (
+            ("input_preparation", input_preparation),
+            ("tokenizer_cache", tokenizer_cache),
+            ("static_vlm", static_vlm),
+            ("vlm_graph", vlm_graph),
+        ):
+            if value is not None and type(value) is not bool:
+                raise ValueError(f"Runtime {name} must be a bool or None")
+        if static_vlm or vlm_graph:
+            raise ValueError(
+                "Static VLM and VLM graph runtime adapters are not implemented"
+            )
+        config = replace(
+            self.config,
+            **{
+                name: value
+                for name, value in (
+                    ("input_preparation", input_preparation),
+                    ("tokenizer_cache", tokenizer_cache),
+                )
+                if value is not None
+            },
+        )
+        with self._runtime_guard():
+            self._validate_runtime_model()
+            if config == self.config:
+                return self
+            if config.enabled:
+                self._admit_runtime_model()
+            previous = self.config
+            previous_boundary = self.boundary
+            # Active-root rejection must happen before any adapter restoration.
+            try:
+                if previous_boundary is not None:
+                    previous_boundary.close()
+                self.runtime_stack.close()
+                self.runtime_stack = ExitStack()
+                self.config = config
+                self._install_runtime_adapters()
+                self._install_boundary()
+            except BaseException:
+                if previous_boundary is not None and not previous_boundary.closed:
+                    # A live root rejected close without changing any methods.
+                    raise
+                try:
+                    self.runtime_stack.close()
+                    self.runtime_stack = ExitStack()
+                    self.config = previous
+                    self._install_runtime_adapters()
+                    self._install_boundary()
+                except BaseException as rollback:
+                    self.close()
+                    raise RuntimeError(
+                        "Runtime rollback failed; optimization session closed"
+                    ) from rollback
+                raise
+        return self
 
     def evidence(self):
         config = asdict(self.config)
@@ -199,20 +365,36 @@ class GrootOptimizations:
             "config": config,
             "coverage": self.coverage,
             "backend": self.backend,
+            "input_preparation": (
+                None
+                if self.preparation is None or not self.config.input_preparation
+                else self.preparation.evidence()
+            ),
+            "tokenizer_cache": (
+                None
+                if self.tokenizer_cache is None or not self.config.tokenizer_cache
+                else self.tokenizer_cache.evidence()
+            ),
+            "dit_graph": None if self.graphs is None else self.graphs.evidence(),
             "scope": "Experimental serial inference; replay checks do not establish task quality",
         }
 
     def close(self):
         # Reject closing inside a live root before ExitStack starts restoring any
         # controller. Its duplicate boundary callback is intentionally idempotent.
-        if self.boundary is None:
-            self.stack.close()
-            return
-        try:
-            self.boundary.close()
-        finally:
-            if self.boundary.closed:
-                self.stack.close()
+        with self._runtime_guard():
+            try:
+                if self.boundary is not None:
+                    self.boundary.close()
+            finally:
+                if self.boundary is None or self.boundary.closed:
+                    try:
+                        self.runtime_stack.close()
+                    finally:
+                        try:
+                            self.stack.close()
+                        finally:
+                            self._active = False
 
     def __exit__(self, *exception):
         self.close()

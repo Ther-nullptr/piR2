@@ -24,6 +24,8 @@ class OptimizationConfig:
     fp_grouped: bool = False
     fp_swiglu: bool = False
     component: str = "all"
+    input_preparation: bool = False
+    tokenizer_cache: bool = False
 
     def __post_init__(self):
         if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
@@ -80,6 +82,8 @@ class OptimizationConfig:
             or self.fusion
             or self.dit_graph
             or self.vision_channels_last
+            or self.input_preparation
+            or self.tokenizer_cache
         )
 
     def validate_variant(self, variant):
@@ -108,6 +112,8 @@ def add_optimization_arguments(parser):
     parser.add_argument("--quantization-shape-tactics", type=Path)
     parser.add_argument("--group-conditioning", action="store_true")
     parser.add_argument("--vision-channels-last", action="store_true")
+    parser.add_argument("--input-preparation", action="store_true")
+    parser.add_argument("--tokenizer-cache", action="store_true")
     parser.add_argument("--norm-modulation-quant", action="store_true")
     parser.add_argument("--residual-norm-quant", action="store_true")
     parser.add_argument("--fp8-fast-quant", action="store_true")
@@ -130,6 +136,8 @@ def optimization_config(args):
         shape_tactics=args.quantization_shape_tactics,
         group_conditioning=args.group_conditioning,
         vision_channels_last=args.vision_channels_last,
+        input_preparation=args.input_preparation,
+        tokenizer_cache=args.tokenizer_cache,
         norm_modulation_quant=args.norm_modulation_quant,
         residual_norm_quant=args.residual_norm_quant,
         fp8_fast_quant=args.fp8_fast_quant,
