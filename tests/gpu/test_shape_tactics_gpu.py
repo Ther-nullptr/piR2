@@ -12,15 +12,15 @@ import torch
 from robotics_kernels.ampere_ada.integer import IntegerProjectionGroup
 from robotics_kernels.common.graph import CudaGraphCall
 
-from coexecution.quantization import (
+from coexecution.optimization.backends.integer.linear import (
     PreparedLinear,
-    TransformerINT,
     install_shape_tactics,
     prepare,
     selected_tactic,
 )
-from coexecution.quantization_connections import packed_input
-from coexecution.test_quantization_gpu import equal
+from coexecution.optimization.groot.integer import TransformerINT
+from coexecution.optimization.groot.integer_connections import packed_input
+from tests.helpers.cuda_assertions import equal
 
 
 @pytest.mark.parametrize("bits", [8, 4])

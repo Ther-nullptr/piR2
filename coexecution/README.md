@@ -20,6 +20,36 @@ See [measurement definitions](../docs/coexecution.md). Raw JSON, plots, SQLite e
 
 ## Experimental GR00T fusion and integer inference
 
+### Module ownership / 模块职责
+
+GR00T optimization implementations live under `coexecution/optimization`:
+
+| Path | Responsibility / 职责 |
+| --- | --- |
+| `config.py`, `tactics.py` | GPU-free configuration and tactic parsing; 配置与调度表 |
+| `session.py` | Reversible installation, restoration and evidence; 安装生命周期 |
+| `groot/projections.py` | Shared model inventory; 共用模型节点发现 |
+| `groot/integer.py`, `groot/floating.py` | Model projection replacement; 模型适配 |
+| `groot/*_connections.py` | GR00T norm/residual producer boundaries; 模型连接 |
+| `execution/graph.py` | Shared pure-DiT graph capture; 共用 Graph |
+| `backends/integer/linear.py` | Integer packing, GEMM and dispatch; 整数算子 |
+| `backends/thor/linear.py`, `backends/thor/packing.py` | Thor floating formats and execution; 浮点算子 |
+
+Configuration and default scope imports do not load Torch or GPU kernels. A
+session imports only its selected implementation. Backends do not import LIBERO
+schedulers or RPC services; integer and floating implementations share model
+inventory and Graph handling, not packed formats. The pinned third-party source
+and existing `coexecution/csrc` remain the kernel source of truth.
+
+原有 `coexecution.groot_optimization`、`quantization`、`floating_quantization`
+等导入路径作为兼容转发保留；新增实现使用上述目录。目录迁移不改变 CLI、默认精度、
+packing、scale、tactic 或融合公式。不同硬件共用模型与调度语义，不复制整套推理服务。
+
+Optimization contracts are in `tests/contracts`, explicit CUDA tests in
+`tests/gpu`, and reusable fixtures in `tests/helpers`. GPU tests require
+`PIR2_GPU_TESTS=1`; public CI checks configuration, scheduling and accounting only.
+The separate SO100/queue tools retain their existing modules and tests.
+
 这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；依赖固定版本的 Speedup Paradox 整数后端。当前范围是单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝，同进程并发优化服务也不支持。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
 
 The modules provide instance-local, reversible adaptations. Weight packing happens during installation; activation scales, quantization and packing run online. Integer GEMM uses INT32 accumulation and a fused scale/bias/BF16 output epilogue. Compatible QKV/KV and gate/up projections share preparation. The native dispatch can combine activation preparation with GELU or SiLU-times-up; AdaLN modulation can produce the packed input directly. Fused SDPA remains floating point. No checkpoint, convolution layout, sampling schedule, observation or VLM-cache policy is changed by enabling quantization.
@@ -84,8 +114,8 @@ Lightweight public CI runs only the configuration and restoration contracts. Exp
 
 ```bash
 PIR2_GPU_TESTS=1 python -m pytest -q \
-  coexecution/test_groot_fusion_gpu.py coexecution/test_quantization_gpu.py \
-  coexecution/test_groot_vision_layout_gpu.py
+  tests/gpu/test_groot_fusion_gpu.py tests/gpu/test_quantization_gpu.py \
+  tests/gpu/test_groot_vision_layout_gpu.py
 ```
 
 Kernel agreement at a fixed precision does not establish quantization quality versus BF16 or robot-task success. Preserve raw evidence outside Git and report unexecuted streaming/closed-loop checks in the PR. Source and license attribution is recorded in [third-party notices](../THIRD_PARTY_NOTICES.md).
@@ -111,19 +141,19 @@ the VLM and uses random weights, so it establishes neither task accuracy nor
 production-model speedup:
 
 ```bash
-PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_groot_streaming_gpu.py
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_groot_streaming_gpu.py
 ```
 
 Explicit checks for the experimental norm/residual options:
 
 ```bash
-PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_groot_norm_quant_gpu.py
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_groot_norm_quant_gpu.py
 ```
 
 Shape-tactic dispatch has separate opt-in CUDA checks for both precisions, prepared inputs, grouped projections and changing-shape Graph capture:
 
 ```bash
-PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_shape_tactics_gpu.py
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_shape_tactics_gpu.py
 ```
 
 These checks separate native-reduction control-flow equivalence from fused
@@ -204,7 +234,7 @@ fixed demonstration observations and committed prefixes. GPU tests check packed
 references, bias, changing Graph inputs, RNG preservation and restoration:
 
 ```bash
-PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_floating_quantization_gpu.py coexecution/test_floating_fusion_gpu.py
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_floating_quantization_gpu.py tests/gpu/test_floating_fusion_gpu.py
 ```
 
 Keep these checks separate from model replay and LIBERO closed-loop evaluation.

@@ -13,20 +13,15 @@ import torch
 import torch.nn.functional as F
 from robotics_kernels.ampere_ada.modulation import prepare_modulation
 
-from coexecution import quantization_connections as connections
-from coexecution import test_groot_streaming_gpu as streaming
-from coexecution.groot_optimization import GrootOptimizations, OptimizationConfig
-from coexecution.test_groot_streaming_gpu import (
+from coexecution.optimization.config import OptimizationConfig
+from coexecution.optimization.groot import integer_connections as connections
+from coexecution.optimization.session import GrootOptimizations
+from tests.helpers.groot_streaming import (
     assert_equal,
     assert_integer_trace,
     rollout,
 )
-from coexecution.test_quantization_gpu import Norm, policy_for
-
-
-@pytest.fixture
-def streaming_policy():
-    return streaming.policy_and_inputs.__wrapped__()
+from tests.helpers.projection_models import Norm, policy_for
 
 
 def unpack(packed):
@@ -83,9 +78,9 @@ def native_residual_pack(x, y, gate, scale, shift, bits, *, eps):
 @pytest.mark.parametrize("graph", [False, True])
 @torch.inference_mode()
 def test_norm_fusion_streaming_semantics_and_cleanup(
-    streaming_policy, precision, residual, graph, monkeypatch, record_property
+    policy_and_inputs, precision, residual, graph, monkeypatch, record_property
 ):
-    policy, inputs = streaming_policy
+    policy, inputs = policy_and_inputs
     head = policy.model.action_head
     config = {"precision": precision, "fusion": True, "scope": "all", "category_id": 0}
     original = rollout(head, inputs)

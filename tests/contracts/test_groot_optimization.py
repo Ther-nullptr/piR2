@@ -261,15 +261,19 @@ def test_empty_integer_coverage_is_rejected_before_gpu_install(tmp_path, monkeyp
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bf16"))
     monkeypatch.setitem(
         sys.modules,
-        "coexecution.quantization",
+        "coexecution.optimization.groot.integer",
         SimpleNamespace(
-            inventory=lambda *a, **k: ({"new.name": object()}, [], [], []),
             TransformerINT=lambda *a, **k: pytest.fail("No sites to install"),
         ),
     )
     monkeypatch.setitem(
         sys.modules,
-        "coexecution.quantization_connections",
+        "coexecution.optimization.groot.projections",
+        SimpleNamespace(inventory=lambda *a, **k: ({"new.name": object()}, [], [], [])),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "coexecution.optimization.groot.integer_connections",
         SimpleNamespace(AdditionalConnections=None),
     )
     with (
@@ -354,7 +358,7 @@ def test_shape_tactics_reach_singles_categories_and_groups(tmp_path, monkeypatch
     installed = []
     monkeypatch.setitem(
         sys.modules,
-        "coexecution.quantization",
+        "coexecution.optimization.backends.integer.linear",
         SimpleNamespace(
             install_shape_tactics=lambda q, shapes: installed.append((q, shapes))
         ),
@@ -445,7 +449,7 @@ def test_name_only_coverage_does_not_require_legacy_shapes(tmp_path, named_tacti
 
 def test_ada_preset_loads_through_public_tactic_interface():
     preset = (
-        Path(__file__).resolve().parents[1] / "configs/quantization/groot-libero10-ada"
+        Path(__file__).resolve().parents[2] / "configs/quantization/groot-libero10-ada"
     )
     coverage = json.loads((preset / "coverage.json").read_text())["linears"]
     singles = json.loads((preset / "tactics.json").read_text())

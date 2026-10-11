@@ -11,10 +11,11 @@ if os.environ.get("PIR2_GPU_TESTS") != "1":
 import torch
 import torch.nn.functional as F
 
-from coexecution.floating_connections import FloatingConnections
-from coexecution.floating_packing import prepare_norm, prepare_swiglu
-from coexecution.floating_quantization import FloatingLinear, FloatingProjections
-from coexecution.test_floating_quantization_gpu import Qwen3VLTextAttention
+from coexecution.optimization.backends.thor.linear import FloatingLinear
+from coexecution.optimization.backends.thor.packing import prepare_norm, prepare_swiglu
+from coexecution.optimization.groot.floating import FloatingProjections
+from coexecution.optimization.groot.floating_connections import FloatingConnections
+from tests.helpers.projection_models import Qwen3VLTextAttention
 
 
 @pytest.mark.parametrize("residual", [False, True])
