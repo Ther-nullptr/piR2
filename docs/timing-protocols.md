@@ -37,21 +37,3 @@ Strict timing validity requires mean frequency within 2% of 20Hz, maximum contro
 The local LIBERO wrapper clears accumulated object-property samplers before hard model reload. This fixes non-reproducible fixture placement without changing task success predicates. Actual fixture-model, settled simulator-state and initial RGB hashes are compared across methods, rather than assuming seed/init-state equality suffices.
 
 Artifacts are generated below `artifacts/libero-protocols/<label>/`: per-condition config, episodes, traces and summary; stage comparison, initial-condition audit and report. They remain local. The publication checkout extracts two unchanged observation/video helpers from the obsolete evaluator into `libero_observations.py`; implementation hashes therefore differ from earlier live-workspace runs. Do not relabel those older results as a rerun of this publication checkout.
-
-## Controlled completion-release experiments
-
-Deployment can run the real model first and then delay worker release using `--action-min-service-ms` and `--vision-min-service-ms` (both default to zero). `--deployment-fixed-delay` optionally fixes both bootstrap and runtime d in 1..5; omitted preserves adaptive scheduling. These controls are rejected for the algorithm protocol and are part of resume identity.
-
-```bash
-python scripts/evaluate_libero_protocol.py \
-  --protocol deployment --variant pir2 --output .local/experiments/release-floor \
-  --task-ids 0 3 --episodes-per-task 1 --no-video \
-  --action-min-service-ms 80 --vision-min-service-ms 160 \
-  --deployment-fixed-delay 2
-```
-
-The action floor starts at submission and includes worker queueing, feature installation and the real plan RPC. The vision floor starts at its worker RPC timestamp. Calibration uses the same floors; fixed d changes bootstrap and runtime scheduling while retaining deadline misses and per-slot rejection accounting. An over-target raw request is released without additional waiting, with `floor_miss` and raw/total overrun recorded. No extra model forward is introduced.
-
-`raw_completed_s` and `raw_service_seconds` precede the hold. `released_s`/`completed_s` are timestamps recorded just after the hold, **before** metadata recording, Future completion or the VLM publication lock. They are not exact consumer-visible availability timestamps. Use `feature_published` for cache visibility and `action_adopted` for actual controller adoption; S1 Future completion is not separately timestamped. `added_wait_seconds` includes bookkeeping and scheduling as well as sleeping.
-
-This intervention controls a minimum recorded release duration, not raw GPU computation, GPU frequency, or a hardware/quantization speedup. Sleeping releases CPU/GPU execution resources, so its contention pattern differs from slowing down an executing GPU kernel. Report raw and recorded-release durations, floor overruns, actual clocks, control validity, source lineage and AoI coverage separately. Failed or timing-invalid attempts remain evidence and do not silently increase paired-repeat counts.

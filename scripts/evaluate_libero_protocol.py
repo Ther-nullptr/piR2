@@ -276,40 +276,7 @@ def build_parser():
     parser.add_argument("--action-delay", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--artificial-compute-wait", type=float, default=0)
-    parser.add_argument(
-        "--action-min-service-ms",
-        type=float,
-        default=0,
-        help="Deployment: hold real DiT result until submission plus this duration",
-    )
-    parser.add_argument(
-        "--vision-min-service-ms",
-        type=float,
-        default=0,
-        help="Deployment: hold real VLM result until worker start plus this duration",
-    )
-    parser.add_argument(
-        "--deployment-fixed-delay",
-        type=int,
-        choices=range(1, 6),
-        help="Deployment: fix bootstrap and control d; disable adaptive increases",
-    )
     return parser
-
-
-def validate_deployment_controls(args):
-    from libero_wallclock import validate_service_floor
-
-    validate_service_floor(args.action_min_service_ms)
-    validate_service_floor(args.vision_min_service_ms)
-    if args.protocol != "deployment" and (
-        args.action_min_service_ms
-        or args.vision_min_service_ms
-        or args.deployment_fixed_delay is not None
-    ):
-        raise ValueError(
-            "Service floors and fixed deployment delay require the deployment protocol"
-        )
 
 
 def save_run_configuration(output, config):
@@ -343,7 +310,6 @@ def save_run_configuration(output, config):
 
 def main():
     args = build_parser().parse_args()
-    validate_deployment_controls(args)
     if args.control_hz != 20:
         raise ValueError("This protocol must match LIBERO's physical20Hz control step")
     if len(set(args.task_ids)) != len(args.task_ids):
@@ -370,7 +336,7 @@ def main():
     config["checkpoint"] = identity
     config["suite"] = "libero_spatial"
     config["initial_state_indices"] = list(range(args.episodes_per_task))
-    config["version"] = 6
+    config["version"] = 5
     config["measurement_mode"] = "success_terminated_closed_loop"
     config["input_dependencies"] = {
         "camera": "physical observation released at each control tick; latest waiting frame replaces older waiting frames",
@@ -424,18 +390,7 @@ def main():
             "fallback": "zero Cartesian delta; retain last committed gripper",
             "flow_publication": "all native clean positions after committed prefix",
             "pir2_publication": "only next clean delay-sized segment",
-            "action_delay_budget": (
-                "fixed bootstrap and control delay; misses and expired/protected slots still recorded"
-                if args.deployment_fixed_delay is not None
-                else "calibratedp95 plus5ms, nondecreasing within episode, maximum5ticks"
-            ),
-            "service_floor_contract": {
-                "scope": "real neural RPC then client-side sleep; no GPU work added and no compute acceleration claimed",
-                "action_anchor": "submission includes executor queue, feature installation, and plan RPC; result future withheld until release",
-                "vision_anchor": "worker RPC start; feature publication and next VLM admission withheld until release",
-                "target_overruns": "real completion beyond target retained; raw and visible times both recorded",
-                "calibration": "same per-role floors as scored workers; bootstrap is outside scored service timing",
-            },
+            "action_delay_budget": "calibratedp95 plus5ms, nondecreasing within episode, maximum5ticks",
         }
     config = save_run_configuration(args.output, config)
     records_path = args.output / "episodes.jsonl"

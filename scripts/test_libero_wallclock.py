@@ -2,7 +2,6 @@
 
 import io
 import json
-import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -12,271 +11,6 @@ from unittest.mock import patch
 
 import numpy as np
 from libero_wallclock import run_control_loop
-
-
-class ServiceFloors(unittest.TestCase):
-    def test_floor_holds_until_anchor_and_retains_raw_completion(self):
-        from libero_wallclock import release_service
-
-        clock = Clock()
-        clock.t = 10.025
-        timing = release_service(10.0, clock.now(), 80, clock)
-        self.assertAlmostEqual(clock.now(), 10.08)
-        self.assertAlmostEqual(timing["raw_service_seconds"], 0.025)
-        self.assertAlmostEqual(timing["added_wait_seconds"], 0.055)
-        self.assertFalse(timing["floor_miss"])
-        self.assertAlmostEqual(timing["completed_s"], 10.08)
-
-    def test_compute_overrun_is_not_hidden_or_delayed_again(self):
-        from libero_wallclock import release_service
-
-        clock = Clock()
-        clock.t = 10.095
-        timing = release_service(10.0, clock.now(), 80, clock)
-        self.assertAlmostEqual(clock.now(), 10.095)
-        self.assertEqual(timing["added_wait_seconds"], 0)
-        self.assertTrue(timing["floor_miss"])
-        self.assertAlmostEqual(timing["raw_target_overrun_seconds"], 0.015)
-        self.assertAlmostEqual(timing["target_overrun_seconds"], 0.015)
-
-    def test_invalid_service_floors_rejected(self):
-        from libero_wallclock import release_service
-
-        for floor in (-1, float("nan"), float("inf")):
-            with self.subTest(floor=floor), self.assertRaises(ValueError):
-                release_service(10, 10, floor, Clock())
-
-    def test_cli_controls_are_deployment_only(self):
-        from evaluate_libero_protocol import build_parser, validate_deployment_controls
-
-        parser = build_parser()
-        common = ["--protocol", "deployment", "--variant", "pir2", "--output", "unused"]
-        defaults = parser.parse_args(common)
-        self.assertEqual(defaults.action_min_service_ms, 0)
-        self.assertEqual(defaults.vision_min_service_ms, 0)
-        self.assertIsNone(defaults.deployment_fixed_delay)
-        for controls in (
-            ["--action-min-service-ms", "80"],
-            ["--vision-min-service-ms", "160"],
-            ["--deployment-fixed-delay", "2"],
-        ):
-            args = parser.parse_args(common + controls)
-            validate_deployment_controls(args)
-            args.protocol = "algorithm"
-            with self.assertRaisesRegex(ValueError, "deployment"):
-                validate_deployment_controls(args)
-
-    def test_calibration_uses_submission_floor_and_keeps_server_time_raw(self):
-        from libero_wallclock import calibrate
-
-        clock = Clock()
-        endpoints = []
-
-        class Client:
-            def __init__(self, **kwargs):
-                pass
-
-            def call_endpoint(self, endpoint, payload):
-                endpoints.append(endpoint)
-                clock.t += 0.01
-                if endpoint == "bootstrap":
-                    return {"actions": np.zeros((40, 7))}
-                if endpoint == "plan":
-                    return {
-                        "actions": np.zeros((1, 7)),
-                        "audit": {
-                            "cache": {"capture_s": 9.0, "source_tick": 0},
-                            "valid_start_tick": payload["request_tick"] + 1,
-                            "valid_end_tick": payload["request_tick"] + 2,
-                            "server_seconds": 0.007,
-                        },
-                    }
-                return {}
-
-        visual = {"vl_embeds": [], "meta": {"capture_s": 9.0, "source_tick": 0}}
-        with patch.dict(
-            "sys.modules",
-            {"gr00t.policy.server_client": SimpleNamespace(PolicyClient=Client)},
-        ):
-            delay, result = calibrate(
-                Client(),
-                {},
-                9.0,
-                1,
-                0.05,
-                visual,
-                1,
-                action_min_service_ms=85,
-                clock=clock,
-            )
-        self.assertEqual(delay, 2)
-        self.assertEqual(endpoints.count("plan"), 12)
-        self.assertEqual(endpoints.count("bootstrap"), 1)
-        np.testing.assert_allclose(result["action_rpc_seconds"], np.full(10, 0.085))
-        self.assertTrue(
-            all(
-                abs(r["raw_service_seconds"] - 0.02) < 1e-8
-                for r in result["raw_samples"]
-            )
-        )
-        self.assertEqual(result["action_server_seconds"], [0.007] * 10)
-
-    def test_deployment_bootstrap_and_worker_controls_use_fixed_delay(self):
-        from libero_wallclock import deployment_episode
-
-        args = SimpleNamespace(
-            control_hz=20,
-            action_min_service_ms=80,
-            vision_min_service_ms=160,
-            deployment_fixed_delay=2,
-            slow_warmup={},
-            calibration=(4, {"selected_delay_ticks": 4}),
-            port=1,
-            slow_port=2,
-            max_steps=10,
-            record_video=False,
-        )
-        boot_calls = []
-
-        def boot(endpoint, payload):
-            boot_calls.append((endpoint, payload))
-            return {
-                "actions": np.zeros((40, 7)),
-                "bootstrap_seconds": 0.1,
-                "forward_counts": {"dit": 8, "vlm": 1},
-            }
-
-        env = SimpleNamespace(
-            _process_observation=lambda raw: raw,
-            _env=SimpleNamespace(
-                env=SimpleNamespace(_get_observations=lambda **kwargs: {})
-            ),
-        )
-        with (
-            patch("libero_wallclock.ActionWorker") as actor,
-            patch("libero_wallclock.VisionWorker") as vision,
-            patch("libero_wallclock.run_control_loop", return_value=({}, [])) as loop,
-        ):
-            result, _ = deployment_episode(
-                env, {}, SimpleNamespace(call_endpoint=boot), args, 1, io.StringIO()
-            )
-        self.assertEqual(len(boot_calls), 1)
-        self.assertEqual(boot_calls[0][0], "bootstrap")
-        self.assertEqual(boot_calls[0][1]["delay_ticks"], 2)
-        self.assertEqual(loop.call_args.args[6], 2)
-        self.assertEqual(loop.call_args.kwargs["fixed_delay"], 2)
-        self.assertEqual(actor.call_args.kwargs["min_service_ms"], 80)
-        self.assertEqual(vision.call_args.kwargs["min_service_ms"], 160)
-        self.assertEqual(result["service_controls"]["calibrated_delay_ticks"], 4)
-        self.assertEqual(result["service_controls"]["effective_initial_delay_ticks"], 2)
-
-    def test_action_future_and_feature_dependency_hidden_until_release(self):
-        from libero_queue_trace import QueueTrace
-        from libero_wallclock import ActionWorker, Observation
-
-        clock = GatedClock()
-        calls = []
-
-        class Client:
-            def __init__(self, **kwargs):
-                pass
-
-            def call_endpoint(self, endpoint, payload):
-                calls.append(endpoint)
-                clock.t += 0.01
-                if endpoint == "plan":
-                    return {
-                        "actions": np.zeros((1, 7)),
-                        "audit": {
-                            "cache": {"capture_s": 9.0, "source_tick": 0},
-                            "valid_start_tick": 1,
-                            "valid_end_tick": 2,
-                            "server_seconds": 0.007,
-                        },
-                    }
-                return {}
-
-        events = QueueTrace(clock=clock.now)
-        visual = {
-            "sequence": 8,
-            "vl_embeds": [],
-            "meta": {"capture_s": 9.0, "source_tick": 0},
-        }
-        with patch.dict(
-            "sys.modules",
-            {"gr00t.policy.server_client": SimpleNamespace(PolicyClient=Client)},
-        ):
-            actor = ActionWorker(1, events=events, min_service_ms=80, clock=clock)
-            future = actor.submit(
-                Observation({}, 0, 9.0), 0, 1, np.zeros((1, 7)), visual, 10.05, 10.0
-            )
-            try:
-                self.assertTrue(clock.holding.wait(2))
-                self.assertFalse(future.done())
-                self.assertEqual(actor.completed, [])
-                self.assertNotIn(
-                    "action_completed", [r["kind"] for r in events.records()]
-                )
-            finally:
-                clock.release.set()
-                actor.close()
-            result = future.result()
-        self.assertEqual(calls, ["install", "plan"])
-        self.assertEqual(result["client_timing"]["feature_sequence"], 8)
-        self.assertAlmostEqual(result["client_timing"]["completed_s"], 10.08)
-        self.assertAlmostEqual(result["client_timing"]["raw_service_seconds"], 0.02)
-        self.assertEqual(result["audit"]["server_seconds"], 0.007)
-
-    def test_vision_cache_is_not_published_until_release(self):
-        from libero_queue_trace import QueueTrace
-        from libero_wallclock import Observation, VisionWorker
-
-        clock = GatedClock()
-        calls = []
-
-        class Client:
-            def __init__(self, **kwargs):
-                self.socket = SimpleNamespace(close=lambda: None)
-                self.context = SimpleNamespace(term=lambda: None)
-
-            def call_endpoint(self, endpoint, payload):
-                calls.append(endpoint)
-                clock.t += 0.02
-                return {
-                    "vl_embeds": [],
-                    "meta": {
-                        "capture_s": payload["capture_s"],
-                        "source_tick": payload["source_tick"],
-                        "vlm_forward_calls": 1,
-                        "vlm_seconds": 0.015,
-                    },
-                }
-
-        events = QueueTrace(clock=clock.now)
-        observation = Observation({}, 0, 9.0)
-        with patch.dict(
-            "sys.modules",
-            {"gr00t.policy.server_client": SimpleNamespace(PolicyClient=Client)},
-        ):
-            vision = VisionWorker(1, events=events, min_service_ms=80, clock=clock)
-            try:
-                vision.offer(observation)
-                self.assertTrue(clock.holding.wait(2))
-                self.assertIsNone(vision.ready(observation))
-                self.assertEqual(vision.snapshot()["inflight_tick"], 0)
-                self.assertNotIn(
-                    "feature_published", [r["kind"] for r in events.records()]
-                )
-                vision.request_stop(10.04)
-            finally:
-                clock.release.set()
-                stats = vision.close()
-        self.assertEqual(calls, ["vision"])
-        self.assertEqual(vision.ready(observation)["sequence"], 1)
-        self.assertAlmostEqual(stats["rpc_times"][0]["completed_s"], 10.08)
-        self.assertAlmostEqual(stats["rpc_times"][0]["raw_service_seconds"], 0.02)
-        self.assertEqual(stats["completed_after_control_end"], 1)
-        self.assertEqual(stats["rpc_times"][0]["server_vlm_seconds"], 0.015)
 
 
 class QueueAccounting(unittest.TestCase):
@@ -475,7 +209,7 @@ class QueueAccounting(unittest.TestCase):
         from libero_wallclock import calibrate
 
         class CalibrationActor:
-            def __init__(self, port, **kwargs):
+            def __init__(self, port):
                 self.count = 0
 
             def submit(self, obs, tick, delay, prefix, visual, deadline, submitted):
@@ -517,19 +251,6 @@ class Clock:
 
     def sleep_until(self, t):
         self.t = max(self.t, t)
-
-
-class GatedClock(Clock):
-    def __init__(self):
-        super().__init__()
-        self.holding = threading.Event()
-        self.release = threading.Event()
-
-    def sleep_until(self, t):
-        self.holding.set()
-        if not self.release.wait(2):
-            raise TimeoutError("Test did not release the service gate")
-        super().sleep_until(t)
 
 
 class Future:
@@ -612,7 +333,7 @@ class Vision:
 
 
 class ControlTiming(unittest.TestCase):
-    def run_case(self, latency, slow_first_step=False, steps=12, fixed_delay=None):
+    def run_case(self, latency, slow_first_step=False, steps=12):
         clock = Clock()
         actor = Actor(clock, latency)
         vision = Vision(clock)
@@ -643,7 +364,6 @@ class ControlTiming(unittest.TestCase):
             steps,
             trace,
             clock=clock,
-            fixed_delay=fixed_delay,
         )
         self.last_clock = clock
         self.last_trace = [json.loads(line) for line in trace.getvalue().splitlines()]
@@ -682,20 +402,6 @@ class ControlTiming(unittest.TestCase):
         self.assertGreater(result["action_request_deadline_misses"], 0)
         self.assertGreater(result["expired_action_slots"], 0)
         self.assertAlmostEqual(result["actual_control_hz"], 20)
-
-    def test_fixed_delay_keeps_misses_and_expired_counts_without_adapting(self):
-        adaptive, _, _ = self.run_case(0.18)
-        fixed, _, _ = self.run_case(0.18, fixed_delay=1)
-        self.assertGreater(adaptive["final_action_delay_ticks"], 1)
-        self.assertEqual(fixed["final_action_delay_ticks"], 1)
-        self.assertGreater(fixed["action_request_deadline_misses"], 0)
-        self.assertGreater(fixed["expired_action_slots"], 0)
-        ticks = [r for r in self.last_trace if r["kind"] == "control_tick"]
-        self.assertTrue(all(r["action_delay_budget_ticks"] == 1 for r in ticks))
-
-    def test_fixed_delay_cannot_disagree_with_bootstrap(self):
-        with self.assertRaisesRegex(ValueError, "Bootstrap"):
-            self.run_case(0.02, fixed_delay=2)
 
     def test_future_simulator_observation_is_withheld(self):
         _, ticks, offers = self.run_case(0.02)
