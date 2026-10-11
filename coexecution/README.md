@@ -27,11 +27,13 @@ GR00T optimization implementations live under `coexecution/optimization`:
 | Path | Responsibility / 职责 |
 | --- | --- |
 | `config.py`, `tactics.py` | GPU-free configuration and tactic parsing; 配置与调度表 |
+| `capabilities.py` | Selected-backend preflight and runtime identity; 后端能力与来源 |
 | `session.py` | Reversible installation, restoration and evidence; 安装生命周期 |
 | `groot/projections.py` | Shared model inventory; 共用模型节点发现 |
 | `groot/integer.py`, `groot/floating.py` | Model projection replacement; 模型适配 |
 | `groot/*_connections.py` | GR00T norm/residual producer boundaries; 模型连接 |
 | `execution/graph.py` | Shared pure-DiT graph capture; 共用 Graph |
+| `execution/cache.py` | Invocation-local cache ownership and serial guards; 调用边界 |
 | `backends/integer/linear.py` | Integer packing, GEMM and dispatch; 整数算子 |
 | `backends/thor/linear.py`, `backends/thor/packing.py` | Thor floating formats and execution; 浮点算子 |
 
@@ -73,6 +75,7 @@ This is a server invocation, not a completed closed-loop protocol. The existing 
 - `--residual-norm-quant`: additionally fuse the attention-output residual addition, FFN input LayerNorm and low-bit packing. Requires `--norm-modulation-quant` and a quantized FFN input projection. GR00T has no gate/modulation at this boundary: integer modes use unit gate and zero scale/shift with the reference residual kernel, while floating modes use a separate residual producer. Both preserve the residual equation; the FFN output residual remains separate. Only non-affine LayerNorm and blocks without positional embeddings are supported. Both options default off and restore original forwards on exit; checkpoint quality and GPU savings require target-device validation.
 - `--inference-precision {bf16,w8a8,w4a4,fp8,fp4}`: BF16 is the default; low-bit modes are experimental and can change actions. The floating modes require the separate Thor environment below.
 - `--quantization-scope transformer`: quantize selected vision/text/DiT transformer projections. `all` additionally selects other BF16 Linear modules, including conditioning and vocabulary projections; it does not skip logits or cache condition calculations.
+- `--quantization-component {all,vlm,dit}`: intersect the selected scope and optional coverage with S2 backbone or S1 action-head projections. S1 includes `action_head.vl_self_attention`. The default is `all`; this selects quantization coverage, not the scope of general BF16 fusion. Category, condition-group and DiT norm-producer options cannot be combined with `vlm` alone. The same selection applies to integer and Thor floating precision.
 - `--quantization-category-id N`: with `scope=all`, quantize the fixed embodiment's category projections. Each call checks B1 and the actual ID; omitting the option leaves these projections in BF16. ID 2 is the LIBERO_PANDA mapping in the pinned model, not a universal embodiment ID.
 - `--group-conditioning`: with integer precision, fusion and `scope=all`, concatenate the DiT blocks' condition projections and final output-modulation projection using the reference `IntegerProjectionGroup`. They consume the same activated condition in this fused forward, so one preparation and GEMM serves all projections. Shared `[B,D]` and per-token `[B,T,D]` conditions retain their values; this is within one forward, with no reuse across denoising steps. Concatenated weights are packed at installation and require additional packed-weight storage. The option defaults off, requires complete coverage of the group to take effect, and records actual groups in the identity metadata. It does not establish streaming checkpoint or closed-loop quality. Measure both its complete group and full inference; the speedup of these small projections is not the speedup of every model GEMM.
 - `--quantization-coverage FILE`: optionally select ordinary Linear sites using a JSON `linears` mapping keyed by module name. Input `shape` fields are needed only for legacy shape-based tactic lookup. Without this file, the selected model inventory is used; category projections are selected separately by `--quantization-category-id`.
@@ -108,7 +111,26 @@ The preset covers 469 executed Linear sites and seven fixed-category projections
 
 To recalibrate, collect executed input shapes on a representative full call, then compare reference tactics 0–7 on actual packed activations and weights using CUDA Graph event timing. Retain raw repetitions and check every candidate against the same-precision reference before choosing a tactic. Export module-name entries and exact group-member entries in the formats above. Recheck complete policy outputs after loading the files in a fresh process, and measure BF16, previous and candidate configurations in one randomized, matched GPU session. Isolated repeated-GEMM timings have different cache behavior from a full policy; a microbenchmark winner alone is not evidence of a full-policy improvement.
 
-The service records the configuration, replaced sites and tactic-file hashes in its local identity output. A complete comparison must include online activation preparation and checks, use matching fusion/layout/Graph settings for BF16 and integer variants, and record checkpoint/input identity. Profiled GPU duration sums, isolated GEMM timing, complete Linear timing and synchronized CPU-observation-to-action latency are different metrics. Installation, compilation, packing and Graph capture are reported separately. Old experiment measurements are not automatically performance claims for a different entrypoint or configuration.
+The service records the configuration, replaced sites and tactic-file hashes in its local identity output. Before changing model methods or layouts, an enabled scope checks the selected backend's exact operator APIs, including the FP8 packed-tactic and FP4 weight-packing APIs. Runtime evidence separates the pinned source revision from the observed source and loaded-library hashes, and records Torch/CUDA/Triton, device architecture and quantization format. Preloaded or ambiguous binary ownership is explicitly `unknown`; a requested environment-variable path is not proof that its library executed.
+
+Integer precision retains the original loader/API policy, with SM89 separately recorded as the validated architecture. Successfully loading elsewhere does not establish arithmetic or task quality. Thor floating precision retains its existing SM110 restriction; BF16 has no new architecture whitelist. Missing APIs and loader failures propagate rather than silently selecting BF16. A complete comparison must include online activation preparation and checks, use matching fusion/layout/Graph settings for BF16 and low-bit variants, and record checkpoint/input identity. Profiled GPU duration sums, isolated GEMM timing, complete Linear timing and synchronized CPU-observation-to-action latency are different metrics. Installation, compilation, packing, preflight and Graph capture are reported separately.
+
+Shape-tactic files still accept the legacy row list. A versioned integer profile can additionally bind the rows to the actual backend, clean source revision, architecture and quantization format:
+
+```json
+{
+  "schema_version": 1,
+  "backend_id": "robotics_integer",
+  "backend_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+  "device_arch": "sm_89",
+  "quant_format": "w8a8-symmetric-row-v1",
+  "rows": [{"bits": 8, "shape": [41, 6144, 1536, true], "tactic": 2}]
+}
+```
+
+This is a schema example, not a recommended tuning result. Profiles with missing, unknown or mismatched runtime identity are rejected before installation; legacy lists remain explicitly unbound. W4A4 uses `w4a4-symmetric-row-v1`. Thor FP8/FP4 use their distinct floating formats and cannot consume integer profiles. Close and rebuild the optimization scope after changing precision, weights or tactics.
+
+优化根调用与 reset 共享串行保护，调用开始、结束和异常时清理投影缓存；Graph 异常恢复 eager 后仍保留该边界。该锁只管理 Python 提交，不是 CUDA 跨流同步，也不开放同进程双优化 worker。组件选择、缓存与后端契约的新增测试使用元数据/fake 对象；旧闭环结果不能作为新组合的质量结论。对应 CUDA 回归需显式执行 `tests/gpu/test_streaming_component_cache_gpu.py`，包含 eager/Graph 的 W8/W4 异常重试与 reset。本次结构和契约整理未重跑这些 GPU 测试。
 
 Lightweight public CI runs only the configuration and restoration contracts. Explicit local GPU checks use no model download:
 

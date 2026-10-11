@@ -15,11 +15,43 @@ def checked_tactic(value):
     return value
 
 
-def read_shape_tactics(path):
+def read_shape_tactics(path, *, backend_evidence=None):
     choices = {}
     rows = read_json(path, [])
+    profile_bits = None
+    if isinstance(rows, dict):
+        profile = rows
+        fields = ("backend_id", "backend_revision", "device_arch", "quant_format")
+        if (
+            type(profile.get("schema_version")) is not int
+            or profile["schema_version"] != 1
+        ):
+            raise ValueError("Shape tactic profile schema_version must be 1")
+        if any(
+            not isinstance(profile.get(key), str) or not profile[key] for key in fields
+        ):
+            raise ValueError(
+                "Shape tactic profile requires backend/revision/architecture/format metadata"
+            )
+        if backend_evidence is None:
+            raise ValueError("Shape tactic profiles require runtime backend evidence")
+        for key in fields:
+            actual = backend_evidence.get(key)
+            if actual in (None, "unknown") or profile[key] != actual:
+                raise ValueError(
+                    f"Shape tactic profile {key} does not match the runtime backend"
+                )
+        if profile["backend_id"] != "robotics_integer":
+            raise ValueError(
+                "Integer shape tactics require the robotics_integer backend"
+            )
+        formats = {"w8a8-symmetric-row-v1": 8, "w4a4-symmetric-row-v1": 4}
+        if profile["quant_format"] not in formats:
+            raise ValueError("Unsupported integer shape tactic quant_format")
+        profile_bits = formats[profile["quant_format"]]
+        rows = profile.get("rows")
     if not isinstance(rows, list):
-        raise TypeError("Shape tactics must be a JSON list")
+        raise TypeError("Shape tactics must contain a JSON row list")
     for row in rows:
         bits, shape = row["bits"], row["shape"]
         if (
@@ -33,6 +65,8 @@ def read_shape_tactics(path):
             raise ValueError(
                 "Expected bits 4/8 and shape [positive M, K, N, bool bias]"
             )
+        if profile_bits is not None and bits != profile_bits:
+            raise ValueError("Shape tactic bits do not match the profile quant_format")
         key = (bits, *shape)
         if key in choices:
             raise ValueError("Duplicate integer shape tactic")
@@ -40,7 +74,12 @@ def read_shape_tactics(path):
     return choices
 
 
-def apply_tactics(controller, extra, config, coverage):
+def apply_tactics(controller, extra, config, coverage, *, backend_evidence=None):
+    shapes = (
+        None
+        if config.shape_tactics is None
+        else read_shape_tactics(config.shape_tactics, backend_evidence=backend_evidence)
+    )
     singles = read_json(config.tactics, {})
     groups = read_json(config.group_tactics, [])
     for bits in (8, 4):
@@ -74,7 +113,6 @@ def apply_tactics(controller, extra, config, coverage):
             install_shape_tactics,
         )
 
-        shapes = read_shape_tactics(config.shape_tactics)
         for bits in (8, 4):
             models = [
                 *controller.quant[bits].values(),

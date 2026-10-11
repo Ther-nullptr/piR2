@@ -23,6 +23,7 @@ class OptimizationConfig:
     fp_shared_inputs: bool = False
     fp_grouped: bool = False
     fp_swiglu: bool = False
+    component: str = "all"
 
     def __post_init__(self):
         if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
@@ -35,6 +36,16 @@ class OptimizationConfig:
             raise ValueError("Floating fusion requires precision=fp8 or fp4")
         if self.scope not in ("transformer", "all"):
             raise ValueError("Quantization scope must be transformer or all")
+        if self.component not in ("all", "vlm", "dit"):
+            raise ValueError("Quantization component must be all, vlm or dit")
+        if self.component == "vlm" and (
+            self.category_id is not None
+            or self.group_conditioning
+            or self.norm_modulation_quant
+        ):
+            raise ValueError(
+                "Category, condition and norm producers require the DiT component"
+            )
         if self.category_id is not None and self.category_id < 0:
             raise ValueError("Category ID must be nonnegative")
         if self.category_id is not None and self.scope != "all":
@@ -87,6 +98,9 @@ def add_optimization_arguments(parser):
     parser.add_argument(
         "--quantization-scope", choices=["transformer", "all"], default="transformer"
     )
+    parser.add_argument(
+        "--quantization-component", choices=["all", "vlm", "dit"], default="all"
+    )
     parser.add_argument("--quantization-category-id", type=int)
     parser.add_argument("--quantization-coverage", type=Path)
     parser.add_argument("--quantization-tactics", type=Path)
@@ -108,6 +122,7 @@ def optimization_config(args):
         fusion=args.operator_fusion,
         dit_graph=args.dit_cuda_graph,
         scope=args.quantization_scope,
+        component=args.quantization_component,
         category_id=args.quantization_category_id,
         coverage=args.quantization_coverage,
         tactics=args.quantization_tactics,
@@ -121,4 +136,13 @@ def optimization_config(args):
         fp_shared_inputs=args.fp_shared_inputs,
         fp_grouped=args.fp_grouped,
         fp_swiglu=args.fp_swiglu,
+    )
+
+
+def selected_component(name, component):
+    """S2 is the backbone; S1 includes every action-head projection, including VL."""
+    if component not in ("all", "vlm", "dit"):
+        raise ValueError("Quantization component must be all, vlm or dit")
+    return component == "all" or name.startswith(
+        "backbone." if component == "vlm" else "action_head."
     )
