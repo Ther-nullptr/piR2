@@ -119,11 +119,14 @@ class TransformerINT:
             return y[:, : q.out_features].reshape(*x.shape[:-1], q.out_features)
         return q.forward_packed(prepare(x, q.bits, lut, up))
 
-    def set(self, mode):
+    def clear_projection_cache(self):
         for groups in self.grouped.values():
             for _, group in groups:
                 group._input = group._output = None
                 group._remaining.clear()
+
+    def set(self, mode):
+        self.clear_projection_cache()
         for m, attr, had, original in self.saved:
             if had:
                 setattr(m, attr, original)
