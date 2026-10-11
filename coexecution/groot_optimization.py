@@ -1,4 +1,4 @@
-"""Opt-in, reversible GR00T fusion and integer inference configuration.
+"""Opt-in, reversible GR00T fusion and low-bit inference configuration.
 
 Importing this module does not import Torch or compile kernels. GPU dependencies
 are loaded only when an enabled configuration enters its scope.
@@ -27,16 +27,36 @@ class OptimizationConfig:
     vision_channels_last: bool = False
     norm_modulation_quant: bool = False
     residual_norm_quant: bool = False
+    fp8_fast_quant: bool = False
+    fp_shared_inputs: bool = False
+    fp_grouped: bool = False
+    fp_swiglu: bool = False
 
     def __post_init__(self):
-        if self.precision not in ("bf16", "w8a8", "w4a4"):
-            raise ValueError("Precision must be bf16, w8a8 or w4a4")
+        if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
+            raise ValueError("Precision must be bf16, w8a8, w4a4, fp8 or fp4")
+        if self.fp8_fast_quant and self.precision != "fp8":
+            raise ValueError("Fast FP8 quantization requires precision=fp8")
+        if self.fp_shared_inputs and self.precision not in ("fp8", "fp4"):
+            raise ValueError("Shared floating inputs require precision=fp8 or fp4")
+        if (self.fp_grouped or self.fp_swiglu) and self.precision not in ("fp8", "fp4"):
+            raise ValueError("Floating fusion requires precision=fp8 or fp4")
         if self.scope not in ("transformer", "all"):
             raise ValueError("Quantization scope must be transformer or all")
         if self.category_id is not None and self.category_id < 0:
             raise ValueError("Category ID must be nonnegative")
         if self.category_id is not None and self.scope != "all":
             raise ValueError("Category projections require scope=all")
+        if self.precision in ("fp8", "fp4") and (
+            self.category_id is not None
+            or self.tactics is not None
+            or self.group_tactics is not None
+            or self.shape_tactics is not None
+            or self.group_conditioning
+        ):
+            raise ValueError(
+                "Floating precision does not support integer tactic, category or condition grouping flags"
+            )
         if self.group_conditioning and (
             not self.fusion or self.scope != "all" or self.precision == "bf16"
         ):
@@ -45,7 +65,7 @@ class OptimizationConfig:
             )
         if self.norm_modulation_quant and (not self.fusion or self.precision == "bf16"):
             raise ValueError(
-                "Norm quantization fusion requires fusion and integer precision"
+                "Norm quantization fusion requires fusion and low-bit precision"
             )
         if self.residual_norm_quant and not self.norm_modulation_quant:
             raise ValueError("Residual fusion requires norm_modulation_quant")
@@ -66,7 +86,9 @@ class OptimizationConfig:
 
 def add_optimization_arguments(parser):
     parser.add_argument(
-        "--inference-precision", choices=["bf16", "w8a8", "w4a4"], default="bf16"
+        "--inference-precision",
+        choices=["bf16", "w8a8", "w4a4", "fp8", "fp4"],
+        default="bf16",
     )
     parser.add_argument("--operator-fusion", action="store_true")
     parser.add_argument("--dit-cuda-graph", action="store_true")
@@ -82,6 +104,10 @@ def add_optimization_arguments(parser):
     parser.add_argument("--vision-channels-last", action="store_true")
     parser.add_argument("--norm-modulation-quant", action="store_true")
     parser.add_argument("--residual-norm-quant", action="store_true")
+    parser.add_argument("--fp8-fast-quant", action="store_true")
+    parser.add_argument("--fp-shared-inputs", action="store_true")
+    parser.add_argument("--fp-grouped", action="store_true")
+    parser.add_argument("--fp-swiglu", action="store_true")
 
 
 def optimization_config(args):
@@ -99,6 +125,10 @@ def optimization_config(args):
         vision_channels_last=args.vision_channels_last,
         norm_modulation_quant=args.norm_modulation_quant,
         residual_norm_quant=args.residual_norm_quant,
+        fp8_fast_quant=args.fp8_fast_quant,
+        fp_shared_inputs=args.fp_shared_inputs,
+        fp_grouped=args.fp_grouped,
+        fp_swiglu=args.fp_swiglu,
     )
 
 
@@ -237,7 +267,34 @@ class GrootOptimizations:
             pointwise = PointwiseFusion(self.policy)
             self.stack.callback(pointwise.close)
             pointwise.set("dit")
-        if self.config.precision != "bf16":
+        if self.config.precision in ("fp8", "fp4"):
+            from coexecution.floating_quantization import FloatingProjections
+
+            recorded = (
+                None
+                if self.config.coverage is None
+                else read_json(self.config.coverage, {}).get("linears", {})
+            )
+            floating = FloatingProjections(
+                model,
+                recorded,
+                expanded=self.config.scope == "all",
+                precision=self.config.precision,
+                fast_fp8=self.config.fp8_fast_quant,
+                shared_inputs=self.config.fp_shared_inputs,
+                grouped=self.config.fp_grouped,
+                swiglu=self.config.fp_swiglu,
+            )
+            self.stack.callback(floating.close)
+            self.coverage = floating.coverage
+            if self.config.norm_modulation_quant:
+                from coexecution.floating_connections import FloatingConnections
+
+                connections = FloatingConnections(
+                    self.policy, floating, residual=self.config.residual_norm_quant
+                )
+                self.stack.callback(connections.close)
+        elif self.config.precision != "bf16":
             from coexecution.quantization import TransformerINT, inventory
             from coexecution.quantization_connections import AdditionalConnections
 
@@ -281,7 +338,7 @@ class GrootOptimizations:
                 "tactic_policy": "Exact runtime shape, then explicit site/group, then 0",
             }
         if self.config.dit_graph:
-            from coexecution.quantization_connections import DitGraphs
+            from coexecution.groot_graph import DitGraphs
 
             graphs = DitGraphs(model.action_head.model)
             self.stack.callback(graphs.close)

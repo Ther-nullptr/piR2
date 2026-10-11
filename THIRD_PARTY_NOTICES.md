@@ -13,7 +13,7 @@ The project does not redistribute model weights or training datasets. Obtain the
 
 - **Source Han Sans / 思源黑体**: https://github.com/adobe-fonts/source-han-sans at `a4f7cf94edfb9d7ffbdfc4841de276358bd7e0f2`. Copyright 2014–2025 Adobe; SIL Open Font License 1.1, Reserved Font Name “Source”. [License](licenses/SOURCE_HAN_SANS_LICENSE). The unmodified CN variable WOFF2 is an optional separately downloaded local asset; its SHA-256 is recorded in `sources.lock.json`. Offline reports embed the font and its license when present.
 
-## Optional Speedup Paradox integer dependency
+## Optional Speedup Paradox low-bit dependency
 
 The `robotics-kernels` component in [sources.lock.json](sources.lock.json) fetches
 [robotics-the-speedup-paradox](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/tree/239b4a3ef2268048571c9f508ad5700f98398c2f)
@@ -41,3 +41,26 @@ and [provenance with per-file hashes](https://github.com/thu-ee-acts-lab/robotic
 These terms apply to that header snapshot, not the reference's independent
 integer operator or this entire repository. No CUTLASS headers or binaries are
 redistributed here.
+
+The Thor floating adapter additionally calls the same pinned checkout's
+`blackwell.fp8_linear` and `blackwell.fp4_linear` registered CUTLASS operators.
+Its [Blackwell provenance](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/blob/239b4a3ef2268048571c9f508ad5700f98398c2f/src/robotics_kernels/blackwell/PROVENANCE.json)
+identifies source revision `1c6f8b8ac31c49e401ee267647b3f967725cd26e` of
+`streaming-inference-infra-code/vlm/streaming_vlm_kernels` and per-file hashes.
+That directory retains its MIT license, copyright 2025 MIT HAN Lab, in the
+separately obtained checkout. The pinned source's pending-hardware-validation
+notice is distinct from this adapter's own Thor tests. No backend source or
+binary is copied into this repository and no upstream source patch is applied.
+`coexecution/floating_packing.py` is a local Triton implementation of the
+reference's per-tensor E4M3 quantization convention, checked against its packed
+bytes and scale; it does not replace the external CUTLASS GEMM.
+
+The floating producer extensions in `coexecution/floating_packing.py` follow
+that pinned backend's block-16 E2M1/UE4M3 encoding and `sfa_offset` scale layout
+from `blackwell/csrc/fp4_cutlass_linear.cu`, implemented in Triton. The LayerNorm,
+modulation and residual sequencing follows the same checkout's
+`ampere_ada/modulation.py`, adapted to floating formats without using integer
+packed buffers. Native BF16 SiLU lookup follows `common/fused.py`, preserving
+the original activation rounding rather than adopting the Blackwell wrapper's
+different SwiGLU rounding. `coexecution/floating_connections.py` adapts this
+repository's existing DiT connection; external CUDA sources remain unmodified.
