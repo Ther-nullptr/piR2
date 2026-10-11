@@ -64,3 +64,44 @@ Streaming condition grouping and paired optimized workers remain unsupported.
 Synthetic streaming checks do not establish trained-checkpoint or closed-loop quality.
 See [execution configuration and validation](../coexecution/README.md). GPU/model checks
 remain explicit local commands, not public CI dependencies.
+
+## Optional Thor floating inference
+
+The FP8/FP4 adapter targets NVIDIA Thor (SM110, aarch64). The tested environment
+uses JetPack 7.2 / L4T 39.2, CUDA toolkit 13.2, PyTorch `2.10.0+cu130`, Triton 3.6.0,
+Python 3.12, Transformers 4.57.3 and Diffusers 0.35.1. It uses SDPA attention.
+Keep NumPy 1.26.4 with compatible dependencies; the model environment used
+PyArrow 20.0.0, tifffile 2024.9.20 and PyAV 16.1.0. These are observed versions,
+not an instruction to upgrade a shared installation.
+
+Use a personal checkout, environment, build directory and caches. CUDA requires
+access to the platform GPU device nodes (including `/dev/nvmap` on the tested
+machine). A successful SSH login or Torch import does not establish that access.
+Have the administrator provide an approved GPU execution context; do not run the
+model as root or change shared device permissions from the project setup.
+
+With the pinned complete `robotics-kernels` checkout and a compatible existing
+CUDA toolkit, build both backends explicitly for Thor:
+
+```bash
+ref="$PWD/third_party/robotics-the-speedup-paradox"
+cutlass="$ref/src/robotics_kernels/ampere_ada/third_party/cutlass"
+export CUDA_HOME=/usr/local/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+export CPATH="$CUDA_HOME/include${CPATH:+:$CPATH}"
+for precision in fp8 fp4; do
+  python "$ref/tools/build_blackwell.py" --backend "$precision" --arch 11.0a \
+    --cutlass-root "$cutlass" --build-dir "$PWD/.local/build/$precision"
+done
+export ROBOTICS_CUTLASS_FP8_SO="$PWD/.local/build/fp8/robotics_cutlass_fp8_ext.so"
+export ROBOTICS_CUTLASS_FP4_SO="$PWD/.local/build/fp4/robotics_cutlass_fp4_ext.so"
+export PYTHONPATH="$PWD:$ref/src:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
+export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
+export TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"
+```
+
+Triton 3.6 selects a separate Blackwell assembler; on the tested installation its
+bundled binary did not recognize `sm_110a`. The second assembler variable is needed
+for the optional fast FP8 packer and uses the already installed compatible
+toolkit. Do not edit Triton's vendor files. Build and warmup/capture costs belong
+outside steady inference. See [floating formats, flags and tests](../coexecution/README.md#experimental-thor-fp8-and-fp4).

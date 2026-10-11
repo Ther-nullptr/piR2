@@ -39,9 +39,9 @@ This is a server invocation, not a completed closed-loop protocol. The existing 
 
 - `--operator-fusion`: BF16 RoPE/RMSNorm, AdaLN modulation, and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
 - `--vision-channels-last`: independently opt into channels-last-3D inputs and weights for the vision patch Conv3D. This can avoid the `SlowDilated3d` fallback; it preserves tensor values but can change BF16 rounding. The original weight storage, layout and hooks are restored on exit. Compare fusion and integer modes with the same explicit layout setting and measure its action differences separately.
-- `--norm-modulation-quant`: experimental fusion of non-affine DiT LayerNorm, AdaLN modulation, dynamic scale and integer packing, using the pinned reference Triton kernel. Requires integer precision and `--operator-fusion`; shared and per-token conditions are supported. FP32 reduction order differs from native LayerNorm, so this is not a bitwise-preserving option.
-- `--residual-norm-quant`: additionally fuse the attention-output residual addition, FFN input LayerNorm and integer packing. Requires `--norm-modulation-quant` and a quantized FFN input projection. GR00T has no gate/modulation at this boundary: unit gate and zero scale/shift reuse the reference residual kernel without changing the residual equation. The FFN output residual remains separate. Only non-affine LayerNorm and blocks without positional embeddings are supported. Both new options default off and restore original forwards on exit; checkpoint quality and GPU savings require target-device validation.
-- `--inference-precision {bf16,w8a8,w4a4}`: BF16 is the default; W4A4 is experimental and can substantially change actions.
+- `--norm-modulation-quant`: experimental fusion of non-affine DiT LayerNorm, AdaLN modulation, dynamic scale and low-bit packing. Requires `w8a8`, `w4a4`, `fp8` or `fp4` precision and `--operator-fusion`; shared and per-token conditions are supported. Integer modes use the pinned reference Triton kernel; floating modes use the separate local producers described in [Thor FP8 and FP4](#experimental-thor-fp8-and-fp4). FP32 reduction order differs from native LayerNorm, so this is not a bitwise-preserving option.
+- `--residual-norm-quant`: additionally fuse the attention-output residual addition, FFN input LayerNorm and low-bit packing. Requires `--norm-modulation-quant` and a quantized FFN input projection. GR00T has no gate/modulation at this boundary: integer modes use unit gate and zero scale/shift with the reference residual kernel, while floating modes use a separate residual producer. Both preserve the residual equation; the FFN output residual remains separate. Only non-affine LayerNorm and blocks without positional embeddings are supported. Both options default off and restore original forwards on exit; checkpoint quality and GPU savings require target-device validation.
+- `--inference-precision {bf16,w8a8,w4a4,fp8,fp4}`: BF16 is the default; low-bit modes are experimental and can change actions. The floating modes require the separate Thor environment below.
 - `--quantization-scope transformer`: quantize selected vision/text/DiT transformer projections. `all` additionally selects other BF16 Linear modules, including conditioning and vocabulary projections; it does not skip logits or cache condition calculations.
 - `--quantization-category-id N`: with `scope=all`, quantize the fixed embodiment's category projections. Each call checks B1 and the actual ID; omitting the option leaves these projections in BF16. ID 2 is the LIBERO_PANDA mapping in the pinned model, not a universal embodiment ID.
 - `--group-conditioning`: with integer precision, fusion and `scope=all`, concatenate the DiT blocks' condition projections and final output-modulation projection using the reference `IntegerProjectionGroup`. They consume the same activated condition in this fused forward, so one preparation and GEMM serves all projections. Shared `[B,D]` and per-token `[B,T,D]` conditions retain their values; this is within one forward, with no reuse across denoising steps. Concatenated weights are packed at installation and require additional packed-weight storage. The option defaults off, requires complete coverage of the group to take effect, and records actual groups in the identity metadata. It does not establish streaming checkpoint or closed-loop quality. Measure both its complete group and full inference; the speedup of these small projections is not the speedup of every model GEMM.
@@ -133,6 +133,87 @@ the existing integer path, norm fusion, then residual fusion at the same precisi
 checkpoint, inputs, layout and Graph setting. Report repeated profiled GPU kernel /
 memcpy / memset duration sums separately from CUDA-event elapsed time and host
 latency; inspect action error against both the previous integer path and BF16.
+
+## Experimental Thor FP8 and FP4
+
+The serial floating adapter requires Thor SM110, eval-mode BF16 CUDA weights,
+and the explicitly built [Blackwell dependencies](../docs/environment.md#optional-thor-floating-inference).
+It uses the same reversible `GrootOptimizations` interface:
+
+```python
+config = OptimizationConfig(
+    precision="fp8", scope="all", dit_graph=True, fp8_fast_quant=True
+)
+with GrootOptimizations(policy, config) as optimized:
+    # Run the normal streaming bootstrap / vision / plan interface here.
+    coverage = optimized.evidence()
+```
+
+The equivalent server flags are `--inference-precision fp8 --quantization-scope all
+--dit-cuda-graph --fp8-fast-quant`. Select `fp4` and omit `--fp8-fast-quant` for FP4.
+All options default off. Close the scope before changing weights or configuration.
+
+- FP8 uses E4M3 weights and activations with one FP32 scale per tensor.
+  `--fp8-fast-quant` selects a two-pass Triton activation packer: partial absmax,
+  followed by scale finalization and conversion. Both passes refresh every call,
+  including Graph replay. The default uses the pinned reference packer.
+- `--fp-shared-inputs` optionally packs the common activation once per known
+  QKV/KV or gate/up module invocation. Only fully selected groups participate;
+  every member keeps its original quantized weight, scale, GEMM and tactic.
+  Reuse requires the identical, unmodified input tensor in that invocation.
+  Owner exit (including exceptions) clears reuse state, and direct projection
+  calls pack independently. Graph capture records fresh packing for every replay.
+  This option supports serial FP8/FP4 inference and defaults off.
+- `--fp-grouped` merges fully selected QKV/KV and gate/up projections into one
+  GEMM per owner invocation, taking precedence over `--fp-shared-inputs`.
+  FP8 repacks the concatenated weight with one tensor scale, so it can change
+  quantization error compared with independent weights. FP4 retains block-16
+  row scales. Output views are retained except where text Q/K normalization
+  requires contiguous inputs. Owner exit and exceptions clear the group state.
+- `--fp-swiglu` fuses the text MLP's native BF16 SiLU lookup, multiply and input
+  packing. The SiLU output is rounded to BF16 before multiplying, preserving
+  the original PyTorch boundary. This differs from the reference's alternative
+  SwiGLU rounding policies. FP8 uses a producer/partial-amax pass and one global
+  scale/cast pass; FP4 emits packed E2M1 and swizzled block scales directly.
+- With `--operator-fusion`, floating modes also accept `--norm-modulation-quant`
+  and `--residual-norm-quant`. These connect non-affine DiT LayerNorm/AdaLN and
+  attention residual + FFN LayerNorm to floating packed inputs. The residual
+  and materialized intermediate boundaries remain BF16, but Triton LayerNorm's
+  reduction order differs from native Torch. Measure numerical error against
+  both the same-precision unfused path and BF16. These flags default off and do
+  not enable the integer packed-buffer path or alter attention's precision.
+- FP4 uses E2M1 data and UE4M3 scales per 16 elements in the CUTLASS swizzled
+  layout. This is the reference block-scaled FP4 GEMM path, not MXFP8 or an INT4
+  buffer. Both floating GEMMs accumulate in FP32 and output BF16; neither
+  dequantizes its operands to run a BF16 GEMM.
+- FP8 chooses from a small, measured Thor table keyed by exact runtime
+  `(M, K, N, has_bias)`, falling back to explicit prefill tactic 2. FP4 uses
+  bias-aware tactic 0 for M>1 and tactic 3 for M=1. The pinned FP4 backend's
+  nonzero prefill tactics omit the bias epilogue and are deliberately avoided.
+  Ada integer tactic files, category selection and condition grouping are rejected.
+- `scope=all` covers eligible ordinary Linear projections, including vocabulary
+  and conditioning projections. FP8 requires K/N divisible by 16; FP4 by 32.
+  CategorySpecificLinear and excluded/unaligned sites remain BF16 and are listed
+  in coverage metadata. QK, softmax and PV attention stay floating point.
+- Original parameters remain allocated so exit and failure can restore BF16.
+  Packed weights, scales, activation workspaces and Graph pools add storage;
+  quantization does not imply lower total resident model memory here.
+
+The targeted validation uses checkpoint-500 of Spatial πR² adaptation, B1/H40,
+fixed demonstration observations and committed prefixes. GPU tests check packed
+references, bias, changing Graph inputs, RNG preservation and restoration:
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q coexecution/test_floating_quantization_gpu.py coexecution/test_floating_fusion_gpu.py
+```
+
+Keep these checks separate from model replay and LIBERO closed-loop evaluation.
+Compare BF16/FP8/FP4 with identical checkpoint, attention, layout, fusion and Graph
+settings. Report bootstrap, vision and plan separately, along with full replay;
+exclude offline weight packing, compilation and capture from steady timings;
+include online activation packing. Action/cache errors
+and finite outputs do not establish task quality. No learned-policy quality
+threshold or FP4 deployment recommendation is supplied by this adapter.
 
 ## Measured LIBERO queue reports
 
