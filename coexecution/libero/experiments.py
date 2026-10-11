@@ -318,33 +318,41 @@ class OwnedProcesses:
 
 def _admit_devices(plan):
     for gpu in set(plan["gpus"].values()):
-        status = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "-i",
-                str(gpu),
-                "--query-gpu=memory.used,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-        )
-        memory, utilization = (
-            int(value.strip()) for value in status.strip().split(",")
-        )
-        processes = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "-i",
-                str(gpu),
-                "--query-compute-apps=pid",
-                "--format=csv,noheader",
-            ],
-            text=True,
-        ).strip()
-        if memory > 200 or utilization or processes:
-            raise RuntimeError(
-                f"Declared GPU {gpu} is not clean before this experiment"
+        # A completed condition can leave a briefly nonzero resource sample.
+        # Recheck without launching anything; visible compute jobs reject at once.
+        for attempt in range(5):
+            status = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "-i",
+                    str(gpu),
+                    "--query-gpu=memory.used,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
             )
+            memory, utilization = (
+                int(value.strip()) for value in status.strip().split(",")
+            )
+            processes = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "-i",
+                    str(gpu),
+                    "--query-compute-apps=pid",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+            ).strip()
+            if memory <= 200 and not utilization and not processes:
+                break
+            if processes or attempt == 4:
+                raise RuntimeError(
+                    f"Declared GPU {gpu} is not clean before this experiment: "
+                    f"memory={memory} MiB, utilization={utilization}%, "
+                    f"compute_pids={processes or 'none'}"
+                )
+            time.sleep(0.5)
     for port in plan["ports"].values():
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
@@ -420,9 +428,9 @@ def run(plan, output):
         results, records = {}, {protocol: {} for protocol in plan["protocols"]}
         for case in plan["conditions"]:
             condition_output = output / case["name"]
-            _admit_devices(plan)
             owned = OwnedProcesses(plan)
             try:
+                _admit_devices(plan)
                 commands = build_commands(
                     plan, case, plan["protocols"][0], condition_output
                 )

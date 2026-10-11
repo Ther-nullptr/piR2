@@ -243,3 +243,91 @@ def test_lookup_race_cleanup_timeout_still_visits_other_workers(plan, monkeypatc
     with pytest.raises(RuntimeError, match="stop"):
         owned.close()
     assert 123450 in visited
+
+
+def test_admission_rechecks_transient_activity_before_binding_ports(plan, monkeypatch):
+    m = module()
+    activity = iter(["126, 30", "126, 0"])
+    calls, waits, ports = [], [], []
+
+    def query(command, **kwargs):
+        calls.append(command)
+        return (
+            next(activity)
+            if "--query-gpu=memory.used,utilization.gpu" in command
+            else ""
+        )
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def bind(self, address):
+            assert len(calls) == 4
+            ports.append(address[1])
+
+    monkeypatch.setattr(m.subprocess, "check_output", query)
+    monkeypatch.setattr(m.time, "sleep", waits.append)
+    monkeypatch.setattr(m.socket, "socket", Socket)
+    m._admit_devices(plan)
+    assert waits and sum(waits) <= 2
+    assert ports == list(plan["ports"].values())
+
+
+def test_admission_persistent_activity_is_bounded_and_explains_rejection(
+    plan, monkeypatch
+):
+    m = module()
+    waits = []
+    monkeypatch.setattr(
+        m.subprocess,
+        "check_output",
+        lambda command, **kwargs: (
+            "126, 30" if "--query-gpu=memory.used,utilization.gpu" in command else ""
+        ),
+    )
+    monkeypatch.setattr(m.time, "sleep", waits.append)
+    monkeypatch.setattr(m.socket, "socket", lambda: pytest.fail("Busy GPU admitted"))
+    with pytest.raises(RuntimeError, match="memory=126.*utilization=30"):
+        m._admit_devices(plan)
+    assert waits and sum(waits) <= 2
+
+
+def test_admission_never_retries_a_visible_compute_process(plan, monkeypatch):
+    m = module()
+    monkeypatch.setattr(
+        m.subprocess,
+        "check_output",
+        lambda command, **kwargs: (
+            "126, 0"
+            if "--query-gpu=memory.used,utilization.gpu" in command
+            else "12345"
+        ),
+    )
+    monkeypatch.setattr(
+        m.time, "sleep", lambda seconds: pytest.fail("Active process waited")
+    )
+    with pytest.raises(RuntimeError, match="12345"):
+        m._admit_devices(plan)
+
+
+def test_failed_admission_publishes_current_failure_instead_of_running(
+    plan, tmp_path, monkeypatch
+):
+    m = module()
+    monkeypatch.setattr(m, "validate_launch_paths", lambda plan: None)
+
+    def reject(plan):
+        raise RuntimeError("GPU admission rejected")
+
+    monkeypatch.setattr(m, "_admit_devices", reject)
+    with pytest.raises(RuntimeError, match="admission rejected"):
+        m.run(plan, tmp_path)
+    import json
+
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["phase"] == "failed"
+    assert status["condition"] == "bf16-baseline"
