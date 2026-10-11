@@ -28,8 +28,9 @@ def main():
         "tests/contracts/test_optimization_imports.py",
         "coexecution/test_queue_report.py",
         "coexecution/test_feature_usage.py",
-        "scripts/test_libero_inference_backend.py",
-        "scripts/test_libero_model_loading.py",
+        "tests/contracts/test_libero_inference_backend.py",
+        "tests/contracts/test_libero_model_loading.py",
+        "tests/contracts/test_libero_imports.py",
         "simulator/test_serve.py",
     ]
     tests = [x for x in contracts if (ROOT / x).is_file()]
