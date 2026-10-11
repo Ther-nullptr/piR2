@@ -39,8 +39,29 @@ Evaluation provenance hashes both the compatibility entrypoints and the canonica
 runtime implementations. This source-tracking update does not change scheduling,
 episode accounting or protocol semantics. Lightweight contracts live in
 `tests/contracts/`; they use import checks and doubles rather than executing models.
-Optimizations remain restricted to one worker, including when two paired workers
-would share a single GPU.
+Enabled optimizations require one serialized worker per process. Separately
+started action and VLM processes can use the same explicitly declared GPU;
+optimized paired workers within one process remain unsupported.
+
+`coexecution/libero/measurement.py` measures official Spatial observations with
+matched runtime modes and precision settings. `profiling.py` accounts for each
+recorded device activity once and keeps GPU work separate from elapsed time.
+`experiments.py` runs a declared JSON plan with owned workers, distinct ports,
+all ten Spatial tasks and paired initial-state hashes. It validates actual
+executed image/state ages against feature publication and execution records.
+These modules reuse the existing evaluator and timing protocols.
+
+Run `python -m coexecution.libero.experiments --plan PLAN.json --output OUTPUT`
+from the prepared runtime. The plan declares `runtime_root`, `model_python`,
+`evaluation_python`, `upstream`, `libero_config`, the action/VLM/simulation
+`gpus`, action/VLM `ports`, `protocols`, `episodes_per_task`, `max_steps`, `seed`
+and `conditions`. Each condition supplies a unique `name`, `checkpoint`,
+`variant` and explicit optimization `flags`; optional `simulation_preload`
+selects a compatible local library. The runner requires clean devices before
+each condition, preserves invocation logs and stops only its own processes.
+Use a new output directory when changing the plan. Deployment comparison fixes
+real control at 20 Hz and reports success, deadline misses and executed AoI;
+kernel timing alone does not establish these results.
 
 ## Training
 

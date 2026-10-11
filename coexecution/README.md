@@ -34,6 +34,9 @@ GR00T optimization implementations live under `coexecution/optimization`:
 | `groot/*_connections.py` | GR00T norm/residual producer boundaries; 模型连接 |
 | `execution/graph.py` | Shared pure-DiT graph capture; 共用 Graph |
 | `execution/cache.py` | Invocation-local cache ownership and serial guards; 调用边界 |
+| `execution/preparation.py`, `execution/tokenization.py` | Scoped input routing and exact-text token preparation; 输入准备 |
+| `execution/guards.py`, `execution/patching.py` | Host metadata guards and instance-local callable adaptation; 状态校验 |
+| `groot/vlm.py` | Static VLM metadata and optional complete VLM capture; 完整 VLM 执行 |
 | `backends/integer/linear.py` | Integer packing, GEMM and dispatch; 整数算子 |
 | `backends/thor/linear.py`, `backends/thor/packing.py` | Thor floating formats and execution; 浮点算子 |
 
@@ -51,6 +54,34 @@ Optimization contracts are in `tests/contracts`, explicit CUDA tests in
 `tests/gpu`, and reusable fixtures in `tests/helpers`. GPU tests require
 `PIR2_GPU_TESTS=1`; public CI checks configuration, scheduling and accounting only.
 The separate SO100/queue tools retain their existing modules and tests.
+
+### Common policy runtime / 公共推理路径
+
+Four independent options apply to the same BF16 or quantized CUDA policy:
+`--input-preparation` routes only consumed tensor fields to each model component;
+`--tokenizer-cache` caches exact expanded text after fresh image processing;
+`--static-vlm` prepares fixed text/grid/mask metadata without device-side scalar
+reads; `--vlm-cuda-graph` captures the complete VLM and requires `--static-vlm`.
+Images, robot state and VLM features are recomputed for every observation.
+These options default off. Graph and metadata caches are bounded, and new input
+signatures require warmup. Runtime changes through `optimized.set_runtime(...)`
+retain the selected precision controller and the separate DiT graph cache.
+
+Use `python -m coexecution.libero.measurement --help` for paired measurements of
+raw-observation policy wall time, prepared-input complete-model time, CUDA event
+spans and separately collected GPU activity. These timing scopes overlap and
+must not be added or subtracted as a CPU/GPU decomposition. The module validates
+same-precision actions and checks that timed graph calls replay without capture.
+It requires CUDA, the official Spatial task checkpoint and its dataset; profiler
+output and numerical archives stay local.
+
+The opt-in numerical suite is
+`PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_policy_vlm_gpu.py` in the pinned
+CUDA environment. This checks execution behavior, not closed-loop task success.
+For full Spatial evaluation, see the declared-condition runner in
+[LIBERO](../docs/libero.md). Separate action and VLM processes can share an
+explicitly declared GPU; optimized paired workers within one process remain
+unsupported.
 
 这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；依赖固定版本的 Speedup Paradox 整数后端。当前范围是单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝，同进程并发优化服务也不支持。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
 

@@ -1,0 +1,522 @@
+"""Run declared LIBERO conditions with owned workers and paired full-suite fixtures.
+
+Model workers require CUDA. Import, command planning and fixture checks perform
+no model computation. The runner owns only children it starts; it never adopts
+or stops servers from another experiment's PID files.
+"""
+
+import argparse
+import fcntl
+import json
+import math
+import os
+import signal
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+FIXTURE_FIELDS = (
+    "initial_state_sha256",
+    "fixture_model_sha256",
+    "settled_sim_state_sha256",
+    "initial_rgb_sha256",
+)
+
+
+def validate_plan(plan):
+    from coexecution.optimization.config import (
+        add_optimization_arguments,
+        optimization_config,
+    )
+
+    required = (
+        "runtime_root",
+        "model_python",
+        "evaluation_python",
+        "upstream",
+        "libero_config",
+        "gpus",
+        "ports",
+        "conditions",
+        "protocols",
+        "episodes_per_task",
+        "max_steps",
+        "seed",
+    )
+    if any(key not in plan for key in required):
+        raise ValueError("Experiment plan is missing required fields")
+    if any(
+        type(plan[key]) is not int or plan[key] < 1
+        for key in ("episodes_per_task", "max_steps")
+    ):
+        raise ValueError("Episode and step counts must be positive integers")
+    if type(plan["seed"]) is not int:
+        raise ValueError("Experiment seed must be an integer")
+    if set(plan["gpus"]) != {"action", "vlm", "simulation"} or any(
+        type(value) is not int or value < 0 for value in plan["gpus"].values()
+    ):
+        raise ValueError("Declare physical CUDA devices for all three roles")
+    if (
+        set(plan["ports"]) != {"action", "vlm"}
+        or any(
+            type(value) is not int or not 1 <= value <= 65535
+            for value in plan["ports"].values()
+        )
+        or len(set(plan["ports"].values())) != 2
+    ):
+        raise ValueError("Declare two distinct valid worker ports")
+    if not plan["protocols"] or set(plan["protocols"]) - {"algorithm", "deployment"}:
+        raise ValueError("Protocols must be algorithm and/or deployment")
+    names = [case["name"] for case in plan["conditions"]]
+    if (
+        not names
+        or len(names) != len(set(names))
+        or any(
+            not name or Path(name).name != name or name in (".", "..") for name in names
+        )
+    ):
+        raise ValueError("Conditions need unique directory names")
+    parser = argparse.ArgumentParser(add_help=False)
+    add_optimization_arguments(parser)
+    for case in plan["conditions"]:
+        if case["variant"] not in ("flow", "pir2") or not case["checkpoint"]:
+            raise ValueError("Declare each condition checkpoint and variant")
+        if not isinstance(case["flags"], list) or any(
+            not isinstance(flag, str) for flag in case["flags"]
+        ):
+            raise ValueError("Optimization flags must be an argument list")
+        try:
+            config = optimization_config(parser.parse_args(case["flags"]))
+        except SystemExit as error:
+            raise ValueError("Invalid optimization flags") from error
+        config.validate_variant(case["variant"])
+
+
+def build_commands(plan, case, protocol, output):
+    root = Path(plan["runtime_root"])
+    commands = {}
+    for role in ("action", "vlm"):
+        commands[role] = [
+            str(plan["model_python"]),
+            "-m",
+            "coexecution.libero.service",
+            "--checkpoint",
+            str(case["checkpoint"]),
+            "--variant",
+            case["variant"],
+            "--role",
+            role,
+            "--port",
+            str(plan["ports"][role]),
+            "--device",
+            "cuda:0",
+            "--output",
+            str(output / (role + "-server")),
+            *case["flags"],
+        ]
+    commands["evaluate"] = [
+        str(plan["evaluation_python"]),
+        str(root / "scripts/evaluate_libero_protocol.py"),
+        "--protocol",
+        protocol,
+        "--variant",
+        case["variant"],
+        "--output",
+        str(output / protocol),
+        "--port",
+        str(plan["ports"]["action"]),
+        "--slow-port",
+        str(plan["ports"]["vlm"]),
+        "--episodes-per-task",
+        str(plan["episodes_per_task"]),
+        "--max-steps",
+        str(plan["max_steps"]),
+        "--seed",
+        str(plan["seed"]),
+        "--control-hz",
+        "20",
+        "--visual-delay",
+        "3",
+        "--action-delay",
+        "1",
+        "--no-video",
+        "--task-ids",
+        *(str(i) for i in range(10)),
+    ]
+    return commands
+
+
+def paired_fixtures(conditions, *, episodes_per_task):
+    expected = {
+        (task, episode) for task in range(10) for episode in range(episodes_per_task)
+    }
+    mapped, problems = {}, []
+    for name, rows in conditions.items():
+        values = {(row["task_id"], row["episode_id"]): row for row in rows}
+        if set(values) != expected or len(rows) != len(expected):
+            problems.append(
+                {"condition": name, "reason": "incomplete or duplicate episodes"}
+            )
+        mapped[name] = values
+    if not mapped:
+        problems.append({"reason": "no conditions"})
+    else:
+        reference_name, reference = next(iter(mapped.items()))
+        for name, values in mapped.items():
+            for key in expected & reference.keys() & values.keys():
+                for field in FIXTURE_FIELDS:
+                    if reference[key].get(field) is None or reference[key].get(
+                        field
+                    ) != values[key].get(field):
+                        problems.append(
+                            {
+                                "condition": name,
+                                "reference": reference_name,
+                                "episode": key,
+                                "field": field,
+                            }
+                        )
+    return {
+        "passed": not problems,
+        "expected_per_condition": len(expected),
+        "problems": problems,
+    }
+
+
+def _write(path, data):
+    path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
+
+
+def validate_launch_paths(plan):
+    root = Path(plan["runtime_root"])
+    paths = [
+        root / "coexecution/libero/service.py",
+        root / "scripts/evaluate_libero_protocol.py",
+        Path(plan["model_python"]),
+        Path(plan["evaluation_python"]),
+        Path(plan["libero_config"]),
+        Path(plan["upstream"]) / "gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
+        Path(plan["upstream"]) / "gr00t/policy/decoupled_policy.py",
+        *(Path(case["checkpoint"]) / "config.json" for case in plan["conditions"]),
+    ]
+    missing = [str(path) for path in paths if not path.exists()]
+    if (
+        plan.get("simulation_preload")
+        and not Path(plan["simulation_preload"]).is_file()
+    ):
+        missing.append(str(plan["simulation_preload"]))
+    if missing:
+        raise ValueError(f"Declared launch paths are missing: {missing}")
+    # The canonical evaluator hashes this pinned path under the runtime root.
+    if (root / "upstream/learning/Isaac-GR00T").resolve() != Path(
+        plan["upstream"]
+    ).resolve():
+        raise ValueError("Runtime upstream path does not match the declared source")
+
+
+def environment(plan, role):
+    env = os.environ.copy()
+    root = Path(plan["runtime_root"])
+    gpu = plan["gpus"][role]
+    env.update(
+        CUDA_VISIBLE_DEVICES=str(gpu),
+        PYTHONUNBUFFERED="1",
+        OMP_NUM_THREADS="2",
+        MAX_JOBS="2",
+        TOKENIZERS_PARALLELISM="false",
+        NO_ALBUMENTATIONS_UPDATE="1",
+        GROOT_HF_LOCAL_FIRST="1",
+        GROOT_PATCH_MISTRAL="1",
+        PYTHONPATH=os.pathsep.join(
+            (
+                str(root),
+                str(root / "third_party/robotics-the-speedup-paradox/src"),
+                str(plan["upstream"]),
+            )
+        ),
+    )
+    env.pop("HF_HUB_OFFLINE", None)
+    if role == "simulation":
+        env.update(
+            MUJOCO_GL="egl",
+            PYOPENGL_PLATFORM="egl",
+            MUJOCO_EGL_DEVICE_ID=str(gpu),
+            LIBERO_CONFIG_PATH=str(plan["libero_config"]),
+        )
+        preload = plan.get("simulation_preload") or env.get("PIR2_LIBERO_LD_PRELOAD")
+        if preload:
+            env["LD_PRELOAD"] = str(preload)
+    return env
+
+
+class OwnedProcesses:
+    def __init__(self, plan):
+        self.plan, self.children = plan, {}
+        self.logs = {}
+
+    def start(self, name, command, output, role):
+        output.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns()}"
+        log_path = output / f"{stamp}_{name}.log"
+        with log_path.open("x") as log:
+            process = subprocess.Popen(
+                command,
+                cwd=self.plan["runtime_root"],
+                env=environment(self.plan, role),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        self.children[name] = process
+        self.logs[name] = log_path
+        job = {
+            "pid": process.pid,
+            "command": command,
+            "gpu": self.plan["gpus"][role],
+            "log": str(log_path),
+        }
+        _write(output / f"{stamp}_job.json", job)
+        _write(output / "job.json", job)
+        return process
+
+    def ready(self, name, output, timeout=900):
+        process, deadline = self.children[name], time.monotonic() + timeout
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError(f"Worker {name} exited; see {self.logs[name]}")
+            log = self.logs[name]
+            if log.exists() and "TIMED_PROTOCOL_SERVER_READY" in log.read_text(
+                errors="replace"
+            ):
+                return
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"Worker {name} did not become ready")
+            time.sleep(1)
+
+    def close(self):
+        errors = []
+        for process in reversed(tuple(self.children.values())):
+            if process.poll() is None:
+                try:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=10)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    errors.append((process.pid, str(error)))
+        if errors:
+            raise RuntimeError(f"Unable to stop owned workers: {errors}")
+        self.children.clear()
+
+
+def _admit_devices(plan):
+    for gpu in set(plan["gpus"].values()):
+        status = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "-i",
+                str(gpu),
+                "--query-gpu=memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+        memory, utilization = (
+            int(value.strip()) for value in status.strip().split(",")
+        )
+        processes = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "-i",
+                str(gpu),
+                "--query-compute-apps=pid",
+                "--format=csv,noheader",
+            ],
+            text=True,
+        ).strip()
+        if memory > 200 or utilization or processes:
+            raise RuntimeError(
+                f"Declared GPU {gpu} is not clean before this experiment"
+            )
+    for port in plan["ports"].values():
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", port))
+
+
+def deployment_report(plan, output, *, report_output=None):
+    from coexecution.feature_usage import analyze_report
+    from coexecution.queue_report import condition_report
+
+    conditions = []
+    expected = {
+        (task, episode)
+        for task in range(10)
+        for episode in range(plan["episodes_per_task"])
+    }
+    for case in plan["conditions"]:
+        directory = output / case["name"] / "deployment"
+        condition = condition_report(directory)
+        if (
+            condition is None
+            or len(condition["episodes"]) != len(expected)
+            or {
+                (episode["metadata"]["task_id"], episode["metadata"]["episode_id"])
+                for episode in condition["episodes"]
+            }
+            != expected
+        ):
+            raise RuntimeError(f"Incomplete deployment control traces: {directory}")
+        for episode in condition["episodes"]:
+            for tick in episode["ticks"]:
+                if tick["fallback"]:
+                    continue
+                for field in ("executed_image_age_ms", "executed_state_age_ms"):
+                    age = tick.get(field)
+                    if (
+                        not isinstance(age, (int, float))
+                        or not math.isfinite(age)
+                        or age < 0
+                    ):
+                        raise RuntimeError(
+                            f"Unknown or invalid executed observation age: {directory}/{field}"
+                        )
+        conditions.append(condition)
+    report = {
+        "schema_version": 2,
+        "scope": "Full Spatial suite, paired declared initial states; actual executed image/state ages",
+        "conditions": conditions,
+    }
+    usage = analyze_report(report, raw_root=output)
+    report_output = output if report_output is None else Path(report_output)
+    report_output.mkdir(parents=True, exist_ok=True)
+    _write(report_output / "deployment-aoi.json", report)
+    _write(report_output / "feature-usage.json", usage)
+    if not all(
+        condition["read_accounting_complete"]
+        and condition["execution_accounting_complete"]
+        for condition in usage["conditions"]
+    ):
+        raise RuntimeError("Deployment feature/execution lineage is incomplete")
+    return report
+
+
+def run(plan, output):
+    validate_plan(plan)
+    validate_launch_paths(plan)
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / ".supervisor.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        existing = output / "plan.json"
+        if existing.exists() and json.loads(existing.read_text()) != plan:
+            raise RuntimeError("Experiment plan changed on resume")
+        _write(existing, plan)
+        results, records = {}, {protocol: {} for protocol in plan["protocols"]}
+        for case in plan["conditions"]:
+            condition_output = output / case["name"]
+            _admit_devices(plan)
+            owned = OwnedProcesses(plan)
+            try:
+                commands = build_commands(
+                    plan, case, plan["protocols"][0], condition_output
+                )
+                for role in ("action", "vlm"):
+                    worker_output = condition_output / (role + "-server")
+                    owned.start(role, commands[role], worker_output, role)
+                    owned.ready(role, worker_output)
+                for protocol in plan["protocols"]:
+                    commands = build_commands(plan, case, protocol, condition_output)
+                    evaluation_output = condition_output / protocol
+                    process = owned.start(
+                        "evaluate",
+                        commands["evaluate"],
+                        evaluation_output,
+                        "simulation",
+                    )
+                    _write(
+                        output / "status.json",
+                        {
+                            "condition": case["name"],
+                            "protocol": protocol,
+                            "pid": process.pid,
+                            "phase": "running",
+                        },
+                    )
+                    print(case["name"], protocol, "started", process.pid, flush=True)
+                    if process.wait():
+                        raise RuntimeError(f"Evaluation failed: {evaluation_output}")
+                    _write(
+                        evaluation_output / "hardware.json",
+                        {
+                            "layout": case["name"],
+                            "condition": protocol,
+                            "role_gpus": {
+                                "S1": plan["gpus"]["action"],
+                                "S2": plan["gpus"]["vlm"],
+                            },
+                            "inference_gpus": sorted(
+                                {plan["gpus"]["action"], plan["gpus"]["vlm"]}
+                            ),
+                            "renderer_gpu": plan["gpus"]["simulation"],
+                            "returncode": process.returncode,
+                        },
+                    )
+                    summary = json.loads(
+                        (evaluation_output / "summary.json").read_text()
+                    )
+                    if not summary["complete"]:
+                        raise RuntimeError("Full Spatial evaluation is incomplete")
+                    results[case["name"] + "/" + protocol] = summary
+                    records[protocol][case["name"]] = [
+                        json.loads(row)
+                        for row in (evaluation_output / "episodes.jsonl")
+                        .read_text()
+                        .splitlines()
+                    ]
+                    _write(output / "results.partial.json", results)
+            except BaseException as error:
+                _write(
+                    output / "status.json",
+                    {"phase": "failed", "condition": case["name"], "error": str(error)},
+                )
+                raise
+            finally:
+                owned.close()
+        pairs = {
+            protocol: paired_fixtures(rows, episodes_per_task=plan["episodes_per_task"])
+            for protocol, rows in records.items()
+        }
+        _write(output / "paired-initial-conditions.json", pairs)
+        if not all(value["passed"] for value in pairs.values()):
+            raise RuntimeError("Full-suite paired fixtures differ")
+        if "deployment" in plan["protocols"]:
+            deployment_report(plan, output)
+        _write(output / "results.json", results)
+        _write(output / "status.json", {"phase": "complete"})
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+
+    def stop_requested(_number, _frame):
+        raise KeyboardInterrupt("Experiment supervisor received a stop request")
+
+    previous = signal.signal(signal.SIGTERM, stop_requested)
+    try:
+        run(json.loads(args.plan.read_text()), args.output)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+if __name__ == "__main__":
+    main()

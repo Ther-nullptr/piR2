@@ -1,0 +1,245 @@
+"""Deployment planning and paired fixtures; no model or GPU execution."""
+
+import importlib
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+
+
+def module():
+    return importlib.import_module("coexecution.libero.experiments")
+
+
+@pytest.fixture
+def plan():
+    return {
+        "runtime_root": "/runtime",
+        "model_python": "/model-python",
+        "evaluation_python": "/eval-python",
+        "upstream": "/fixed-upstream",
+        "libero_config": "/libero-config",
+        "gpus": {"action": 0, "vlm": 0, "simulation": 0},
+        "ports": {"action": 5680, "vlm": 5682},
+        "episodes_per_task": 1,
+        "max_steps": 720,
+        "seed": 1000,
+        "protocols": ["deployment"],
+        "conditions": [
+            {
+                "name": "bf16-baseline",
+                "checkpoint": "/weights",
+                "variant": "flow",
+                "flags": [],
+            },
+            {
+                "name": "bf16-common",
+                "checkpoint": "/weights",
+                "variant": "flow",
+                "flags": ["--input-preparation", "--static-vlm", "--vlm-cuda-graph"],
+            },
+        ],
+    }
+
+
+def test_commands_use_declared_ports_full_suite_and_separate_workers(plan):
+    m = module()
+    m.validate_plan(plan)
+    commands = m.build_commands(
+        plan, plan["conditions"][1], "deployment", Path("/output")
+    )
+    assert commands["action"][0] == "/model-python"
+    assert commands["vlm"][0] == "/model-python"
+    for role, port in (("action", "5680"), ("vlm", "5682")):
+        command = commands[role]
+        assert command[command.index("--role") + 1] == role
+        assert command[command.index("--port") + 1] == port
+        assert command[command.index("--device") + 1] == "cuda:0"
+        assert "--vlm-device" not in command
+        assert "--vlm-cuda-graph" in command
+    evaluate = commands["evaluate"]
+    assert evaluate[0] == "/eval-python"
+    assert evaluate[evaluate.index("--control-hz") + 1] == "20"
+    assert evaluate[evaluate.index("--port") + 1] == "5680"
+    assert evaluate[evaluate.index("--slow-port") + 1] == "5682"
+    assert evaluate[evaluate.index("--task-ids") + 1 :] == [str(i) for i in range(10)]
+
+
+@pytest.mark.parametrize("change", ["ports", "names", "flags", "episodes", "protocol"])
+def test_invalid_plan_is_rejected_before_starting_any_process(plan, change):
+    if change == "ports":
+        plan["ports"]["vlm"] = plan["ports"]["action"]
+    elif change == "names":
+        plan["conditions"][1]["name"] = plan["conditions"][0]["name"]
+    elif change == "flags":
+        plan["conditions"][0]["flags"] = ["--checkpoint", "/other"]
+    elif change == "episodes":
+        plan["episodes_per_task"] = 0
+    else:
+        plan["protocols"] = ["unknown"]
+    with pytest.raises(ValueError):
+        module().validate_plan(plan)
+
+
+def test_full_paired_fixtures_require_every_episode_and_matching_hashes():
+    m = module()
+    rows = [
+        {"task_id": task, "episode_id": 0, **dict.fromkeys(m.FIXTURE_FIELDS, str(task))}
+        for task in range(10)
+    ]
+    candidates = {"baseline": rows, "common": deepcopy(rows)}
+    assert m.paired_fixtures(candidates, episodes_per_task=1)["passed"]
+    candidates["common"].pop()
+    assert not m.paired_fixtures(candidates, episodes_per_task=1)["passed"]
+    candidates["common"] = deepcopy(rows)
+    candidates["common"][3]["initial_rgb_sha256"] = "different"
+    assert not m.paired_fixtures(candidates, episodes_per_task=1)["passed"]
+
+
+def test_old_ready_marker_cannot_admit_a_new_worker(plan, tmp_path, monkeypatch):
+    m = module()
+    (tmp_path / "run.log").write_text("TIMED_PROTOCOL_SERVER_READY old worker\n")
+
+    class Process:
+        pid = 123456
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *args, **kwargs: Process())
+    owned = m.OwnedProcesses(plan)
+    owned.start("action", ["worker"], tmp_path, "action")
+    with pytest.raises(TimeoutError):
+        owned.ready("action", tmp_path, timeout=0)
+    assert "old worker" in (tmp_path / "run.log").read_text()
+
+
+def test_failed_child_cleanup_still_stops_other_owned_workers(plan, monkeypatch):
+    m = module()
+    signals = []
+
+    class Process:
+        def __init__(self, pid, blocked):
+            self.pid, self.blocked, self.waited = pid, blocked, False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            self.waited = True
+            if self.blocked:
+                raise m.subprocess.TimeoutExpired("worker", timeout)
+
+    first, second = Process(123450, False), Process(123451, True)
+    owned = m.OwnedProcesses(plan)
+    owned.children = {"first": first, "second": second}
+    monkeypatch.setattr(m.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    with pytest.raises(RuntimeError, match="stop"):
+        owned.close()
+    assert first.waited and second.waited
+    assert {pid for pid, _ in signals} == {first.pid, second.pid}
+
+
+def test_missing_launch_paths_reject_before_gpu_admission_or_processes(plan):
+    with pytest.raises(ValueError, match="path"):
+        module().validate_launch_paths(plan)
+
+
+def test_official_predicted_and_native_decoded_horizons_are_distinct():
+    from types import SimpleNamespace
+
+    from coexecution.libero import service
+
+    core = SimpleNamespace(
+        model=SimpleNamespace(
+            config=SimpleNamespace(streaming=False, action_horizon=40)
+        ),
+        modality_configs={"action": SimpleNamespace(delta_indices=list(range(16)))},
+    )
+    assert service.policy_horizons(core, "flow") == {
+        "predicted_horizon": 40,
+        "decoded_horizon": 16,
+    }
+    core.model.config.streaming = True
+    core.modality_configs["action"].delta_indices = list(range(40))
+    assert service.policy_horizons(core, "pir2")["decoded_horizon"] == 40
+    core.modality_configs["action"].delta_indices = list(range(4))
+    with pytest.raises(ValueError):
+        service.policy_horizons(core, "pir2")
+
+
+@pytest.mark.parametrize(
+    "invalid", ["keys", "missing_age", "nonfinite_age", "negative_age"]
+)
+def test_deployment_completion_requires_exact_episode_keys_and_actual_ages(
+    plan, tmp_path, monkeypatch, invalid
+):
+    from coexecution import feature_usage, queue_report
+
+    condition = {
+        "episodes": [
+            {
+                "metadata": {"task_id": task, "episode_id": 0},
+                "ticks": [
+                    {
+                        "fallback": False,
+                        "executed_image_age_ms": 10.0,
+                        "executed_state_age_ms": 12.0,
+                    }
+                ],
+            }
+            for task in range(10)
+        ]
+    }
+    if invalid == "keys":
+        condition["episodes"][0]["metadata"]["task_id"] = 10
+    elif invalid == "missing_age":
+        condition["episodes"][0]["ticks"][0]["executed_image_age_ms"] = None
+    elif invalid == "nonfinite_age":
+        condition["episodes"][0]["ticks"][0]["executed_state_age_ms"] = float("nan")
+    else:
+        condition["episodes"][0]["ticks"][0]["executed_state_age_ms"] = -1
+    monkeypatch.setattr(queue_report, "condition_report", lambda path: condition)
+    monkeypatch.setattr(
+        feature_usage,
+        "analyze_report",
+        lambda *args, **kwargs: {
+            "conditions": [
+                {
+                    "read_accounting_complete": True,
+                    "execution_accounting_complete": True,
+                }
+            ]
+        },
+    )
+    with pytest.raises(RuntimeError):
+        module().deployment_report(plan, tmp_path)
+
+
+def test_lookup_race_cleanup_timeout_still_visits_other_workers(plan, monkeypatch):
+    m = module()
+    visited = []
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            visited.append(self.pid)
+            if self.pid == 123451:
+                raise m.subprocess.TimeoutExpired("worker", timeout)
+
+    owned = m.OwnedProcesses(plan)
+    owned.children = {"action": Process(123450), "vlm": Process(123451)}
+
+    def kill(pid, sig):
+        if pid == 123451:
+            raise ProcessLookupError("worker just exited")
+
+    monkeypatch.setattr(m.os, "killpg", kill)
+    with pytest.raises(RuntimeError, match="stop"):
+        owned.close()
+    assert 123450 in visited

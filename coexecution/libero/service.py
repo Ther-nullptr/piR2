@@ -17,6 +17,18 @@ from coexecution.optimization.session import GrootOptimizations
 LOGGER = logging.getLogger(__name__)
 
 
+def policy_horizons(core, variant):
+    predicted = core.model.config.action_horizon
+    decoded = len(core.modality_configs["action"].delta_indices)
+    if core.model.config.streaming != (variant == "pir2") or predicted != 40:
+        raise ValueError("The declared variant requires the fixed H40 model")
+    if not 5 < decoded <= predicted:
+        raise ValueError(
+            "Native decoded horizon must exceed the five-tick delay budget"
+        )
+    return {"predicted_horizon": predicted, "decoded_horizon": decoded}
+
+
 def load_core(checkpoint, output, device):
     import torch
     from gr00t.policy import gr00t_policy as policy_module
@@ -155,16 +167,11 @@ def main():
         output = args.output / spec["role"] if len(layout) > 1 else args.output
         output.mkdir(parents=True, exist_ok=True)
         core = load_core(args.checkpoint, output, spec["device"])
-        if spec["role"] == "action":
-            assert core.model.config.streaming == (args.variant == "pir2")
-            assert (
-                core.model.config.action_horizon
-                == len(core.modality_configs["action"].delta_indices)
-                == 40
-            )
+        horizons = policy_horizons(core, args.variant)
         backend = Backend(core, args.variant, output)
         identity = {
             **base_identity,
+            **horizons,
             "variant": args.variant,
             "role": spec["role"],
             "logical_device": spec["device"],
