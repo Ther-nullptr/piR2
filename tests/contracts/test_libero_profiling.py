@@ -77,3 +77,26 @@ def test_stage_uses_launch_correlation_and_keeps_quant_pack_exclusive():
     assert report["categories"] == [
         {"category": "producer_quantization", "event_count": 1, "gpu_ms": 0.5}
     ]
+
+
+def test_measured_norm_producers_are_separate_from_standalone_activation_packing():
+    module = importlib.import_module("coexecution.libero.profiling")
+    trace = {
+        "traceEvents": [
+            {"ph": "X", "cat": "kernel", "name": name, "ts": i * 1000, "dur": 500}
+            for i, name in enumerate(
+                (
+                    "_prepare_norm_modulation",
+                    "_prepare_residual_norm_modulation",
+                    "void prepare_integer<8>(...)",
+                )
+            )
+        ]
+    }
+    report = module.summarize_trace(trace)
+    assert report["categories"] == [
+        {"category": "producer_quantization", "event_count": 2, "gpu_ms": 1.0},
+        {"category": "quantization_prepare", "event_count": 1, "gpu_ms": 0.5},
+    ]
+    assert report["gpu_work_ms"] == 1.5
+    assert report["device_event_count"] == 3

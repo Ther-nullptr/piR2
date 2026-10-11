@@ -99,7 +99,15 @@ def _category(name, chain, cat):
         return "layout_copy"
     if "_prepare_condition" in kernel:
         return "pointwise"
-    if any(token in kernel for token in ("layernorm_pack", "rms_tail_pack")):
+    if any(
+        token in kernel
+        for token in (
+            "layernorm_pack",
+            "rms_tail_pack",
+            "_prepare_norm_modulation",
+            "_prepare_residual_norm_modulation",
+        )
+    ):
         return "producer_quantization"
     if any(
         token in kernel
