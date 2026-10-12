@@ -65,6 +65,39 @@ def test_commands_use_declared_ports_full_suite_and_separate_workers(plan):
     assert evaluate[evaluate.index("--task-ids") + 1 :] == [str(i) for i in range(10)]
 
 
+@pytest.mark.parametrize("transport", ["numpy_bf16", "cuda_local"])
+def test_paired_layout_has_one_owned_process_and_two_explicit_endpoints(
+    plan, transport
+):
+    plan.update(server_layout="paired", feature_transport=transport)
+    module().validate_plan(plan)
+    commands = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/output")
+    )
+    assert set(commands) == {"paired", "evaluate"}
+    command = commands["paired"]
+    assert command[command.index("--server-layout") + 1] == "paired"
+    assert command[command.index("--vlm-device") + 1] == "cuda:0"
+    assert command[command.index("--vlm-port") + 1] == "5682"
+    assert (
+        commands["evaluate"][commands["evaluate"].index("--server-layout") + 1]
+        == "paired"
+    )
+
+
+@pytest.mark.parametrize("change", ["layout", "placement", "variant"])
+def test_resident_plan_rejects_incompatible_placements_before_launch(plan, change):
+    plan.update(server_layout="paired", feature_transport="cuda_local")
+    if change == "layout":
+        plan["server_layout"] = "split"
+    elif change == "placement":
+        plan["gpus"]["vlm"] = 1
+    else:
+        plan["conditions"][0]["variant"] = "pir2"
+    with pytest.raises(ValueError):
+        module().validate_plan(plan)
+
+
 @pytest.mark.parametrize("case_rate, expected", [(None, 15), (12, 12), (0, 0)])
 def test_vision_rate_plan_default_and_case_override_reach_only_deployment(
     plan, case_rate, expected
@@ -211,6 +244,38 @@ def test_old_ready_marker_cannot_admit_a_new_worker(plan, tmp_path, monkeypatch)
     with pytest.raises(TimeoutError):
         owned.ready("action", tmp_path, timeout=0)
     assert "old worker" in (tmp_path / "run.log").read_text()
+
+
+def test_paired_readiness_requires_both_owned_endpoint_markers(plan, tmp_path):
+    from types import SimpleNamespace
+
+    owned = module().OwnedProcesses(plan)
+    owned.children["paired"] = SimpleNamespace(poll=lambda: None)
+    owned.logs["paired"] = tmp_path / "paired.log"
+    owned.logs["paired"].write_text("TIMED_PROTOCOL_SERVER_READY action\n")
+    with pytest.raises(TimeoutError):
+        owned.ready("paired", tmp_path, timeout=0, endpoints=2)
+    owned.logs["paired"].write_text(
+        "TIMED_PROTOCOL_SERVER_READY action\nTIMED_PROTOCOL_SERVER_READY vlm\n"
+    )
+    owned.ready("paired", tmp_path, timeout=0, endpoints=2)
+
+
+def test_cleanup_signals_each_owned_pid_once_even_with_endpoint_aliases(
+    plan, monkeypatch
+):
+    from types import SimpleNamespace
+
+    m = module()
+    signals, waits = [], []
+    owned = m.OwnedProcesses(plan)
+    process = SimpleNamespace(
+        pid=12345, poll=lambda: None, wait=lambda **kwargs: waits.append(kwargs)
+    )
+    owned.children = {"action": process, "vlm": process}
+    monkeypatch.setattr(m.os, "killpg", lambda *args: signals.append(args))
+    owned.close()
+    assert len(signals) == len(waits) == 1
 
 
 def test_failed_child_cleanup_still_stops_other_owned_workers(plan, monkeypatch):

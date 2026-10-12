@@ -6,11 +6,12 @@ every other tensor dtype. Validation is host-only; torch is supplied by callers.
 """
 
 import math
+import time
 from numbers import Real
 
 import numpy as np
 
-FEATURE_TRANSPORTS = ("numpy_fp32", "numpy_bf16")
+FEATURE_TRANSPORTS = ("numpy_fp32", "numpy_bf16", "cuda_local")
 FEATURE_RPC_MODES = ("separate", "combined")
 TIMING_VERSION = 2
 SCHEMA = "libero.features"
@@ -44,7 +45,7 @@ def add_feature_arguments(parser, *, rpc=False):
         "--feature-transport",
         choices=FEATURE_TRANSPORTS,
         default="numpy_fp32",
-        help="VLM wire representation; numpy_bf16 preserves exact BF16 bits",
+        help="VLM wire representation; cuda_local requires paired same-device workers",
     )
     if rpc:
         parser.add_argument(
@@ -64,11 +65,92 @@ def validate_feature_identity(identity, requested):
         )
 
 
+def validate_worker_pair(action, vision, layout, transport):
+    if layout not in ("split", "paired"):
+        raise ValueError("Unknown server layout")
+    for identity in (action, vision):
+        actual = identity.get(
+            "server_layout",
+            "paired" if identity.get("paired_same_process") else "split",
+        )
+        if actual != layout:
+            raise ValueError("Requested server layout differs from worker identity")
+    if layout == "paired":
+        if action.get("role") != "action" or vision.get("role") != "vlm":
+            raise ValueError("Paired worker roles are invalid")
+        for key in ("pid", "server_instance"):
+            if action.get(key) is None or action[key] != vision.get(key):
+                raise ValueError(
+                    "Paired endpoints must belong to the same owned process"
+                )
+        for key in ("policy_instance", "cuda_stream"):
+            if (
+                action.get(key) is None
+                or vision.get(key) is None
+                or action[key] == vision[key]
+            ):
+                raise ValueError(
+                    "Paired workers require independent policies and streams"
+                )
+    if transport == "cuda_local":
+        if (
+            layout != "paired"
+            or not action.get("physical_device_uuid")
+            or action.get("physical_device_uuid") != vision.get("physical_device_uuid")
+        ):
+            raise ValueError("Resident features require the same physical CUDA device")
+        owner = action.get("feature_exchange", {}).get("owner")
+        if not owner or owner != vision.get("feature_exchange", {}).get("owner"):
+            raise ValueError("Resident workers do not share the same owned exchange")
+
+
 def feature_use_time(timing):
     """Prefer explicit server planning; keep legacy RPC-entry semantics labeled."""
     if timing.get("server_plan_started_s") is not None:
         return "server_plan_started_s", timing["server_plan_started_s"]
     return "plan_rpc_started_s", timing.get("plan_rpc_started_s")
+
+
+def prepare_episode_vision(client, observation, capture_s, *, clock=None):
+    """Warm this task's real S2 path before scored control; publish no feature.
+
+    Condition-wide solo calibration cannot prepare a new task's text/metadata
+    graph bucket. The next scored frame still runs the real VLM independently.
+    """
+    clock = time.monotonic if clock is None else clock
+    started = clock()
+    result = client.call_endpoint(
+        "vision",
+        {
+            "observation": observation,
+            "capture_s": capture_s,
+            "source_tick": 0,
+            "return_features": False,
+        },
+    )
+    completed = clock()
+    meta = result["meta"]
+    if (
+        meta.get("vlm_forward_calls") != 1
+        or meta.get("capture_s") != capture_s
+        or meta.get("source_tick") != 0
+        or "vl_embeds" in result
+    ):
+        raise RuntimeError(
+            "Episode preparation requires one real VLM call for the supplied source, without feature publication"
+        )
+    return {
+        "scope": "outside scored control, before fresh S1 bootstrap capture",
+        "started_s": started,
+        "completed_s": completed,
+        "capture_s": capture_s,
+        "source_tick": 0,
+        "rpc_seconds": completed - started,
+        "server_vlm_seconds": meta["vlm_seconds"],
+        "vlm_forward_calls": meta["vlm_forward_calls"],
+        "graph_execution": meta.get("graph_execution"),
+        "frame_hashes": meta.get("frame_hashes"),
+    }
 
 
 def _array(value):
@@ -132,6 +214,8 @@ def encode_features(features, encoding="numpy_fp32", *, torch_module=None):
     encoding. The blocking CPU copies complete before this function returns.
     """
     validate_feature_options(encoding)
+    if encoding == "cuda_local":
+        raise ValueError("cuda_local requires an owned feature exchange")
     fields = {}
     for key, value in features.items():
         if torch_module is not None and torch_module.is_tensor(value):
@@ -184,6 +268,10 @@ def decode_features(payload, *, torch_module, device, legacy_dtype):
 
 
 def feature_evidence(payload):
+    if isinstance(payload, dict) and payload.get("encoding") == "cuda_local":
+        from coexecution.libero.resident import resident_evidence
+
+        return resident_evidence(payload)
     encoding, fields = validate_features(payload)
     return {
         "encoding": encoding,

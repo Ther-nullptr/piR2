@@ -31,6 +31,62 @@ Queue reports and feature-usage audits prefer `server_plan_started_s` for `use_s
 
 Run `PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_feature_transport_gpu.py` in the pinned CUDA environment for all 65,536 BF16 bit patterns, other dtype/shape preservation, fresh storage and stream-readiness gates. These codec checks perform no neural inference and do not establish LIBERO task success.
 
+Same-process Flow workers are an explicit `--server-layout paired` option. Start
+one service with `--device cuda:0 --vlm-device cuda:0 --port 5570 --vlm-port 5572`
+and select `--server-layout paired` on the deployment evaluator. The service loads
+two independent official policies, each with its own CUDA stream and endpoint.
+The default layout remains `split`. Experiment plans accept `server_layout`
+globally or per condition; paired plans start and own one process, wait for both
+endpoints, and require the same declared physical GPU.
+
+With paired Flow workers on one physical device, `--feature-transport cuda_local`
+replaces tensor serialization with versioned, owner-qualified feature handles.
+Each admitted frame still runs the real VLM. Publication follows the completed
+producer event; the consumer waits on that event and records its stream before
+installing independent references in its policy cache. A bounded pool (default
+16 leases, service option `--feature-max-leases`) retains owned tensor snapshots.
+It rejects capacity exhaustion rather than evicting an in-flight reader. Handles
+bind the exact metadata, dtype, shape, device, process instance and client session;
+stale or modified handles fail without substituting older neural outputs.
+
+The client holds a lease while the feature is latest, selected, pending, or kept
+as the action worker's fallback. Last-reference releases are batched on the next
+vision RPC. Shutdown first joins action consumers, then closes the owned feature
+session over a fresh RPC connection, including features whose replies were lost.
+Reset invalidates the producer session while existing reader references remain
+safe. `feature_wire.payload_nbytes` is zero tensor bytes for this transport;
+`resident_nbytes` reports retained tensor storage. Handle serialization still has
+metadata overhead. Pool counts appear in VLM responses and runtime identities.
+
+Paired optimization installs adapters independently for each policy. Ordinary
+CUDA submissions can overlap; first VLM/DiT graph captures take a process-wide
+exclusive guard after quiescing prior GPU work. Simultaneous capture upgrades
+drop their shared submission slots before waiting. Startup, reset, inherited
+policy endpoints and teardown also participate. Paired whole-action graph mode
+is rejected; per-DiT and whole-VLM graph options are supported. S2 reset does not
+reseed S1's RNG. Graph capture/replay/failure deltas remain separate from physical
+forward hooks, and `scored_cold_capture_requests` exposes captures during scored
+control. Cold warmup costs stay outside steady measurement.
+
+Condition-wide solo calibration prepares only its initial task metadata. Each
+episode therefore also runs one real S2 preparation call for its current task,
+before the fresh S1 bootstrap capture and scored control. This applies equally
+to split and paired layouts and every feature transport. The call requests no
+feature payload; its outputs never enter the scored mailbox or S1 cache. Every
+subsequent admitted frame still runs the real VLM. Per-episode
+`vision_preparation` records its actual source and wall times, physical VLM count
+and graph deltas separately. It does not change the calibrated delay, the
+nondecreasing delay rule, camera admission or scored completion timestamps.
+
+Compare resident transport against **paired `numpy_bf16`** as well as split
+`numpy_bf16`, with identical precision/runtime flags, 20Hz control and S2 admission
+settings. This separates transport cost from process/context layout effects.
+Run `PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_resident_features_gpu.py`
+for stream readiness, owned storage, allocator lifetime and two independent tiny
+pinned CUDA policies with simultaneous cold captures, fresh images and RNG
+checks. Official-checkpoint equality, measured server latency and full Spatial
+quality remain separate gates; W4 systems measurements do not establish quality.
+
 Measured queue traces retain the existing `control_tick`, `request_completed`, `unused_result_at_episode_end` and `vision_request` row kinds. New lifecycle rows add `schema_version: 1`, a unique insertion-order `seq`, and `t_s` in the same host monotonic-clock domain as worker RPC and controller timestamps. Threads collect detached metadata in memory; JSON/file I/O occurs after timed control and worker drain. Row order is insertion order, so timeline viewers use each event's timestamp instead of assuming timestamps increase with `seq`.
 
 | Event / field | Meaning |

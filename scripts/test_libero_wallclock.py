@@ -159,6 +159,8 @@ class ServiceFloors(unittest.TestCase):
         with (
             patch("libero_wallclock.ActionWorker") as actor,
             patch("libero_wallclock.VisionWorker") as vision,
+            patch("libero_wallclock.feature_rpc_client"),
+            patch("libero_wallclock.prepare_episode_vision", return_value={}),
             patch("libero_wallclock.run_control_loop", return_value=({}, [])) as loop,
         ):
             result, _ = deployment_episode(

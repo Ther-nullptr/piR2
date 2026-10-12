@@ -106,6 +106,22 @@ def validate_plan(plan):
         except SystemExit as error:
             raise ValueError("Invalid optimization flags") from error
         config.validate_variant(case["variant"])
+        from coexecution.libero.service import validate_server_layout
+
+        layout = case.get("server_layout", plan.get("server_layout", "split"))
+        paired_device = f"cuda:{plan['gpus']['vlm']}" if layout == "paired" else None
+        validate_server_layout(
+            layout,
+            f"cuda:{plan['gpus']['action']}",
+            paired_device,
+            case.get("feature_transport", plan.get("feature_transport", "numpy_fp32")),
+            case["variant"],
+            config,
+        )
+        if layout == "paired" and plan["gpus"]["action"] != plan["gpus"]["vlm"]:
+            raise ValueError(
+                "Experiment paired layout currently requires the same physical GPU"
+            )
 
 
 def build_commands(plan, case, protocol, output):
@@ -116,6 +132,7 @@ def build_commands(plan, case, protocol, output):
         "feature_transport", plan.get("feature_transport", "numpy_fp32")
     )
     feature_rpc = case.get("feature_rpc", plan.get("feature_rpc", "separate"))
+    layout = case.get("server_layout", plan.get("server_layout", "split"))
     feature_controls = []
     if "feature_transport" in case or "feature_transport" in plan:
         feature_controls = ["--feature-transport", feature_transport]
@@ -144,6 +161,22 @@ def build_commands(plan, case, protocol, output):
             *case["flags"],
             *feature_controls,
         ]
+    if layout == "paired":
+        commands["paired"] = commands.pop("action")
+        del commands["vlm"]
+        commands["paired"][commands["paired"].index("--output") + 1] = str(
+            output / "paired-server"
+        )
+        commands["paired"].extend(
+            [
+                "--server-layout",
+                "paired",
+                "--vlm-device",
+                "cuda:0",
+                "--vlm-port",
+                str(plan["ports"]["vlm"]),
+            ]
+        )
     commands["evaluate"] = [
         str(plan["evaluation_python"]),
         str(root / "scripts/evaluate_libero_protocol.py"),
@@ -171,6 +204,7 @@ def build_commands(plan, case, protocol, output):
         "1",
         "--no-video",
         *deployment_controls,
+        *(["--server-layout", layout] if layout != "split" else []),
         *(feature_controls if protocol == "deployment" else []),
         *(
             ["--feature-rpc", feature_rpc]
@@ -318,14 +352,16 @@ class OwnedProcesses:
         _write(output / "job.json", job)
         return process
 
-    def ready(self, name, output, timeout=900):
+    def ready(self, name, output, timeout=900, *, endpoints=1):
         process, deadline = self.children[name], time.monotonic() + timeout
         while True:
             if process.poll() is not None:
                 raise RuntimeError(f"Worker {name} exited; see {self.logs[name]}")
             log = self.logs[name]
-            if log.exists() and "TIMED_PROTOCOL_SERVER_READY" in log.read_text(
-                errors="replace"
+            if (
+                log.exists()
+                and log.read_text(errors="replace").count("TIMED_PROTOCOL_SERVER_READY")
+                >= endpoints
             ):
                 return
             if time.monotonic() > deadline:
@@ -334,7 +370,8 @@ class OwnedProcesses:
 
     def close(self):
         errors = []
-        for process in reversed(tuple(self.children.values())):
+        unique = {process.pid: process for process in self.children.values()}
+        for process in reversed(tuple(unique.values())):
             if process.poll() is None:
                 try:
                     try:
@@ -471,10 +508,17 @@ def run(plan, output):
                 commands = build_commands(
                     plan, case, plan["protocols"][0], condition_output
                 )
-                for role in ("action", "vlm"):
+                for role in ("paired",) if "paired" in commands else ("action", "vlm"):
                     worker_output = condition_output / (role + "-server")
-                    owned.start(role, commands[role], worker_output, role)
-                    owned.ready(role, worker_output)
+                    owned.start(
+                        role,
+                        commands[role],
+                        worker_output,
+                        "action" if role == "paired" else role,
+                    )
+                    owned.ready(
+                        role, worker_output, endpoints=2 if role == "paired" else 1
+                    )
                 for protocol in plan["protocols"]:
                     commands = build_commands(plan, case, protocol, condition_output)
                     evaluation_output = condition_output / protocol
@@ -500,6 +544,9 @@ def run(plan, output):
                         evaluation_output / "hardware.json",
                         {
                             "layout": case["name"],
+                            "server_layout": case.get(
+                                "server_layout", plan.get("server_layout", "split")
+                            ),
                             "condition": protocol,
                             "role_gpus": {
                                 "S1": plan["gpus"]["action"],

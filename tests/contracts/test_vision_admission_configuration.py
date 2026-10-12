@@ -54,6 +54,10 @@ def test_requested_rate_and_deployment_contract_are_saved_and_bind_resume(tmp_pa
     assert "bootstrap" in contract["scope"]
     assert "publication" in contract
     assert "stop" in contract
+    preparation = config["deployment_contract"]["episode_vision_preparation"]
+    assert preparation["calls_per_episode"] == 1
+    assert "every layout and transport" in preparation["scope"]
+    assert "return_features=False" in preparation["publication"]
     save_run_configuration(tmp_path, config)
     saved = json.loads((tmp_path / "config.json").read_text())
     assert saved["deployment_contract"] == config["deployment_contract"]

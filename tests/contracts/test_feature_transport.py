@@ -15,6 +15,190 @@ def codec():
     return importlib.import_module("coexecution.libero.features")
 
 
+def test_episode_vision_preparation_records_real_work_without_feature_publication():
+    calls = []
+    graph = {"capture_delta": {"vlm": 1}, "cold_capture": True}
+
+    def call(endpoint, payload):
+        calls.append((endpoint, payload))
+        return {
+            "meta": {
+                "capture_s": 9.0,
+                "source_tick": 0,
+                "vlm_forward_calls": 1,
+                "vlm_seconds": 0.3,
+                "graph_execution": graph,
+                "frame_hashes": {"image": "actual"},
+            }
+        }
+
+    clock = iter([10.0, 10.31])
+    record = codec().prepare_episode_vision(
+        SimpleNamespace(call_endpoint=call),
+        {"language": {"task": "new"}},
+        9.0,
+        clock=lambda: next(clock),
+    )
+    assert calls == [
+        (
+            "vision",
+            {
+                "observation": {"language": {"task": "new"}},
+                "capture_s": 9.0,
+                "source_tick": 0,
+                "return_features": False,
+            },
+        )
+    ]
+    assert record["capture_s"] == 9.0
+    assert record["started_s"] == 10.0 and record["completed_s"] == 10.31
+    assert record["rpc_seconds"] == pytest.approx(0.31)
+    assert record["vlm_forward_calls"] == 1
+    assert record["graph_execution"] == graph
+    assert "vl_embeds" not in record
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"vlm_forward_calls": 0},
+        {"vlm_forward_calls": 2},
+        {"capture_s": 9.1},
+        {"source_tick": 1},
+    ],
+)
+def test_episode_preparation_rejects_wrong_compute_or_source_before_control(change):
+    meta = {
+        "capture_s": 9.0,
+        "source_tick": 0,
+        "vlm_forward_calls": 1,
+        "vlm_seconds": 0.3,
+        **change,
+    }
+    client = SimpleNamespace(call_endpoint=lambda *_: {"meta": meta})
+    with pytest.raises(RuntimeError):
+        codec().prepare_episode_vision(client, {}, 9.0)
+
+
+@pytest.mark.parametrize(
+    "layout,transport",
+    [
+        ("split", "numpy_fp32"),
+        ("split", "numpy_bf16"),
+        ("paired", "numpy_bf16"),
+        ("paired", "cuda_local"),
+    ],
+)
+def test_each_episode_prepares_s2_before_fresh_bootstrap_even_with_cached_calibration(
+    monkeypatch,
+    layout,
+    transport,
+):
+    import io
+    from unittest.mock import Mock
+
+    import libero_wallclock as wallclock
+
+    events, replies = [], []
+    args = SimpleNamespace(
+        control_hz=20,
+        slow_warmup={"cached": True},
+        calibration=(1, {"selected_delay_ticks": 1}),
+        port=1,
+        slow_port=2,
+        max_steps=5,
+        record_video=False,
+        server_layout=layout,
+        feature_transport=transport,
+    )
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs["port"] == 2
+            self.socket = SimpleNamespace(setsockopt=lambda *args: None)
+            self.context = SimpleNamespace(
+                setsockopt=lambda *args: None, destroy=lambda **kwargs: None
+            )
+
+        def call_endpoint(self, name, payload):
+            assert name == "vision" and payload["return_features"] is False
+            assert "feature_session" not in payload
+            language = payload["observation"]["language"]["language.task"][0][0]
+            events.append(("prepare", language))
+            return {
+                "meta": {
+                    "capture_s": payload["capture_s"],
+                    "source_tick": 0,
+                    "vlm_forward_calls": 1,
+                    "vlm_seconds": 0.3,
+                    "graph_execution": {
+                        "capture_delta": {"vlm": 1},
+                        "cold_capture": True,
+                    },
+                }
+            }
+
+    def bootstrap(name, payload):
+        assert name == "bootstrap" and payload["delay_ticks"] == 1
+        events.append(
+            ("bootstrap", payload["observation"]["language"]["language.task"][0][0])
+        )
+        assert payload["capture_s"] >= replies[-1]["completed_s"]
+        return {
+            "actions": np.zeros((16, 7)),
+            "bootstrap_seconds": 0.01,
+            "forward_counts": {"vlm": 1, "dit": 4},
+        }
+
+    # Observe the real reusable preparation helper, rather than replace its RPC.
+    original = codec().prepare_episode_vision
+
+    def prepare(*args, **kwargs):
+        record = original(*args, **kwargs)
+        replies.append(record)
+        return record
+
+    monkeypatch.setitem(
+        sys.modules, "gr00t.policy.server_client", SimpleNamespace(PolicyClient=Client)
+    )
+    monkeypatch.setitem(sys.modules, "zmq", SimpleNamespace(LINGER=17))
+    monkeypatch.setattr(wallclock, "prepare_episode_vision", prepare)
+    monkeypatch.setattr(wallclock, "ActionWorker", Mock())
+    monkeypatch.setattr(wallclock, "VisionWorker", Mock())
+
+    def control(_step, observation, *args, **kwargs):
+        events.append(("control", observation["language.task"]))
+        return {}, []
+
+    monkeypatch.setattr(wallclock, "run_control_loop", control)
+    for task in ("first", "second"):
+        observation = {"language.task": task}
+
+        def refresh(_task=task, _observation=observation, **kwargs):
+            events.append(("refresh", _task))
+            return _observation
+
+        env = SimpleNamespace(
+            _process_observation=lambda raw: raw,
+            _env=SimpleNamespace(env=SimpleNamespace(_get_observations=refresh)),
+        )
+        result, _ = wallclock.deployment_episode(
+            env,
+            observation,
+            SimpleNamespace(call_endpoint=bootstrap),
+            args,
+            1000,
+            io.StringIO(),
+        )
+        assert result["vision_preparation"] == replies[-1]
+        assert result["calibration"] is args.calibration[1]
+    assert events == [
+        (phase, task)
+        for task in ("first", "second")
+        for phase in ("prepare", "refresh", "bootstrap", "control")
+    ]
+
+
 def envelope():
     return {
         "schema": "libero.features",

@@ -21,8 +21,15 @@ if _ROOT not in sys.path:
 
 from coexecution.libero.features import (
     TIMING_VERSION,
+    prepare_episode_vision,
     validate_feature_meta,
     validate_feature_options,
+)
+from coexecution.libero.resident import (
+    ClientFeatureLeases,
+    close_remote_features,
+    feature_rpc_client,
+    remote_feature_session,
 )
 from coexecution.libero.scheduling import (
     AdmissionSchedule,
@@ -102,8 +109,18 @@ def release_service(anchor_s, raw_completed_s, min_service_ms, clock):
 
 
 class VisionWorker:
-    def __init__(self, port, events=None, min_service_ms=0, clock=None, max_hz=0):
+    def __init__(
+        self,
+        port,
+        events=None,
+        min_service_ms=0,
+        clock=None,
+        max_hz=0,
+        feature_transport="numpy_fp32",
+    ):
         validate_service_floor(min_service_ms)
+        validate_feature_options(feature_transport)
+        self.feature_transport, self.leases = feature_transport, None
         self.admission_schedule = AdmissionSchedule(max_hz)
         self.max_hz = max_hz
         self.port = port
@@ -156,6 +173,10 @@ class VisionWorker:
 
         client = PolicyClient(host="127.0.0.1", port=self.port, timeout_ms=120000)
         try:
+            if self.feature_transport == "cuda_local":
+                identity = client.call_endpoint("identity", requires_input=False)
+                self.leases = ClientFeatureLeases.new(identity["feature_exchange"])
+                self.leases.open(client.call_endpoint)
             while True:
                 with self.condition:
                     wait_started = None
@@ -208,14 +229,16 @@ class VisionWorker:
                 # RPC entry is distinct from admission: stop can be observed
                 # after an admission while this already-owned request starts.
                 start = self.clock.now()
-                result = client.call_endpoint(
-                    "vision",
-                    {
-                        "observation": to_nested(observation.data),
-                        "capture_s": observation.capture_s,
-                        "source_tick": observation.tick,
-                        "return_features": True,
-                    },
+                payload = {
+                    "observation": to_nested(observation.data),
+                    "capture_s": observation.capture_s,
+                    "source_tick": observation.tick,
+                    "return_features": True,
+                }
+                result = (
+                    self.leases.vision(client.call_endpoint, payload)
+                    if self.leases is not None
+                    else client.call_endpoint("vision", payload)
                 )
                 if result["meta"]["vlm_forward_calls"] != 1:
                     raise RuntimeError(
@@ -247,6 +270,8 @@ class VisionWorker:
                         "capture_s": observation.capture_s,
                         "server_vlm_seconds": result["meta"]["vlm_seconds"],
                         "feature_wire": result["meta"].get("feature_wire"),
+                        "graph_execution": result["meta"].get("graph_execution"),
+                        "feature_exchange": result.get("feature_exchange"),
                         "frame_hashes": result["meta"].get("frame_hashes"),
                         "requested_tick": result["meta"].get("requested_tick"),
                     }
@@ -282,6 +307,16 @@ class VisionWorker:
     def close(self):
         self.request_stop()
         self.thread.join()
+        # The controller joins ActionWorker first. Its pending task/fallback
+        # references can no longer use a lease when this session is revoked.
+        if self.leases is not None:
+            with self.condition:
+                if self.queue.latest is not None:
+                    self.queue.latest = {
+                        "meta": self.queue.latest["meta"],
+                        "sequence": self.queue.latest["sequence"],
+                    }
+        close_remote_features(self.leases, self.port)
         if self.error is not None:
             raise RuntimeError("VLM worker failed") from self.error
         starts = [row["admitted_s"] for row in self.admissions]
@@ -339,6 +374,7 @@ class ActionWorker:
         self.local = threading.local()
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.completed = []
+        self.closed = False
 
     def submit(
         self,
@@ -496,7 +532,23 @@ class ActionWorker:
         return result
 
     def close(self):
-        self.pool.shutdown(wait=True)
+        if self.closed:
+            return
+
+        def release():
+            if hasattr(self.local, "client"):
+                self.local.feature = None
+                if hasattr(self.local.client, "socket"):
+                    self.local.client.socket.close()
+                    self.local.client.context.term()
+                del self.local.client
+
+        try:
+            self.pool.submit(release).result()
+        finally:
+            self.pool.shutdown(wait=True)
+            self.initial_feature = None
+            self.closed = True
 
 
 def run_control_loop(
@@ -798,6 +850,16 @@ def run_control_loop(
             ),
             "slow_gpu_vlm": vlm_stats["completed"],
         },
+        "scored_cold_capture_requests": {
+            "action": sum(
+                bool(x["audit"].get("graph_execution", {}).get("cold_capture"))
+                for x in completed
+            ),
+            "vlm": sum(
+                bool((x.get("graph_execution") or {}).get("cold_capture"))
+                for x in vlm_stats.get("rpc_times", [])
+            ),
+        },
         "sensor_release_contract_verified": all(
             released >= target for _, released, target in observation_events
         ),
@@ -856,6 +918,7 @@ def calibrate(
                     "excluded": tick < 2,
                     "rpc_seconds": elapsed,
                     "server_seconds": result["audit"]["server_seconds"],
+                    "graph_execution": result["audit"].get("graph_execution"),
                     **{
                         key: value
                         for key, value in result["client_timing"].items()
@@ -934,84 +997,103 @@ def deployment_episode(env, observation, client, args, seed, trace):
         from gr00t.policy.server_client import PolicyClient
 
         slow = PolicyClient(host="127.0.0.1", port=args.slow_port, timeout_ms=120000)
-        records = []
-        for sample_index in range(getattr(args, "slow_warmup_calls", 12)):
-            started = time.monotonic()
-            visual = slow.call_endpoint(
-                "vision",
-                {
-                    "observation": to_nested(observation),
-                    "capture_s": capture,
-                    "source_tick": 0,
-                    "return_features": True,
-                },
-            )
-            assert visual["meta"]["vlm_forward_calls"] == 1
-            timing = release_service(
-                started, time.monotonic(), vision_floor, RealClock()
-            )
-            records.append(
-                {
-                    "rpc_seconds": timing["completed_s"] - started,
-                    **timing,
-                    "sample_index": sample_index,
-                    "excluded": sample_index < 2,
-                    "vlm_seconds": visual["meta"]["vlm_seconds"],
-                    "vlm_forward_calls": 1,
-                    "feature_wire": visual["meta"].get("feature_wire"),
+        try:
+            with remote_feature_session(
+                slow, args.slow_port, feature_transport
+            ) as warmup_leases:
+                records = []
+                for sample_index in range(getattr(args, "slow_warmup_calls", 12)):
+                    started = time.monotonic()
+                    payload = {
+                        "observation": to_nested(observation),
+                        "capture_s": capture,
+                        "source_tick": 0,
+                        "return_features": True,
+                    }
+                    visual = (
+                        warmup_leases.vision(slow.call_endpoint, payload)
+                        if warmup_leases is not None
+                        else slow.call_endpoint("vision", payload)
+                    )
+                    assert visual["meta"]["vlm_forward_calls"] == 1
+                    timing = release_service(
+                        started, time.monotonic(), vision_floor, RealClock()
+                    )
+                    records.append(
+                        {
+                            "rpc_seconds": timing["completed_s"] - started,
+                            **timing,
+                            "sample_index": sample_index,
+                            "excluded": sample_index < 2,
+                            "vlm_seconds": visual["meta"]["vlm_seconds"],
+                            "vlm_forward_calls": 1,
+                            "feature_wire": visual["meta"].get("feature_wire"),
+                            "graph_execution": visual["meta"].get("graph_execution"),
+                        }
+                    )
+                args.slow_warmup = {
+                    "scope": "outside scored control, repeated for each condition/process",
+                    "vision_min_service_ms": vision_floor,
+                    "service_floor_scope": "worker RPC start to visible result; real VLM is computed before any wait",
+                    "calls": records,
+                    "workload": "solo_vlm_without_concurrent_action",
+                    "included_sample_count": sum(
+                        not row["excluded"] for row in records
+                    ),
+                    "rpc_seconds": summarize_values(
+                        [row["rpc_seconds"] for row in records if not row["excluded"]]
+                    ),
+                    "server_vlm_seconds": summarize_values(
+                        [row["vlm_seconds"] for row in records if not row["excluded"]]
+                    ),
                 }
-            )
-        slow.socket.close()
-        slow.context.term()
-        args.slow_warmup = {
-            "scope": "outside scored control, repeated for each condition/process",
-            "vision_min_service_ms": vision_floor,
-            "service_floor_scope": "worker RPC start to visible result; real VLM is computed before any wait",
-            "calls": records,
-            "workload": "solo_vlm_without_concurrent_action",
-            "included_sample_count": sum(not row["excluded"] for row in records),
-            "rpc_seconds": summarize_values(
-                [row["rpc_seconds"] for row in records if not row["excluded"]]
-            ),
-            "server_vlm_seconds": summarize_values(
-                [row["vlm_seconds"] for row in records if not row["excluded"]]
-            ),
-        }
-        (args.output / "slow-warmup.json").write_text(
-            json.dumps(args.slow_warmup, indent=2) + "\n"
-        )
-        calibration_path = args.output / "calibration.json"
-        if calibration_path.exists():
-            calibration = json.loads(calibration_path.read_text())
-            if calibration.get("action_min_service_ms", 0) != action_floor:
-                raise RuntimeError(
-                    "Action service floor changed from saved calibration"
+                (args.output / "slow-warmup.json").write_text(
+                    json.dumps(args.slow_warmup, indent=2) + "\n"
                 )
-            if (
-                calibration.get("feature_rpc", "separate") != feature_rpc
-                or calibration.get("feature_transport", "numpy_fp32")
-                != feature_transport
-            ):
-                raise RuntimeError("Feature transport changed from saved calibration")
-            d = calibration["selected_delay_ticks"]
-        else:
-            d, calibration = calibrate(
-                client,
-                observation,
-                capture,
-                seed,
-                period,
-                visual,
-                args.port,
-                action_min_service_ms=action_floor,
-                feature_rpc=feature_rpc,
-                feature_transport=feature_transport,
-            )
-        args.calibration = (d, calibration)
-        calibration_path.write_text(json.dumps(calibration, indent=2) + "\n")
+                calibration_path = args.output / "calibration.json"
+                if calibration_path.exists():
+                    calibration = json.loads(calibration_path.read_text())
+                    if calibration.get("action_min_service_ms", 0) != action_floor:
+                        raise RuntimeError(
+                            "Action service floor changed from saved calibration"
+                        )
+                    if (
+                        calibration.get("feature_rpc", "separate") != feature_rpc
+                        or calibration.get("feature_transport", "numpy_fp32")
+                        != feature_transport
+                    ):
+                        raise RuntimeError(
+                            "Feature transport changed from saved calibration"
+                        )
+                    d = calibration["selected_delay_ticks"]
+                else:
+                    d, calibration = calibrate(
+                        client,
+                        observation,
+                        capture,
+                        seed,
+                        period,
+                        visual,
+                        args.port,
+                        action_min_service_ms=action_floor,
+                        feature_rpc=feature_rpc,
+                        feature_transport=feature_transport,
+                    )
+                args.calibration = (d, calibration)
+                calibration_path.write_text(json.dumps(calibration, indent=2) + "\n")
+        finally:
+            slow.socket.close()
+            slow.context.term()
     d, calibration = args.calibration
     if fixed_delay is not None:
         d = fixed_delay
+    # Each task can introduce a new VLM graph bucket. Prepare S2 before the
+    # fresh S1 bootstrap capture, for all layouts/transports; no warmup feature
+    # enters the scored mailbox or replaces a scored frame's neural execution.
+    with feature_rpc_client(args.slow_port) as slow:
+        vision_preparation = prepare_episode_vision(
+            slow, to_nested(observation), capture
+        )
     gc.collect()
     observation = env._process_observation(
         env._env.env._get_observations(force_update=True)
@@ -1038,7 +1120,11 @@ def deployment_episode(env, observation, client, args, seed, trace):
         feature_rpc=feature_rpc,
     )
     vision = VisionWorker(
-        args.slow_port, events=events, min_service_ms=vision_floor, max_hz=vision_max_hz
+        args.slow_port,
+        events=events,
+        min_service_ms=vision_floor,
+        max_hz=vision_max_hz,
+        feature_transport=feature_transport,
     )
 
     def advance(action):
@@ -1074,16 +1160,18 @@ def deployment_episode(env, observation, client, args, seed, trace):
     result["bootstrap_forward_counts"] = boot["forward_counts"]
     result["calibration"] = calibration
     result["visual_solo_calibration"] = args.slow_warmup
+    result["vision_preparation"] = vision_preparation
     result["service_controls"] = {
         "action_min_service_ms": action_floor,
         "vision_min_service_ms": vision_floor,
         "vision_max_hz": vision_max_hz,
         "feature_rpc": feature_rpc,
         "feature_transport": feature_transport,
+        "server_layout": getattr(args, "server_layout", "split"),
         "deployment_fixed_delay": fixed_delay,
         "calibrated_delay_ticks": calibration["selected_delay_ticks"],
         "effective_initial_delay_ticks": d,
-        "scope": "real GPU inference with client-visible latency floors; no accelerated or extra model calls",
+        "scope": "real GPU inference with client-visible latency floors; scored calls unchanged, episode preparation reported separately",
     }
     result["cyclic_gc_disabled_during_control"] = True
     return result, frames

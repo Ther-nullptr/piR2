@@ -4,6 +4,8 @@ from collections import OrderedDict
 
 from robotics_kernels.common.graph import CudaGraphCall
 
+from coexecution.optimization.execution.submission import cold_capture
+
 
 class DitGraphs:
     def __init__(self, model, max_entries=64):
@@ -85,7 +87,8 @@ class DitGraphs:
                 graph = CudaGraphCall(function)
             before = graph.captures, graph.replays
             try:
-                result = graph(*(value for value in values if value is not None))
+                with cold_capture(graph.captures == 0):
+                    result = graph(*(value for value in values if value is not None))
             except Exception:
                 self.failure_count += 1
                 self.graphs.pop(bucket, None)

@@ -552,7 +552,10 @@ class PolicyStaticS2:
             graph = self._graph_class(forward, retained_tensors=retained)
         before = graph.captures, graph.replays
         try:
-            features = graph(pixels)
+            from coexecution.optimization.execution.submission import cold_capture
+
+            with cold_capture(graph.captures == 0):
+                features = graph(pixels)
         except BaseException:
             self.counts["graph_failures"] += 1
             self.graphs.clear()

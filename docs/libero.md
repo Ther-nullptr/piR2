@@ -39,9 +39,11 @@ Evaluation provenance hashes both the compatibility entrypoints and the canonica
 runtime implementations. This source-tracking update does not change scheduling,
 episode accounting or protocol semantics. Lightweight contracts live in
 `tests/contracts/`; they use import checks and doubles rather than executing models.
-Enabled optimizations require one serialized worker per process. Separately
-started action and VLM processes can use the same explicitly declared GPU;
-optimized paired workers within one process remain unsupported.
+Each policy requires serial submissions. Separate processes remain the default;
+`--server-layout paired` also supports independent action/VLM policies in one
+process with shared cold-capture coordination. Paired whole-action graphs remain
+unsupported. See [feature transport and placement](timing-protocols.md) for the
+optional bounded `cuda_local` handoff and matched paired/split NumPy controls.
 
 `coexecution/libero/measurement.py` measures official Spatial observations with
 matched runtime modes and precision settings. `profiling.py` accounts for each

@@ -271,6 +271,7 @@ def build_parser():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=5570)
     parser.add_argument("--slow-port", type=int, default=5572)
+    parser.add_argument("--server-layout", choices=("split", "paired"), default="split")
     parser.add_argument("--episodes-per-task", type=int, default=20)
     parser.add_argument(
         "--task-ids", nargs="+", type=int, choices=range(10), default=list(range(10))
@@ -321,6 +322,10 @@ def validate_deployment_controls(args):
     validate_service_floor(args.vision_min_service_ms)
     validate_vision_max_hz(args.vision_max_hz)
     validate_feature_options(args.feature_transport, args.feature_rpc)
+    if args.feature_transport == "cuda_local" and (
+        args.server_layout != "paired" or args.variant != "flow"
+    ):
+        raise ValueError("cuda_local requires paired Flow workers")
     if args.protocol != "deployment" and (
         args.action_min_service_ms
         or args.vision_min_service_ms
@@ -345,8 +350,24 @@ def save_run_configuration(output, config):
             key: {
                 name: value
                 for name, value in identity.items()
-                if name not in {"pid", "cuda_stream"}
+                if name
+                not in {
+                    "pid",
+                    "cuda_stream",
+                    "server_instance",
+                    "policy_instance",
+                    "feature_exchange",
+                }
             }
+            | (
+                {
+                    "feature_exchange": {
+                        "max_leases": identity["feature_exchange"]["max_leases"]
+                    }
+                }
+                if "feature_exchange" in identity
+                else {}
+            )
             for key, identity in identities.items()
         },
     }
@@ -424,6 +445,8 @@ def main():
         "coexecution/libero/service.py",
         "coexecution/libero/scheduling.py",
         "coexecution/libero/features.py",
+        "coexecution/libero/resident.py",
+        "coexecution/optimization/execution/submission.py",
         "scripts/libero_streaming_client.py",
         "scripts/libero_observations.py",
         "upstream/learning/Isaac-GR00T/gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
@@ -434,7 +457,10 @@ def main():
         for name in implementation_files
     }
     if args.protocol == "deployment":
-        from coexecution.libero.features import validate_feature_identity
+        from coexecution.libero.features import (
+            validate_feature_identity,
+            validate_worker_pair,
+        )
 
         config.pop("visual_delay")
         config.pop("action_delay")
@@ -442,6 +468,12 @@ def main():
         config["slow_checkpoint"] = slow.call_endpoint("identity", requires_input=False)
         for worker_identity in (identity, config["slow_checkpoint"]):
             validate_feature_identity(worker_identity, args.feature_transport)
+        validate_worker_pair(
+            identity,
+            config["slow_checkpoint"],
+            args.server_layout,
+            args.feature_transport,
+        )
         if args.feature_rpc == "combined" and "combined" not in identity.get(
             "feature_rpc_modes", []
         ):
@@ -458,6 +490,12 @@ def main():
             "cyclic_gc_disabled_during_control": True,
             "slow_vlm_warmup_calls_per_condition": args.slow_warmup_calls,
             "slow_vlm_calibration_excluded_initial_calls": 2,
+            "episode_vision_preparation": {
+                "calls_per_episode": 1,
+                "scope": "real S2 VLM before fresh S1 bootstrap capture and scored control, for every layout and transport",
+                "publication": "return_features=False; preparation outputs are never published or installed in S1",
+                "evidence": "episode vision_preparation contains original source/clock times, physical VLM count and graph deltas; scored cold captures remain separately reported",
+            },
             "strict_timing_validity": "mean frequency within2%, max lateness and adjacent interval error each<=5ms",
             "fallback": "zero Cartesian delta; retain last committed gripper",
             "flow_publication": "all native clean positions after committed prefix",
@@ -485,6 +523,7 @@ def main():
             },
             "feature_transport_contract": {
                 "encoding": args.feature_transport,
+                "server_layout": args.server_layout,
                 "rpc": args.feature_rpc,
                 "timing_version": 2,
                 "selection": "unchanged completed-feature selection and sequence deduplication; combined replies advance client installation only on success",
@@ -493,7 +532,7 @@ def main():
                 "server_seconds": "server plan wall time after installation; server_request_seconds also includes combined installation",
                 "whole_call": "submission through completion includes executor queue, installation, network and planning in both modes",
                 "clock": "loopback workers and client share the host monotonic clock",
-                "representation": "numpy_bf16 carries existing BF16 bits, preserving other dtypes; independent of model precision",
+                "representation": "numpy_bf16 preserves BF16 bits; cuda_local uses bounded same-process leases, producer completion, consumer event wait and stream ownership; independent of model precision",
             },
         }
     config = save_run_configuration(args.output, config)

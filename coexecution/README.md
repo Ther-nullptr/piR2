@@ -151,10 +151,12 @@ The opt-in numerical suite is
 CUDA environment. This checks execution behavior, not closed-loop task success.
 For full Spatial evaluation, see the declared-condition runner in
 [LIBERO](../docs/libero.md). Separate action and VLM processes can share an
-explicitly declared GPU; optimized paired workers within one process remain
-unsupported.
+explicitly declared GPU. The opt-in `--server-layout paired` service uses two
+independent policy instances/streams and coordinates cold VLM/DiT capture across
+all endpoint CUDA submissions. See [transport and placement](../docs/timing-protocols.md)
+for bounded resident feature leases and the paired NumPy control.
 
-这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；依赖固定版本的 Speedup Paradox 整数后端。当前范围是单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝，同进程并发优化服务也不支持。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
+这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；依赖固定版本的 Speedup Paradox 整数后端。当前范围是每个策略单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝。配对服务使用独立策略实例与流，首次 VLM/DiT capture 通过进程共享协调器排他执行；配对 whole-action graph 仍被拒绝。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
 
 The modules provide instance-local, reversible adaptations. Weight packing happens during installation; activation scales, quantization and packing run online. Integer GEMM uses INT32 accumulation and a fused scale/bias/BF16 output epilogue. Compatible QKV/KV and gate/up projections share preparation. The native dispatch can combine activation preparation with GELU or SiLU-times-up; AdaLN modulation can produce the packed input directly. Fused SDPA remains floating point. No checkpoint, convolution layout, sampling schedule, observation or VLM-cache policy is changed by enabling quantization.
 
@@ -169,7 +171,7 @@ python scripts/serve_libero_protocol.py \
   --quantization-scope all --quantization-category-id 2
 ```
 
-This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` is a separate serial-only option for Flow and πR². It captures only the pure DiT forward; rolling buffers, noise, action decoding and the VLM remain eager: first calls and new tensor signatures capture graphs and must be excluded from timing. The current reference Graph helper is not suitable for concurrent S1/S2 capture. Enabled experimental optimizations therefore reject paired `--vlm-device` workers in one process; default BF16 paired workers remain supported. Close the optimization scope before changing weights or using the policy concurrently.
+This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` requires serial submissions to each Flow or πR² policy. It captures only the pure DiT forward; rolling buffers, noise and action decoding stay outside that graph. First calls and new tensor signatures capture graphs and must be excluded from steady timing. In paired service mode, a process-wide submission coordinator gives cold VLM/DiT graph calls exclusive CUDA access without changing the pinned graph implementation. Steady handlers can overlap. Close the optimization scope before changing weights or using the same policy concurrently.
 
 - `--operator-fusion`: BF16 RoPE/RMSNorm, AdaLN modulation, and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
 - `--vision-channels-last`: independently opt into channels-last-3D inputs and weights for the vision patch Conv3D. This can avoid the `SlowDilated3d` fallback; it preserves tensor values but can change BF16 rounding. The original weight storage, layout and hooks are restored on exit. Compare fusion and integer modes with the same explicit layout setting and measure its action differences separately.

@@ -61,9 +61,6 @@ def test_paired_startup_failure_reaches_parent():
 @pytest.mark.parametrize(
     "flags",
     [
-        ["--operator-fusion"],
-        ["--inference-precision", "w8a8"],
-        ["--dit-cuda-graph"],
         ["--action-cuda-graph"],
     ],
 )
@@ -92,8 +89,33 @@ def test_optimized_paired_service_is_rejected_before_model_loading(
             *flags,
         ],
     )
-    with pytest.raises(ValueError, match="single worker"):
+    with pytest.raises(ValueError, match="paired.*action graph"):
         service.main()
+
+
+@pytest.mark.parametrize(
+    "transport,layout,device,variant",
+    [
+        ("cuda_local", "split", "cuda:0", "flow"),
+        ("cuda_local", "paired", "cuda:1", "flow"),
+        ("cuda_local", "paired", "cuda:0", "pir2"),
+    ],
+)
+def test_resident_unsupported_placement_rejected_without_loading(
+    transport, layout, device, variant
+):
+    from coexecution.libero.service import validate_server_layout
+    from coexecution.optimization.config import OptimizationConfig
+
+    with pytest.raises(ValueError):
+        validate_server_layout(
+            layout,
+            "cuda:0",
+            device if layout == "paired" else None,
+            transport,
+            variant,
+            OptimizationConfig(),
+        )
 
 
 @pytest.mark.parametrize("enabled", [False, True])

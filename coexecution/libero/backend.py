@@ -70,8 +70,22 @@ def endpoint_layout(device, vlm_device, port, vlm_port, role):
 
 
 class Backend:
-    def __init__(self, core, variant, output, feature_transport="numpy_fp32"):
+    def __init__(
+        self,
+        core,
+        variant,
+        output,
+        feature_transport="numpy_fp32",
+        *,
+        feature_exchange=None,
+        role="action",
+        paired=False,
+    ):
         validate_feature_options(feature_transport)
+        if feature_transport == "cuda_local" and (
+            feature_exchange is None or not paired
+        ):
+            raise ValueError("cuda_local requires a paired feature exchange")
         import torch
         from transformers import BatchFeature
 
@@ -85,6 +99,7 @@ class Backend:
         self.cache_meta = {}
         self.cache_install_timing = {}
         self.feature_transport = feature_transport
+        self.feature_exchange, self.role, self.paired = feature_exchange, role, paired
         self.counts = {"vlm": 0, "dit": 0}
         for name, module in [
             ("vlm", core.model.backbone),
@@ -101,6 +116,34 @@ class Backend:
         session = getattr(self, "optimization", None)
         graph = getattr(session, "action_graph", None)
         return None if graph is None else graph.evidence()
+
+    def graph_counters(self):
+        session = getattr(self, "optimization", None)
+        dit, vlm = (
+            getattr(session, "graphs", None),
+            getattr(session, "static_vlm", None),
+        )
+        counts = {} if vlm is None else vlm.counts
+        return {
+            "dit": {
+                key: getattr(dit, key + "_count", 0)
+                for key in ("capture", "replay", "failure")
+            },
+            "vlm": {
+                key: counts.get("graph_" + key + "s", 0)
+                for key in ("capture", "replay", "failure")
+            },
+        }
+
+    def graph_execution(self, before):
+        after = self.graph_counters()
+        evidence = {
+            key + "_delta": {
+                role: after[role][key] - before[role][key] for role in before
+            }
+            for key in ("capture", "replay", "failure")
+        }
+        return {**evidence, "cold_capture": any(evidence["capture_delta"].values())}
 
     @staticmethod
     def raw(actions):
@@ -121,8 +164,29 @@ class Backend:
         self.anchor = None
         self.cache_meta = {}
         self.cache_install_timing = {}
-        self.torch.manual_seed(int((options or {}).get("seed", 1000)))
+        if getattr(self, "role", "action") == "vlm" and getattr(self, "paired", False):
+            # The vision policy is deterministic in eval mode. Its episode reset
+            # must not change the independent action policy's global CUDA RNG.
+            exchange = getattr(self, "feature_exchange", None)
+            if exchange is not None:
+                self.stream.synchronize()
+                exchange.reset()
+        else:
+            self.torch.manual_seed(int((options or {}).get("seed", 1000)))
         return {"reset": True}
+
+    def feature_control(self, operation, session=None):
+        if self.feature_transport != "cuda_local" or self.role != "vlm":
+            raise ValueError(
+                "Resident feature session control belongs to the VLM endpoint"
+            )
+        if operation == "open":
+            return self.feature_exchange.open_session(session)
+        if operation == "close":
+            self.stream.synchronize()
+            self.feature_exchange.close_session(session)
+            return self.feature_exchange.evidence()
+        raise ValueError("Unknown resident feature session operation")
 
     def vision(
         self,
@@ -131,9 +195,23 @@ class Backend:
         source_tick,
         requested_tick=None,
         return_features=True,
+        feature_session=None,
+        released_features=None,
     ):
         validate_feature_meta({"capture_s": capture_s, "source_tick": source_tick})
+        resident = self.feature_transport == "cuda_local" and return_features
+        if resident:
+            if self.role != "vlm":
+                raise ValueError(
+                    "Only the paired VLM endpoint publishes resident features"
+                )
+            self.feature_exchange.release(
+                feature_session, [] if released_features is None else released_features
+            )
+        elif feature_session is not None or released_features is not None:
+            raise ValueError("Feature lease controls require cuda_local publication")
         before = dict(self.counts)
+        execution_before = self.graph_counters()
         self.stream.synchronize()
         started = time.monotonic()
         result = self.core.update_vlm_cache(
@@ -156,8 +234,22 @@ class Backend:
             "frame_hashes": self.frame_hashes(observation),
             "vlm_seconds": time.monotonic() - started,
             "vlm_forward_calls": self.counts["vlm"] - before["vlm"],
+            "graph_execution": self.graph_execution(execution_before),
         }
-        if return_features:
+        if resident:
+            with self.core._vl_cache_lock:
+                if self.core._vl_cache_id != result["cache_id"]:
+                    raise RuntimeError("VLM cache changed before resident publication")
+                result["vl_embeds"], meta = self.feature_exchange.publish_cuda(
+                    feature_session,
+                    self.core._vl_cache,
+                    meta,
+                    torch_module=self.torch,
+                    stream=self.stream,
+                    started_s=started,
+                )
+            result["feature_exchange"] = self.feature_exchange.evidence()
+        elif return_features:
             meta["feature_wire"] = {
                 **feature_evidence(result["vl_embeds"]),
                 "source": "vlm_cache_raw_tensor"
@@ -172,22 +264,31 @@ class Backend:
     def install(self, vl_embeds, meta):
         started = time.monotonic()
         validate_feature_meta(meta)
-        validate_features(vl_embeds)
         imported_meta = deepcopy(meta)
         imported_meta["feature_wire"] = {
             **meta.get("feature_wire", {}),
             **feature_evidence(vl_embeds),
         }
-        features = decode_features(
-            vl_embeds,
-            torch_module=self.torch,
-            device=self.core.model.device,
-            legacy_dtype=self.core.model.dtype,
-        )
-        self.stream.synchronize()
-        cid, _ = self.core._prime_vlm_cache(
-            self.BatchFeature(features), meta["capture_s"]
-        )
+        if getattr(self, "feature_transport", "numpy_fp32") == "cuda_local":
+            with self.feature_exchange.borrow_cuda(
+                vl_embeds, meta, device=self.core.model.device, stream=self.stream
+            ) as features:
+                self.stream.synchronize()
+                cid, _ = self.core._prime_vlm_cache(
+                    self.BatchFeature(features), meta["capture_s"]
+                )
+        else:
+            validate_features(vl_embeds)
+            features = decode_features(
+                vl_embeds,
+                torch_module=self.torch,
+                device=self.core.model.device,
+                legacy_dtype=self.core.model.dtype,
+            )
+            self.stream.synchronize()
+            cid, _ = self.core._prime_vlm_cache(
+                self.BatchFeature(features), meta["capture_s"]
+            )
         self.cache_meta = imported_meta
         self.cache_install_timing = {
             "server_install_started_s": started,
@@ -199,6 +300,7 @@ class Backend:
         self.reset({"seed": seed})
         before = dict(self.counts)
         graph_before = self._action_graph_evidence()
+        execution_before = self.graph_counters()
         self.stream.synchronize()
         started = time.monotonic()
         if self.variant == "pir2":
@@ -227,6 +329,7 @@ class Backend:
         return {
             "actions": self.raw(actions),
             "bootstrap_seconds": time.monotonic() - started,
+            "graph_execution": self.graph_execution(execution_before),
             **action_execution_counts(
                 before, self.counts, graph_before, self._action_graph_evidence()
             ),
@@ -264,6 +367,7 @@ class Backend:
             self.install(vl_embeds, feature_meta)
         before = dict(self.counts)
         graph_before = self._action_graph_evidence()
+        execution_before = self.graph_counters()
         self.stream.synchronize()
         started = time.monotonic()
         if visual is not None:
@@ -390,6 +494,7 @@ class Backend:
                 "server_install_completed_s"
             ),
             "feature_installed_in_request": vl_embeds is not None,
+            "graph_execution": self.graph_execution(execution_before),
             **action_execution_counts(
                 before, self.counts, graph_before, self._action_graph_evidence()
             ),
