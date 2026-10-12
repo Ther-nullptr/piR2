@@ -104,13 +104,18 @@ def graph_interval(before, after, *, expected_replays):
         name + "_delta": after[name + "_count"] - before[name + "_count"]
         for name in ("capture", "replay", "failure")
     }
-    return {
+    result = {
         "enabled": True,
         "passes": deltas
         == {"capture_delta": 0, "replay_delta": expected_replays, "failure_delta": 0},
         "expected_replays": expected_replays,
         **deltas,
     }
+    if "logical_nfe_count" in before or "logical_nfe_count" in after:
+        logical = after.get("logical_nfe_count", 0) - before.get("logical_nfe_count", 0)
+        result["logical_nfe_delta"] = logical
+        result["passes"] = result["passes"] and logical == 4 * expected_replays
+    return result
 
 
 def graph_snapshot(session):
@@ -120,13 +125,18 @@ def graph_snapshot(session):
         if session.static_vlm is None:
             raise RuntimeError("VLM graph enabled without an installed adapter")
         vlm = session.static_vlm.evidence()["vlm_graph"]
-    return {"dit": dit, "vlm": vlm}
+    action = getattr(session, "action_graph", None)
+    return {
+        "dit": dit,
+        "vlm": vlm,
+        "action": None if action is None else action.evidence(),
+    }
 
 
 def complete_graph_interval(before, after):
     result = {
-        name: graph_interval(before[name], after[name], expected_replays=count)
-        for name, count in (("dit", 4), ("vlm", 1))
+        name: graph_interval(before.get(name), after.get(name), expected_replays=count)
+        for name, count in (("dit", 4), ("vlm", 1), ("action", 1))
     }
     return {"passes": all(value["passes"] for value in result.values()), **result}
 

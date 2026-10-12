@@ -171,9 +171,9 @@ def test_graph_snapshots_follow_enabled_runtime_scope():
         static_vlm=SimpleNamespace(evidence=lambda: {"vlm_graph": dict(vlm)}),
         config=SimpleNamespace(vlm_graph=False),
     )
-    assert module.graph_snapshot(session) == {"dit": dit, "vlm": None}
+    assert module.graph_snapshot(session) == {"dit": dit, "vlm": None, "action": None}
     session.config.vlm_graph = True
-    assert module.graph_snapshot(session) == {"dit": dit, "vlm": vlm}
+    assert module.graph_snapshot(session) == {"dit": dit, "vlm": vlm, "action": None}
 
 
 def test_model_timer_waits_for_completion_and_invokes_the_body_once(monkeypatch):

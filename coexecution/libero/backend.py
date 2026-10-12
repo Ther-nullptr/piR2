@@ -12,6 +12,35 @@ from scripts.libero_protocol_scheduler import extra_buffer_shift, project_comman
 KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
 
 
+def action_execution_counts(before, after, graph_before, graph_after):
+    """Keep Python observations separate from verified Flow4 graph evaluations."""
+    physical = {key: after[key] - before[key] for key in before}
+    logical = dict(physical)
+    graph, source = None, "python_forward_hooks"
+    if graph_before is not None or graph_after is not None:
+        if graph_before is None or graph_after is None:
+            raise RuntimeError("Action graph scope changed during a request")
+        graph = {
+            key + "_delta": graph_after[key + "_count"] - graph_before[key + "_count"]
+            for key in ("capture", "replay", "failure", "logical_nfe")
+        }
+        if (
+            graph["failure_delta"] != 0
+            or graph["capture_delta"] < 0
+            or graph["replay_delta"] < 1
+            or graph["logical_nfe_delta"] != 4 * graph["replay_delta"]
+        ):
+            raise RuntimeError(f"Invalid action graph execution evidence: {graph}")
+        logical["dit"] = graph["logical_nfe_delta"]
+        source = "captured_flow4_graph"
+    return {
+        "forward_counts": logical,
+        "python_forward_counts": physical,
+        "dit_count_source": source,
+        "action_graph": graph,
+    }
+
+
 def endpoint_layout(device, vlm_device, port, vlm_port, role):
     """Validate explicit logical CUDA devices; physical mapping comes from the mask."""
     devices = [device] + ([vlm_device] if vlm_device is not None else [])
@@ -52,7 +81,13 @@ class Backend:
             def hook(_m, _i, _o, key=name):
                 self.counts[key] += 1
 
+            hook.__pir2_execution_observer__ = True
             module.register_forward_hook(hook)
+
+    def _action_graph_evidence(self):
+        session = getattr(self, "optimization", None)
+        graph = getattr(session, "action_graph", None)
+        return None if graph is None else graph.evidence()
 
     @staticmethod
     def raw(actions):
@@ -119,6 +154,7 @@ class Backend:
     def bootstrap(self, observation, capture_s, delay_ticks, seed=1000):
         self.reset({"seed": seed})
         before = dict(self.counts)
+        graph_before = self._action_graph_evidence()
         self.stream.synchronize()
         started = time.monotonic()
         if self.variant == "pir2":
@@ -147,7 +183,9 @@ class Backend:
         return {
             "actions": self.raw(actions),
             "bootstrap_seconds": time.monotonic() - started,
-            "forward_counts": {k: self.counts[k] - before[k] for k in before},
+            **action_execution_counts(
+                before, self.counts, graph_before, self._action_graph_evidence()
+            ),
         }
 
     def plan(
@@ -165,6 +203,7 @@ class Backend:
         if not 1 <= d <= 5:
             raise ValueError("Use a declared in-distribution action delay in1..5")
         before = dict(self.counts)
+        graph_before = self._action_graph_evidence()
         self.stream.synchronize()
         started = time.monotonic()
         if visual is not None:
@@ -278,7 +317,9 @@ class Backend:
             "image_delay_ticks": info["image_delay_ticks"],
             "image_delay_ms": info["image_delay_ms"],
             "server_seconds": time.monotonic() - started,
-            "forward_counts": {k: self.counts[k] - before[k] for k in before},
+            **action_execution_counts(
+                before, self.counts, graph_before, self._action_graph_evidence()
+            ),
         }
         expected = (5 if recovered else 1) if self.variant == "pir2" else 4
         if audit["forward_counts"]["dit"] != expected:

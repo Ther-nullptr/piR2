@@ -71,11 +71,14 @@ class ModelTopologyGuard:
 class HostGuardPlan:
     """Discover once; batch owner/header/container checks without hot recursion."""
 
-    def __init__(self, model, *, methods, fields, global_bindings):
+    def __init__(self, model, *, methods, fields, global_bindings, observer_hooks=()):
         self.checks, self.seen, self.attributes, self.owners = [], set(), set(), set()
         self.owner_checks, self.attribute_checks, self.method_checks = [], [], []
         self.tensor_checks, self.function_checks, self.cell_checks = [], [], []
         self.mapping_checks, self.sequence_checks = [], []
+        # Only explicitly admitted observational hooks may update captured
+        # counters. Neural function defaults/closures retain full validation.
+        self.observer_hooks = {id(hook) for hook in observer_hooks}
         self.methods, self.fields, self.global_bindings = (
             methods,
             fields,
@@ -166,6 +169,21 @@ class HostGuardPlan:
         if identity in self.seen:
             return
         self.seen.add(identity)
+        if id(value) in self.observer_hooks:
+            if getattr(value, "__pir2_execution_observer__", False) is not True:
+                raise ValueError("Guard observer hooks must be explicitly tagged")
+            self._append(
+                self.function_checks,
+                (
+                    value,
+                    value.__code__,
+                    value.__defaults__,
+                    value.__kwdefaults__,
+                    value.__closure__,
+                ),
+            )
+            self.attribute(value, "__pir2_execution_observer__")
+            return
         if all(hasattr(value, name) for name in ("shape", "dtype", "device", "stride")):
             self._append(self.tensor_checks, (value, _tensor_state(value)))
         elif isinstance(value, dict):

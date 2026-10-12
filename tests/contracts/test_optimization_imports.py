@@ -17,6 +17,11 @@ import sys
 
 from coexecution import groot_optimization as legacy
 from coexecution.optimization import config, session, tactics
+from coexecution.optimization.groot import action
+from coexecution.optimization.execution import tensor_graph
+
+assert callable(action.ActionGraph)
+assert callable(tensor_graph.TensorGraphCall)
 
 for source, names in (
     (config, ("OptimizationConfig", "add_optimization_arguments", "optimization_config")),

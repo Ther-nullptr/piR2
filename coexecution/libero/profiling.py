@@ -62,13 +62,13 @@ def collect_model_profile(
             if before[name] is None
             else after[name]["replay_count"] - before[name]["replay_count"],
         }
-        for name in ("dit", "vlm")
+        for name in ("dit", "vlm", "action")
     }
     if not all(
         graph_interval(before[name], after[name], expected_replays=count * calls)[
             "passes"
         ]
-        for name, count in (("dit", 4), ("vlm", 1))
+        for name, count in (("dit", 4), ("vlm", 1), ("action", 1))
     ):
         raise RuntimeError(f"Profiler probe recaptured or bypassed a graph: {audit}")
     result = summarize_trace(json.loads(output.read_text()))

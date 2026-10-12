@@ -36,6 +36,7 @@ class GrootOptimizations:
         self.preparation = None
         self.tokenizer_cache = None
         self.graphs = None
+        self.action_graph = None
         self.static_vlm = None
         self.fusion = None
         self._active = False
@@ -187,7 +188,8 @@ class GrootOptimizations:
                 "tactic_policy": "Exact runtime shape, then explicit site/group, then 0",
             }
             clear_cache = controller.clear_projection_cache
-        if self.config.dit_graph:
+        # The larger graph owns the four DiT calls; nested capture is unsupported.
+        if self.config.dit_graph and not self.config.action_graph:
             from coexecution.optimization.execution.graph import DitGraphs
 
             graphs = DitGraphs(model.action_head.model)
@@ -289,11 +291,26 @@ class GrootOptimizations:
                 self._roots, self._clear_cache, reset_modules=self._resets
             )
             self.runtime_stack.callback(self.boundary.close)
+        # Freeze S1 execution only after its submodule serial wrappers exist.
+        # The action scope has its own submission lock; the child boundaries
+        # continue clearing projection groups at each original model call.
+        if self.config.action_graph:
+            from coexecution.optimization.groot.action import ActionGraph
+
+            if self.action_graph is None:
+                self.action_graph = ActionGraph(self.policy)
+            self.runtime_stack.callback(self.action_graph.close)
+            self.action_graph.__enter__()
 
     @contextmanager
     def _runtime_guard(self):
         with ExitStack() as guards:
-            for adapter in (self.preparation, self.tokenizer_cache, self.static_vlm):
+            for adapter in (
+                self.preparation,
+                self.tokenizer_cache,
+                self.static_vlm,
+                self.action_graph,
+            ):
                 if adapter is not None:
                     guards.enter_context(adapter.close_guard())
             yield
@@ -391,6 +408,10 @@ class GrootOptimizations:
                 else self.tokenizer_cache.evidence()
             ),
             "dit_graph": None if self.graphs is None else self.graphs.evidence(),
+            "action_graph": None
+            if self.action_graph is None
+            else self.action_graph.evidence(),
+            "dit_graph_superseded": self.config.action_graph and self.config.dit_graph,
             "static_vlm": (
                 None
                 if self.static_vlm is None or not self.config.static_vlm

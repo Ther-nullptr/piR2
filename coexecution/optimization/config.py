@@ -9,6 +9,7 @@ class OptimizationConfig:
     precision: str = "bf16"
     fusion: bool = False
     dit_graph: bool = False
+    action_graph: bool = False
     scope: str = "transformer"
     category_id: int | None = None
     coverage: Path | None = None
@@ -30,6 +31,8 @@ class OptimizationConfig:
     vlm_graph: bool = False
 
     def __post_init__(self):
+        if self.action_graph and self.precision not in ("bf16", "w8a8", "w4a4"):
+            raise ValueError("Action graph requires BF16, W8A8 or W4A4")
         if self.vlm_graph and not self.static_vlm:
             raise ValueError("VLM graph requires static_vlm")
         if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
@@ -85,6 +88,7 @@ class OptimizationConfig:
             self.precision != "bf16"
             or self.fusion
             or self.dit_graph
+            or self.action_graph
             or self.vision_channels_last
             or self.input_preparation
             or self.tokenizer_cache
@@ -93,6 +97,8 @@ class OptimizationConfig:
         )
 
     def validate_variant(self, variant):
+        if self.action_graph and variant != "flow":
+            raise ValueError("Action graph requires non-streaming Flow4")
         if variant == "pir2" and self.group_conditioning:
             raise ValueError("Streaming piR2 condition grouping is not validated")
 
@@ -105,6 +111,7 @@ def add_optimization_arguments(parser):
     )
     parser.add_argument("--operator-fusion", action="store_true")
     parser.add_argument("--dit-cuda-graph", action="store_true")
+    parser.add_argument("--action-cuda-graph", action="store_true")
     parser.add_argument(
         "--quantization-scope", choices=["transformer", "all"], default="transformer"
     )
@@ -135,6 +142,7 @@ def optimization_config(args):
         precision=args.inference_precision,
         fusion=args.operator_fusion,
         dit_graph=args.dit_cuda_graph,
+        action_graph=args.action_cuda_graph,
         scope=args.quantization_scope,
         component=args.quantization_component,
         category_id=args.quantization_category_id,

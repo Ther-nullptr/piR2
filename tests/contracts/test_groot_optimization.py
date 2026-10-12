@@ -238,6 +238,9 @@ def runtime_interface(monkeypatch):
             super().__init__(actual_policy)
             self.cuda_graph, self.vision_rope = cuda_graph, vision_rope
 
+    class Action(Adapter):
+        label = "action"
+
     class Boundary:
         def __init__(self, *args, **kwargs):
             self.closed = False
@@ -285,6 +288,7 @@ def runtime_interface(monkeypatch):
             {"TokenizerCacheScope": Tokenizer},
         ),
         ("coexecution.optimization.groot.vlm", {"PolicyStaticS2": Static}),
+        ("coexecution.optimization.groot.action", {"ActionGraph": Action}),
         ("coexecution.optimization.execution.graph", {"DitGraphs": Graphs}),
         ("coexecution.optimization.groot.floating", {"FloatingProjections": Floating}),
         (
@@ -300,6 +304,70 @@ def runtime_interface(monkeypatch):
         "coexecution.optimization.session.preflight_backend", lambda *args: {}
     )
     return SimpleNamespace(policy=policy, model=model, events=events, failures=failures)
+
+
+def test_action_graph_installs_after_boundary_and_supersedes_nested_dit(
+    runtime_interface,
+):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(action_graph=True, dit_graph=True),
+    ) as session:
+        assert session.graphs is None
+        assert session.evidence()["dit_graph_superseded"]
+        assert runtime_interface.events == [
+            "created boundary",
+            "created action",
+            "entered action",
+        ]
+        assert session.evidence()["action_graph"] == {"adapter": "action"}
+        runtime_interface.events.clear()
+        session.set_runtime(input_preparation=True)
+        assert runtime_interface.events == [
+            "closed boundary",
+            "closed action",
+            "created preparation",
+            "entered preparation",
+            "created boundary",
+            "entered action",
+        ]
+    assert runtime_interface.events[-3:] == [
+        "closed boundary",
+        "closed action",
+        "closed preparation",
+    ]
+
+
+def test_live_action_call_prevents_runtime_switch_and_session_close(runtime_interface):
+    with GrootOptimizations(
+        runtime_interface.policy,
+        OptimizationConfig(action_graph=True),
+    ) as session:
+        previous = list(runtime_interface.events)
+        session.action_graph.active_call = True
+        for operation in (
+            session.close,
+            lambda: session.set_runtime(input_preparation=True),
+        ):
+            with pytest.raises(RuntimeError, match="active call"):
+                operation()
+            assert runtime_interface.events == previous
+            assert not session.boundary.closed
+        session.action_graph.active_call = False
+
+
+def test_action_install_failure_restores_runtime_transaction(runtime_interface):
+    runtime_interface.failures.append("action")
+    with (
+        pytest.raises(RuntimeError, match="action installation failed"),
+        GrootOptimizations(
+            runtime_interface.policy,
+            OptimizationConfig(action_graph=True, input_preparation=True),
+        ),
+    ):
+        pass
+    assert "closed boundary" in runtime_interface.events
+    assert "closed preparation" in runtime_interface.events
 
 
 def test_tokenizer_and_preparation_install_before_outer_boundary(runtime_interface):

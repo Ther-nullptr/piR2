@@ -75,6 +75,39 @@ same-precision actions and checks that timed graph calls replay without capture.
 It requires CUDA, the official Spatial task checkpoint and its dataset; profiler
 output and numerical archives stay local.
 
+`--action-cuda-graph` additionally captures S1 visual/state conditioning and the
+unchanged four-step Flow action head. It supports BF16, W8A8 and W4A4, requires
+non-streaming H40, and preserves the policy's decoded horizon and output API.
+The adapter calls the pinned upstream algorithm with one fresh explicit noise
+tensor per request, including the first capture. Features, state, embodiment ID
+and masks are copied freshly; validated integer image delay is part of the
+bounded eight-entry graph signature along with shape, dtype, stride and stream.
+Inpaint, rolling/streaming requests and unknown options or hooks are rejected.
+Scheduler state, cache timestamps, noise generation and policy decoding remain
+outside the graph. Returned tensors have independent storage.
+
+When both graph flags are selected, the action graph supersedes the inner
+`--dit-cuda-graph`; evidence reports this explicitly. Runtime mode changes close
+and recapture action graphs after installing new serial boundaries. Warm each
+signature before measuring. Capture failures propagate and the adapter stays
+installed until explicit scope close, with no automatic eager fallback. Close
+before replacing weights, methods or attention settings; tracked mutations are
+rejected, while untracked `.data`/foreign writes are outside the frozen scope
+contract. CUDA callers must establish input/weight readiness on their stream.
+
+Service audits preserve `python_forward_counts` as physical hook observations.
+For the larger graph, `forward_counts.dit` is the logical NFE proved by four DiT
+calls in every captured Flow body and explicit replay counts; `dit_count_source`
+and `action_graph` identify that source. Warmup/capture hooks and logical request
+work are separate. The measurement and profiler modules require one whole-action
+replay and four logical evaluations per timed call. Select the same graph flag
+for BF16 and quantized comparisons; these execution checks establish neither
+quantization quality nor closed-loop success.
+
+Run `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_action_graph_gpu.py` in the
+pinned CUDA environment for full-action/RNG, freshness, stride/stream, output
+lifetime, failure, frozen-execution and restoration gates.
+
 The opt-in numerical suite is
 `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_policy_vlm_gpu.py` in the pinned
 CUDA environment. This checks execution behavior, not closed-loop task success.

@@ -60,7 +60,12 @@ def test_paired_startup_failure_reaches_parent():
 
 @pytest.mark.parametrize(
     "flags",
-    [["--operator-fusion"], ["--inference-precision", "w8a8"], ["--dit-cuda-graph"]],
+    [
+        ["--operator-fusion"],
+        ["--inference-precision", "w8a8"],
+        ["--dit-cuda-graph"],
+        ["--action-cuda-graph"],
+    ],
 )
 @pytest.mark.parametrize("vlm_device", ["cuda:0", "cuda:1"])
 def test_optimized_paired_service_is_rejected_before_model_loading(

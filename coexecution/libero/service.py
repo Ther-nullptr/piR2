@@ -75,6 +75,7 @@ def serve(backend, spec, identity, optimization=None):
         torch.cuda.stream(backend.stream),
         GrootOptimizations(backend.core, optimization) as optimized,
     ):
+        backend.optimization = optimized
         if optimized.config.enabled:
             identity["inference_optimization"] = optimized.evidence()
             (backend.output / "identity.json").write_text(
