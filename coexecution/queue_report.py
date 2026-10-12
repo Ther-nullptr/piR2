@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from itertools import pairwise
 from pathlib import Path
 
+from coexecution.libero.features import feature_use_time
+
 
 def read_json(path, default=None):
     return json.loads(path.read_text()) if path.exists() else default
@@ -215,6 +217,7 @@ def summarize_episode(events, metadata):
         done = completion.get(k, {})
         timing = consumed.get(k, {}).get("client_timing", {})
         actual = {**done, **timing}
+        use_boundary, use_time = feature_use_time(actual)
         finish = done.get("t_s")
         censored = finish is None or finish > stop
         if not censored:
@@ -243,7 +246,16 @@ def summarize_episode(events, metadata):
                 "feature_capture_s": relative(actual.get("feature_capture_s")),
                 "state_capture_s": relative(actual.get("state_capture_s")),
                 "state_tick": actual.get("state_tick"),
-                "use_s": relative(timing.get("plan_rpc_started_s")),
+                "use_s": relative(use_time),
+                "use_boundary": use_boundary,
+                "timing_version": actual.get("timing_version", 1),
+                "plan_rpc_started_s": relative(timing.get("plan_rpc_started_s")),
+                "server_install_started_s": relative(
+                    actual.get("server_install_started_s")
+                ),
+                "server_install_completed_s": relative(
+                    actual.get("server_install_completed_s")
+                ),
                 "delay_ticks": row.get("delay_ticks"),
                 "valid_start_tick": lower,
                 "valid_end_tick": upper,
@@ -275,8 +287,12 @@ def summarize_episode(events, metadata):
     cache_samples = []
     for row in by_kind["request_completed"] + by_kind["unused_result_at_episode_end"]:
         timing = row.get("client_timing", {})
-        when = timing.get("plan_rpc_started_s", timing.get("started_s"))
-        age = timing.get("cache_age_at_request_ms")
+        boundary, when = feature_use_time(timing)
+        age = timing.get(
+            "cache_age_at_server_plan_ms"
+            if boundary == "server_plan_started_s"
+            else "cache_age_at_request_ms"
+        )
         if when is not None and age is not None and start <= when < stop:
             cache_samples.append(
                 {
@@ -1044,7 +1060,7 @@ def export_report(input_path, output, include_diagnostics=False, no_figures=Fals
         "method": {
             "独占容量": "完整独占 RPC 校准样本算术均值的倒数；排除预热调用，不做频率到容量的线性外推。",
             "延迟统计": "仅统计控制开始至结束内接纳且完成的请求；跨越结束时刻的请求保留为截尾条，不进入主延迟分位数。",
-            "使用缓存": "DiT plan RPC 开始时实际选中特征的年龄；包含最终未被接纳的已提交请求。",
+            "使用缓存": "优先使用服务器安装完成后的 plan 开始边界；旧日志仍用实际 plan RPC 开始边界并注明 use_boundary。包含最终未被接纳的已提交请求。",
             "执行年龄": "执行动作按 executed_slot.producer_request_tick 追溯生产请求，不能用最新缓存代替。启动动作使用真实初始采集时刻；fallback 或来源缺失保持未知。汇总按执行 tick 采样。",
             "依赖关系": "S1 只采用 action_completed / client_timing 的 feature_sequence；S2 按 source_tick、capture_s、rpc_completed_s 精确对应缓存发布，禁止按时间接近猜测。",
             "时间戳": "请求、初始采集和 feature_updates 使用相对控制起点的秒数；camera_queue 保留原始绝对采集时刻，但状态快照只选择不晚于游标的事件。",

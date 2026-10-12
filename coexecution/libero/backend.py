@@ -4,9 +4,19 @@ import hashlib
 import json
 import re
 import time
+from copy import deepcopy
 
 import numpy as np
 
+from coexecution.libero.features import (
+    TIMING_VERSION,
+    decode_features,
+    encode_features,
+    feature_evidence,
+    validate_feature_meta,
+    validate_feature_options,
+    validate_features,
+)
 from scripts.libero_protocol_scheduler import extra_buffer_shift, project_commands
 
 KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
@@ -60,7 +70,8 @@ def endpoint_layout(device, vlm_device, port, vlm_port, role):
 
 
 class Backend:
-    def __init__(self, core, variant, output):
+    def __init__(self, core, variant, output, feature_transport="numpy_fp32"):
+        validate_feature_options(feature_transport)
         import torch
         from transformers import BatchFeature
 
@@ -72,6 +83,8 @@ class Backend:
         self.output = output
         self.anchor = None
         self.cache_meta = {}
+        self.cache_install_timing = {}
+        self.feature_transport = feature_transport
         self.counts = {"vlm": 0, "dit": 0}
         for name, module in [
             ("vlm", core.model.backbone),
@@ -107,6 +120,7 @@ class Backend:
             self.core._vl_cache_t_image_capture = None
         self.anchor = None
         self.cache_meta = {}
+        self.cache_install_timing = {}
         self.torch.manual_seed(int((options or {}).get("seed", 1000)))
         return {"reset": True}
 
@@ -118,13 +132,23 @@ class Backend:
         requested_tick=None,
         return_features=True,
     ):
+        validate_feature_meta({"capture_s": capture_s, "source_tick": source_tick})
         before = dict(self.counts)
         self.stream.synchronize()
         started = time.monotonic()
         result = self.core.update_vlm_cache(
-            observation, return_features=return_features, t_image_capture=capture_s
+            observation,
+            return_features=return_features and self.feature_transport == "numpy_fp32",
+            t_image_capture=capture_s,
         )
         self.stream.synchronize()
+        if return_features and self.feature_transport == "numpy_bf16":
+            with self.core._vl_cache_lock:
+                if self.core._vl_cache_id != result["cache_id"]:
+                    raise RuntimeError("VLM cache changed before its feature snapshot")
+                result["vl_embeds"] = encode_features(
+                    self.core._vl_cache, self.feature_transport, torch_module=self.torch
+                )
         meta = {
             "capture_s": capture_s,
             "source_tick": source_tick,
@@ -133,23 +157,43 @@ class Backend:
             "vlm_seconds": time.monotonic() - started,
             "vlm_forward_calls": self.counts["vlm"] - before["vlm"],
         }
+        if return_features:
+            meta["feature_wire"] = {
+                **feature_evidence(result["vl_embeds"]),
+                "source": "vlm_cache_raw_tensor"
+                if self.feature_transport == "numpy_bf16"
+                else "upstream_return_features",
+            }
         self.cache_meta = meta
+        self.cache_install_timing = {}
         result["meta"] = meta
         return result
 
     def install(self, vl_embeds, meta):
-        features = {}
-        for k, v in vl_embeds.items():
-            t = self.torch.from_numpy(v).to(self.core.model.device)
-            if t.dtype.is_floating_point:
-                t = t.to(self.core.model.dtype)
-            features[k] = t
+        started = time.monotonic()
+        validate_feature_meta(meta)
+        validate_features(vl_embeds)
+        imported_meta = deepcopy(meta)
+        imported_meta["feature_wire"] = {
+            **meta.get("feature_wire", {}),
+            **feature_evidence(vl_embeds),
+        }
+        features = decode_features(
+            vl_embeds,
+            torch_module=self.torch,
+            device=self.core.model.device,
+            legacy_dtype=self.core.model.dtype,
+        )
         self.stream.synchronize()
         cid, _ = self.core._prime_vlm_cache(
             self.BatchFeature(features), meta["capture_s"]
         )
-        self.cache_meta = dict(meta)
-        return {"cache_id": cid}
+        self.cache_meta = imported_meta
+        self.cache_install_timing = {
+            "server_install_started_s": started,
+            "server_install_completed_s": time.monotonic(),
+        }
+        return {"cache_id": cid, **self.cache_install_timing}
 
     def bootstrap(self, observation, capture_s, delay_ticks, seed=1000):
         self.reset({"seed": seed})
@@ -197,11 +241,27 @@ class Backend:
         state_capture_s,
         visual=None,
         output_scope="native",
+        vl_embeds=None,
+        feature_meta=None,
     ):
+        request_started = time.monotonic()
         r = int(request_tick)
         d = int(delay_ticks)
         if not 1 <= d <= 5:
             raise ValueError("Use a declared in-distribution action delay in1..5")
+        if (vl_embeds is None) != (feature_meta is None):
+            raise ValueError(
+                "Combined feature payload and metadata must be supplied together"
+            )
+        if visual is not None and vl_embeds is not None:
+            raise ValueError("Choose an image or an encoded feature, not both")
+        candidate_meta = feature_meta if vl_embeds is not None else visual
+        if candidate_meta is not None:
+            validate_feature_meta(
+                candidate_meta, state_capture_s=state_capture_s, request_tick=r
+            )
+        if vl_embeds is not None:
+            self.install(vl_embeds, feature_meta)
         before = dict(self.counts)
         graph_before = self._action_graph_evidence()
         self.stream.synchronize()
@@ -217,8 +277,9 @@ class Backend:
             )
         if not self.cache_meta:
             raise RuntimeError("VLM cache is empty")
-        if self.cache_meta["capture_s"] > state_capture_s + 1e-6:
-            raise ValueError("Future image cannot condition an older state")
+        validate_feature_meta(
+            self.cache_meta, state_capture_s=state_capture_s, request_tick=r
+        )
         shifted = 0
         recovered = False
         if self.variant == "pir2":
@@ -317,6 +378,18 @@ class Backend:
             "image_delay_ticks": info["image_delay_ticks"],
             "image_delay_ms": info["image_delay_ms"],
             "server_seconds": time.monotonic() - started,
+            "timing_version": TIMING_VERSION,
+            "feature_use_boundary": "server_plan_started_s",
+            "server_request_started_s": request_started,
+            "server_plan_started_s": started,
+            "server_request_seconds": time.monotonic() - request_started,
+            "server_install_started_s": self.cache_install_timing.get(
+                "server_install_started_s"
+            ),
+            "server_install_completed_s": self.cache_install_timing.get(
+                "server_install_completed_s"
+            ),
+            "feature_installed_in_request": vl_embeds is not None,
             **action_execution_counts(
                 before, self.counts, graph_before, self._action_graph_evidence()
             ),

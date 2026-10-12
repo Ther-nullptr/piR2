@@ -293,8 +293,11 @@ def test_cli_uses_explicit_paths_and_writes_only_derived_tables(tmp_path, capsys
     assert json.loads(capsys.readouterr().out)["episodes"] == 1
 
 
-def test_optional_raw_audit_checks_source_ids_and_detects_mismatch(tmp_path):
-    item = episode(requests=[request(0, 0, 0.05)])
+@pytest.mark.parametrize("server_start", [None, 10.07])
+def test_optional_raw_audit_checks_source_ids_and_detects_mismatch(
+    tmp_path, server_start
+):
+    item = episode(requests=[request(0, 0, 0.05 if server_start is None else 0.07)])
     raw_dir = tmp_path / "parallel" / "trial"
     raw_dir.mkdir(parents=True)
     path = raw_dir / "episode-a-trace.jsonl"
@@ -309,7 +312,11 @@ def test_optional_raw_audit_checks_source_ids_and_detects_mismatch(tmp_path):
         {
             "kind": "request_completed",
             "audit": {"request_tick": 0},
-            "client_timing": {"feature_sequence": 0, "plan_rpc_started_s": 10.05},
+            "client_timing": {
+                "feature_sequence": 0,
+                "plan_rpc_started_s": 10.05,
+                "server_plan_started_s": server_start,
+            },
         },
     ]
     path.write_text("\n".join(json.dumps(r) for r in raw))

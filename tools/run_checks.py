@@ -34,6 +34,7 @@ def main():
         "tests/contracts/test_policy_measurement.py",
         "tests/contracts/test_libero_profiling.py",
         "tests/contracts/test_libero_experiments.py",
+        "tests/contracts/test_feature_transport.py",
         "tests/contracts/test_vision_admission_configuration.py",
         "tests/contracts/test_dit_graph_buckets.py",
         "tests/contracts/test_action_graph.py",

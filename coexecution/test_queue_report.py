@@ -119,7 +119,10 @@ def test_due_deadline_miss_remains_observed_when_result_finishes_after_end():
     assert out["miss_events"][0]["t"] == pytest.approx(0.8)
 
 
-def test_consumed_feature_comes_from_completion_and_client_timing_not_submission():
+@pytest.mark.parametrize("server_start", [None, 10.03])
+def test_consumed_feature_comes_from_completion_and_client_timing_not_submission(
+    server_start,
+):
     rows = [
         event(
             "control_start",
@@ -153,6 +156,7 @@ def test_consumed_feature_comes_from_completion_and_client_timing_not_submission
             audit={"request_tick": 0},
             client_timing={
                 "plan_rpc_started_s": 10.02,
+                "server_plan_started_s": server_start,
                 "feature_sequence": 3,
                 "feature_capture_s": 9.7,
                 "state_capture_s": 9.9,
@@ -166,7 +170,10 @@ def test_consumed_feature_comes_from_completion_and_client_timing_not_submission
     assert request["feature_sequence"] == 3
     assert request["feature_capture_s"] == pytest.approx(-0.3)
     assert request["state_capture_s"] == pytest.approx(-0.1)
-    assert request["use_s"] == pytest.approx(0.02)
+    assert request["use_s"] == pytest.approx(0.02 if server_start is None else 0.03)
+    assert request["use_boundary"] == (
+        "plan_rpc_started_s" if server_start is None else "server_plan_started_s"
+    )
     assert unknown["feature_sequence"] is None
     assert unknown["feature_capture_s"] is None
     assert out["initial_capture_s"] == pytest.approx(-0.2)

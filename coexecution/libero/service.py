@@ -8,6 +8,12 @@ import threading
 from pathlib import Path
 
 from coexecution.libero.backend import Backend, endpoint_layout
+from coexecution.libero.features import (
+    SCHEMA,
+    SCHEMA_VERSION,
+    TIMING_VERSION,
+    add_feature_arguments,
+)
 from coexecution.optimization.config import (
     add_optimization_arguments,
     optimization_config,
@@ -142,6 +148,7 @@ def main():
     )
     parser.add_argument("--vlm-port", type=int)
     parser.add_argument("--torch-threads", type=int, default=2)
+    add_feature_arguments(parser)
     add_optimization_arguments(parser)
     args = parser.parse_args()
     optimization = optimization_config(args)
@@ -169,7 +176,9 @@ def main():
         output.mkdir(parents=True, exist_ok=True)
         core = load_core(args.checkpoint, output, spec["device"])
         horizons = policy_horizons(core, args.variant)
-        backend = Backend(core, args.variant, output)
+        backend = Backend(
+            core, args.variant, output, feature_transport=args.feature_transport
+        )
         identity = {
             **base_identity,
             **horizons,
@@ -181,7 +190,22 @@ def main():
             "cuda_stream": backend.stream.cuda_stream,
             "paired_same_process": len(layout) > 1,
             "stream_local_synchronization": True,
-            "feature_transport": "CPU numpy RPC, identical for single/dual layouts",
+            "feature_transport": args.feature_transport,
+            "feature_wire": {
+                "schema": SCHEMA
+                if args.feature_transport == "numpy_bf16"
+                else "legacy_numpy_dict",
+                "version": SCHEMA_VERSION
+                if args.feature_transport == "numpy_bf16"
+                else None,
+                "source": "vlm_cache_raw_tensor"
+                if args.feature_transport == "numpy_bf16"
+                else "upstream_return_features",
+                "payload_bytes_evidence": "response meta.feature_wire.payload_nbytes; array storage only",
+                "installation": "owned tensors on endpoint CUDA stream, complete before plan",
+            },
+            "feature_rpc_modes": ["separate", "combined"],
+            "timing_version": TIMING_VERSION,
         }
         (output / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
         workers.append((backend, spec, identity, optimization))

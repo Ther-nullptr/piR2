@@ -19,6 +19,11 @@ _ROOT = str(Path(__file__).resolve().parents[1])
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from coexecution.libero.features import (
+    TIMING_VERSION,
+    validate_feature_meta,
+    validate_feature_options,
+)
 from coexecution.libero.scheduling import (
     AdmissionSchedule,
 )
@@ -241,6 +246,9 @@ class VisionWorker:
                         "source_tick": observation.tick,
                         "capture_s": observation.capture_s,
                         "server_vlm_seconds": result["meta"]["vlm_seconds"],
+                        "feature_wire": result["meta"].get("feature_wire"),
+                        "frame_hashes": result["meta"].get("frame_hashes"),
+                        "requested_tick": result["meta"].get("requested_tick"),
                     }
                 )
                 with self.condition:
@@ -312,14 +320,22 @@ class VisionWorker:
 
 class ActionWorker:
     def __init__(
-        self, port, events=None, initial_feature=None, min_service_ms=0, clock=None
+        self,
+        port,
+        events=None,
+        initial_feature=None,
+        min_service_ms=0,
+        clock=None,
+        feature_rpc="separate",
     ):
         validate_service_floor(min_service_ms)
+        validate_feature_options(rpc=feature_rpc)
         self.port = port
         self.min_service_ms = min_service_ms
         self.clock = clock or RealClock()
         self.events = events or QueueTrace(clock=self.clock.now)
         self.initial_feature = initial_feature
+        self.feature_rpc = feature_rpc
         self.local = threading.local()
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.completed = []
@@ -357,6 +373,12 @@ class ActionWorker:
         client = self.local.client
         started = self.clock.now()
         selected = visual if visual is not None else self.local.feature
+        if selected is not None:
+            validate_feature_meta(
+                selected["meta"],
+                state_capture_s=observation.capture_s,
+                request_tick=observation.tick,
+            )
         self.events.emit(
             "action_started",
             t_s=started,
@@ -368,25 +390,46 @@ class ActionWorker:
             deadline_s=deadline_s,
             **feature_dependency(selected),
         )
-        if visual is not None and visual["sequence"] != self.local.installed:
+        new_feature = visual is not None and visual["sequence"] != self.local.installed
+        payload = {
+            "observation": {"state": to_nested(observation.data)["state"]},
+            "request_tick": r,
+            "delay_ticks": d,
+            "committed_actions": prefix,
+            "state_capture_s": observation.capture_s,
+            "output_scope": "native",
+        }
+        if new_feature and self.feature_rpc == "separate":
             client.call_endpoint(
                 "install", {"vl_embeds": visual["vl_embeds"], "meta": visual["meta"]}
             )
             self.local.installed = visual["sequence"]
             self.local.feature = visual
+        elif new_feature:
+            payload.update(vl_embeds=visual["vl_embeds"], feature_meta=visual["meta"])
         plan_rpc_start = self.clock.now()
-        result = client.call_endpoint(
-            "plan",
-            {
-                "observation": {"state": to_nested(observation.data)["state"]},
-                "request_tick": r,
-                "delay_ticks": d,
-                "committed_actions": prefix,
-                "state_capture_s": observation.capture_s,
-                "output_scope": "native",
-            },
-        )
+        result = client.call_endpoint("plan", payload)
+        if new_feature and self.feature_rpc == "combined":
+            self.local.installed = visual["sequence"]
+            self.local.feature = visual
         raw_completed = self.clock.now()
+        server_start = result["audit"].get("server_plan_started_s")
+        server_timing = {
+            "timing_version": TIMING_VERSION if server_start is not None else 1,
+            "feature_rpc": self.feature_rpc,
+            "feature_use_boundary": "server_plan_started_s"
+            if server_start is not None
+            else "plan_rpc_started_s",
+            **{
+                name: result["audit"].get(name)
+                for name in (
+                    "server_request_started_s",
+                    "server_install_started_s",
+                    "server_install_completed_s",
+                    "server_plan_started_s",
+                )
+            },
+        }
         actual_feature = {
             "sequence": selected.get("sequence") if selected else None,
             "meta": result["audit"]["cache"],
@@ -411,6 +454,7 @@ class ActionWorker:
             **timing,
             "deadline_s": deadline_s,
             "plan_rpc_started_s": plan_rpc_start,
+            **server_timing,
             "state_tick": observation.tick,
             "state_capture_s": observation.capture_s,
             **feature_dependency(actual_feature),
@@ -420,6 +464,16 @@ class ActionWorker:
             "state_age_at_request_ms": max(
                 0.0, (plan_rpc_start - observation.capture_s) * 1000
             ),
+            "cache_age_at_server_plan_ms": max(
+                0.0, (server_start - result["audit"]["cache"]["capture_s"]) * 1000
+            )
+            if server_start is not None
+            else None,
+            "state_age_at_server_plan_ms": max(
+                0.0, (server_start - observation.capture_s) * 1000
+            )
+            if server_start is not None
+            else None,
         }
         self.events.emit(
             "action_completed",
@@ -435,6 +489,7 @@ class ActionWorker:
             request_elapsed_s=completed - submitted_s,
             worker_elapsed_s=completed - started,
             **timing,
+            **server_timing,
             **feature_dependency(actual_feature),
         )
         self.completed.append(result)
@@ -760,6 +815,8 @@ def calibrate(
     port,
     action_min_service_ms=0,
     clock=None,
+    feature_rpc="separate",
+    feature_transport="numpy_fp32",
 ):
     clock = clock or RealClock()
     boot = client.call_endpoint(
@@ -774,7 +831,9 @@ def calibrate(
     queue = CommandTimeline(boot["actions"])
     samples = []
     raw_samples = []
-    actor = ActionWorker(port, min_service_ms=action_min_service_ms, clock=clock)
+    actor = ActionWorker(
+        port, min_service_ms=action_min_service_ms, clock=clock, feature_rpc=feature_rpc
+    )
     try:
         for tick in range(12):
             prefix = queue.reserve(tick, 1)
@@ -813,6 +872,16 @@ def calibrate(
                             "raw_target_overrun_seconds",
                             "target_overrun_seconds",
                             "floor_miss",
+                            "plan_rpc_started_s",
+                            "server_request_started_s",
+                            "server_install_started_s",
+                            "server_install_completed_s",
+                            "server_plan_started_s",
+                            "feature_use_boundary",
+                            "timing_version",
+                            "feature_rpc",
+                            "cache_age_at_request_ms",
+                            "cache_age_at_server_plan_ms",
                         }
                     },
                 }
@@ -842,6 +911,8 @@ def calibrate(
         "over_training_budget": ood,
         "includes_cache_install_and_thread_queue": True,
         "action_min_service_ms": action_min_service_ms,
+        "feature_rpc": feature_rpc,
+        "feature_transport": feature_transport,
         "service_floor_scope": "submission to visible result, including executor queue, install and plan; raw server time unchanged",
         "workload": "solo_action_with_cache_install_without_concurrent_vlm",
         "scope": "warm GPU/RPC timing; reset and fresh sensor capture follow before scored control",
@@ -855,6 +926,8 @@ def deployment_episode(env, observation, client, args, seed, trace):
     action_floor = getattr(args, "action_min_service_ms", 0)
     vision_floor = getattr(args, "vision_min_service_ms", 0)
     vision_max_hz = getattr(args, "vision_max_hz", 0)
+    feature_rpc = getattr(args, "feature_rpc", "separate")
+    feature_transport = getattr(args, "feature_transport", "numpy_fp32")
     fixed_delay = getattr(args, "deployment_fixed_delay", None)
     capture = time.monotonic()
     if not hasattr(args, "slow_warmup"):
@@ -885,6 +958,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
                     "excluded": sample_index < 2,
                     "vlm_seconds": visual["meta"]["vlm_seconds"],
                     "vlm_forward_calls": 1,
+                    "feature_wire": visual["meta"].get("feature_wire"),
                 }
             )
         slow.socket.close()
@@ -913,6 +987,12 @@ def deployment_episode(env, observation, client, args, seed, trace):
                 raise RuntimeError(
                     "Action service floor changed from saved calibration"
                 )
+            if (
+                calibration.get("feature_rpc", "separate") != feature_rpc
+                or calibration.get("feature_transport", "numpy_fp32")
+                != feature_transport
+            ):
+                raise RuntimeError("Feature transport changed from saved calibration")
             d = calibration["selected_delay_ticks"]
         else:
             d, calibration = calibrate(
@@ -924,6 +1004,8 @@ def deployment_episode(env, observation, client, args, seed, trace):
                 visual,
                 args.port,
                 action_min_service_ms=action_floor,
+                feature_rpc=feature_rpc,
+                feature_transport=feature_transport,
             )
         args.calibration = (d, calibration)
         calibration_path.write_text(json.dumps(calibration, indent=2) + "\n")
@@ -953,6 +1035,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
             "meta": {"capture_s": capture, "source_tick": 0},
         },
         min_service_ms=action_floor,
+        feature_rpc=feature_rpc,
     )
     vision = VisionWorker(
         args.slow_port, events=events, min_service_ms=vision_floor, max_hz=vision_max_hz
@@ -995,6 +1078,8 @@ def deployment_episode(env, observation, client, args, seed, trace):
         "action_min_service_ms": action_floor,
         "vision_min_service_ms": vision_floor,
         "vision_max_hz": vision_max_hz,
+        "feature_rpc": feature_rpc,
+        "feature_transport": feature_transport,
         "deployment_fixed_delay": fixed_delay,
         "calibrated_delay_ticks": calibration["selected_delay_ticks"],
         "effective_initial_delay_ticks": d,

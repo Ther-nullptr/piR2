@@ -116,6 +116,54 @@ def test_omitted_vision_rate_preserves_existing_evaluator_command(plan):
     assert "--vision-max-hz" not in commands["evaluate"]
 
 
+def test_feature_controls_reach_workers_and_deployment_without_weight_flags(plan):
+    plan["feature_transport"] = "numpy_bf16"
+    plan["feature_rpc"] = "combined"
+    plan["protocols"] = ["algorithm", "deployment"]
+    case = plan["conditions"][0]
+    module().validate_plan(plan)
+    commands = module().build_commands(plan, case, "deployment", Path("/output"))
+    for role in ("action", "vlm", "evaluate"):
+        command = commands[role]
+        assert command[command.index("--feature-transport") + 1] == "numpy_bf16"
+    assert (
+        commands["evaluate"][commands["evaluate"].index("--feature-rpc") + 1]
+        == "combined"
+    )
+    for role in ("action", "vlm"):
+        assert "--feature-rpc" not in commands[role]
+    case["feature_transport"] = "numpy_fp32"
+    case["feature_rpc"] = "separate"
+    command = module().build_commands(plan, case, "deployment", Path("/output"))[
+        "evaluate"
+    ]
+    assert command[command.index("--feature-transport") + 1] == "numpy_fp32"
+    assert command[command.index("--feature-rpc") + 1] == "separate"
+    algorithm = module().build_commands(plan, case, "algorithm", Path("/output"))[
+        "evaluate"
+    ]
+    assert "--feature-rpc" not in algorithm
+    assert "--feature-transport" not in algorithm
+
+
+@pytest.mark.parametrize(
+    "name, value", [("feature_transport", "float16"), ("feature_rpc", "other")]
+)
+@pytest.mark.parametrize("location", ["plan", "case"])
+def test_invalid_feature_options_rejected_before_launch(plan, name, value, location):
+    target = plan if location == "plan" else plan["conditions"][0]
+    target[name] = value
+    with pytest.raises(ValueError, match="feature"):
+        module().validate_plan(plan)
+
+
+def test_feature_controls_require_deployment_in_experiment_protocols(plan):
+    plan["protocols"] = ["algorithm"]
+    plan["feature_rpc"] = "combined"
+    with pytest.raises(ValueError, match="deployment"):
+        module().validate_plan(plan)
+
+
 @pytest.mark.parametrize("change", ["ports", "names", "flags", "episodes", "protocol"])
 def test_invalid_plan_is_rejected_before_starting_any_process(plan, change):
     if change == "ports":

@@ -16,6 +16,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from coexecution.libero.features import validate_feature_options
 from coexecution.libero.scheduling import validate_vision_max_hz
 
 FIXTURE_FIELDS = (
@@ -71,6 +72,13 @@ def validate_plan(plan):
     if not plan["protocols"] or set(plan["protocols"]) - {"algorithm", "deployment"}:
         raise ValueError("Protocols must be algorithm and/or deployment")
     for settings in (plan, *plan["conditions"]):
+        transport = settings.get("feature_transport", "numpy_fp32")
+        rpc = settings.get("feature_rpc", "separate")
+        validate_feature_options(transport, rpc)
+        if (
+            transport != "numpy_fp32" or rpc != "separate"
+        ) and "deployment" not in plan["protocols"]:
+            raise ValueError("Feature controls require a deployment protocol")
         rate = settings.get("vision_max_hz", 0)
         validate_vision_max_hz(rate)
         if rate and "deployment" not in plan["protocols"]:
@@ -104,6 +112,13 @@ def build_commands(plan, case, protocol, output):
     root = Path(plan["runtime_root"])
     commands = {}
     deployment_controls = []
+    feature_transport = case.get(
+        "feature_transport", plan.get("feature_transport", "numpy_fp32")
+    )
+    feature_rpc = case.get("feature_rpc", plan.get("feature_rpc", "separate"))
+    feature_controls = []
+    if "feature_transport" in case or "feature_transport" in plan:
+        feature_controls = ["--feature-transport", feature_transport]
     if protocol == "deployment" and (
         "vision_max_hz" in case or "vision_max_hz" in plan
     ):
@@ -127,6 +142,7 @@ def build_commands(plan, case, protocol, output):
             "--output",
             str(output / (role + "-server")),
             *case["flags"],
+            *feature_controls,
         ]
     commands["evaluate"] = [
         str(plan["evaluation_python"]),
@@ -155,6 +171,13 @@ def build_commands(plan, case, protocol, output):
         "1",
         "--no-video",
         *deployment_controls,
+        *(feature_controls if protocol == "deployment" else []),
+        *(
+            ["--feature-rpc", feature_rpc]
+            if protocol == "deployment"
+            and ("feature_rpc" in case or "feature_rpc" in plan)
+            else []
+        ),
         "--task-ids",
         *(str(i) for i in range(10)),
     ]
