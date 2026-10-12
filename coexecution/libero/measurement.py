@@ -27,6 +27,13 @@ RUNTIME_FIELDS = (
 )
 
 
+def reference_mode(modes):
+    """Keep baseline as reference when requested, otherwise use the first mode."""
+    if not modes or len(set(modes)) != len(modes) or set(modes) - set(MODES):
+        raise ValueError("Unique known measurement modes are required")
+    return "baseline" if "baseline" in modes else modes[0]
+
+
 def runtime_settings(mode):
     if mode not in MODES:
         raise ValueError(f"Unknown runtime mode: {mode}")
@@ -343,6 +350,7 @@ def timed_model(function, device):
 
 
 def run(args):
+    reference_name = reference_mode(args.modes)
     import torch
 
     if args.upstream is not None:
@@ -387,8 +395,8 @@ def run(args):
         (args.output / "samples.jsonl").open("w") as stream,
     ):
         for precision in args.precisions:
-            baseline = configs[f"{precision}-baseline"]
-            with GrootOptimizations(policy, baseline) as optimized:
+            reference_label = f"{precision}-{reference_name}"
+            with GrootOptimizations(policy, configs[reference_label]) as optimized:
                 setter = getattr(optimized, "set_runtime", None)
                 if not callable(setter):
                     raise TypeError(
@@ -509,7 +517,7 @@ def run(args):
                                 samples.append(row)
                                 stream.write(json.dumps(row, allow_nan=False) + "\n")
                         evidence[label] = optimized.evidence()
-                    reference = outputs["baseline"]
+                    reference = outputs[reference_name]
                     for mode, candidates in outputs.items():
                         for index, actions in candidates.items():
                             gate = action_difference(reference[index], actions)
@@ -517,6 +525,7 @@ def run(args):
                                 {
                                     "round": round_row["round"],
                                     "mode": f"{precision}-{mode}",
+                                    "reference_mode": reference_label,
                                     "observation": index,
                                     "same_precision": gate,
                                 }
@@ -527,7 +536,7 @@ def run(args):
                                     args.output / "actions.npz", **retained
                                 )
                                 raise RuntimeError(
-                                    f"Runtime output differs from baseline: {precision}/{mode}: {gate}"
+                                    f"Runtime output differs from {reference_label}: {precision}/{mode}: {gate}"
                                 )
                     stream.flush()
                     _write(args.output / "validation.json", gates)
@@ -580,6 +589,7 @@ def run(args):
             "cuda": torch.version.cuda,
         },
         "runtime_sources": sources,
+        "reference_mode": reference_name,
         "observations": identity,
         "latency": summarize_samples(samples),
         "mode_evidence": evidence,
@@ -596,8 +606,10 @@ def run(args):
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    if "baseline" not in args.modes or len(set(args.modes)) != len(args.modes):
-        parser.error("Unique modes including baseline are required")
+    try:
+        reference_mode(args.modes)
+    except ValueError as error:
+        parser.error(str(error))
     if any(
         getattr(args, name) < 1
         for name in ("observations", "rounds", "warmup", "step_stride", "torch_threads")

@@ -103,6 +103,8 @@ preceding mode. Keep `--action-cuda-graph` and precision settings fixed for each
 paired run. Use the same runtime flags for BF16, W8A8 and W4A4 comparisons.
 The default mode list remains `baseline` through `graph`; explicitly select
 `--modes graph images compiled` to measure the new host optimizations.
+Same-precision action checks use `baseline` when requested, otherwise the first
+requested mode (`graph` in this example); results record that reference explicitly.
 
 Run `PIR2_NATIVE_TESTS=1 python -m pytest tests/native/test_compiled_host_guards.py`
 for native predicate/mutation gates, and

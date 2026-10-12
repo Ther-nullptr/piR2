@@ -37,6 +37,51 @@ def test_new_runtime_measurement_modes_require_explicit_selection():
     assert "images" not in action.default and "compiled" not in action.default
 
 
+@pytest.mark.parametrize(
+    "modes, expected",
+    [
+        (["graph", "images", "compiled"], "graph"),
+        (["compiled", "graph"], "compiled"),
+        (["graph", "baseline", "compiled"], "baseline"),
+        (["baseline"], "baseline"),
+    ],
+)
+def test_explicit_modes_select_a_requested_reference(modes, expected):
+    assert measurement().reference_mode(modes) == expected
+
+
+@pytest.mark.parametrize("modes", [[], ["unknown"], ["graph", "graph"]])
+def test_invalid_reference_selection_fails_before_model_loading(modes):
+    with pytest.raises(ValueError):
+        measurement().reference_mode(modes)
+
+
+def test_documented_cli_modes_without_baseline_reach_the_runner(monkeypatch):
+    module = measurement()
+    received = []
+    monkeypatch.setattr(module, "run", received.append)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "measurement",
+            "--checkpoint",
+            "unused",
+            "--dataset",
+            "unused",
+            "--output",
+            "unused",
+            "--modes",
+            "graph",
+            "images",
+            "compiled",
+        ],
+    )
+    module.main()
+    assert len(received) == 1
+    assert received[0].modes == ["graph", "images", "compiled"]
+
+
 def test_prepared_forward_keeps_the_original_model_body_and_options():
     module = measurement()
     log, features, prediction, options = [], object(), object(), {"image_delay": 2}
