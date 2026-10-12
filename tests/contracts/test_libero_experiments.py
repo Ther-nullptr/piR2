@@ -65,6 +65,57 @@ def test_commands_use_declared_ports_full_suite_and_separate_workers(plan):
     assert evaluate[evaluate.index("--task-ids") + 1 :] == [str(i) for i in range(10)]
 
 
+@pytest.mark.parametrize("case_rate, expected", [(None, 15), (12, 12), (0, 0)])
+def test_vision_rate_plan_default_and_case_override_reach_only_deployment(
+    plan, case_rate, expected
+):
+    m = module()
+    plan["vision_max_hz"] = 15
+    plan["protocols"] = ["algorithm", "deployment"]
+    case = plan["conditions"][0]
+    if case_rate is not None:
+        case["vision_max_hz"] = case_rate
+    m.validate_plan(plan)
+    command = m.build_commands(plan, case, "deployment", Path("/output"))["evaluate"]
+    assert "--vision-max-hz" in command
+    assert float(command[command.index("--vision-max-hz") + 1]) == expected
+    assert command[command.index("--control-hz") + 1] == "20"
+    algorithm = m.build_commands(plan, case, "algorithm", Path("/output"))["evaluate"]
+    assert "--vision-max-hz" not in algorithm
+    for role in ("action", "vlm"):
+        assert (
+            "--vision-max-hz"
+            not in m.build_commands(plan, case, "deployment", Path("/output"))[role]
+        )
+
+
+@pytest.mark.parametrize("location", ["plan", "case"])
+@pytest.mark.parametrize(
+    "rate", [-1, float("nan"), float("inf"), -float("inf"), None, "15", True]
+)
+def test_vision_rate_validation_precedes_launch(plan, location, rate):
+    target = plan if location == "plan" else plan["conditions"][0]
+    target["vision_max_hz"] = rate
+    with pytest.raises(ValueError, match="finite.*nonnegative"):
+        module().validate_plan(plan)
+
+
+@pytest.mark.parametrize("location", ["plan", "case"])
+def test_nonzero_vision_rate_requires_a_deployment_protocol(plan, location):
+    plan["protocols"] = ["algorithm"]
+    target = plan if location == "plan" else plan["conditions"][0]
+    target["vision_max_hz"] = 15
+    with pytest.raises(ValueError, match="deployment"):
+        module().validate_plan(plan)
+
+
+def test_omitted_vision_rate_preserves_existing_evaluator_command(plan):
+    commands = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/output")
+    )
+    assert "--vision-max-hz" not in commands["evaluate"]
+
+
 @pytest.mark.parametrize("change", ["ports", "names", "flags", "episodes", "protocol"])
 def test_invalid_plan_is_rejected_before_starting_any_process(plan, change):
     if change == "ports":

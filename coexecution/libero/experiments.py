@@ -16,6 +16,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from coexecution.libero.scheduling import validate_vision_max_hz
+
 FIXTURE_FIELDS = (
     "initial_state_sha256",
     "fixture_model_sha256",
@@ -68,6 +70,11 @@ def validate_plan(plan):
         raise ValueError("Declare two distinct valid worker ports")
     if not plan["protocols"] or set(plan["protocols"]) - {"algorithm", "deployment"}:
         raise ValueError("Protocols must be algorithm and/or deployment")
+    for settings in (plan, *plan["conditions"]):
+        rate = settings.get("vision_max_hz", 0)
+        validate_vision_max_hz(rate)
+        if rate and "deployment" not in plan["protocols"]:
+            raise ValueError("Vision admission limits require a deployment protocol")
     names = [case["name"] for case in plan["conditions"]]
     if (
         not names
@@ -96,6 +103,12 @@ def validate_plan(plan):
 def build_commands(plan, case, protocol, output):
     root = Path(plan["runtime_root"])
     commands = {}
+    deployment_controls = []
+    if protocol == "deployment" and (
+        "vision_max_hz" in case or "vision_max_hz" in plan
+    ):
+        rate = case.get("vision_max_hz", plan.get("vision_max_hz", 0))
+        deployment_controls = ["--vision-max-hz", str(rate)]
     for role in ("action", "vlm"):
         commands[role] = [
             str(plan["model_python"]),
@@ -141,6 +154,7 @@ def build_commands(plan, case, protocol, output):
         "--action-delay",
         "1",
         "--no-video",
+        *deployment_controls,
         "--task-ids",
         *(str(i) for i in range(10)),
     ]

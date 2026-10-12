@@ -3,14 +3,25 @@
 import gc
 import json
 import math
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from libero_protocol_scheduler import CommandTimeline, latency_budget, summarize_values
 from libero_queue_trace import LatestFrameMailbox, QueueTrace, feature_dependency
+
+# Preserve direct scripts-directory imports from outside the repository cwd.
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from coexecution.libero.scheduling import (
+    AdmissionSchedule,
+)
 
 
 @dataclass(frozen=True)
@@ -86,8 +97,10 @@ def release_service(anchor_s, raw_completed_s, min_service_ms, clock):
 
 
 class VisionWorker:
-    def __init__(self, port, events=None, min_service_ms=0, clock=None):
+    def __init__(self, port, events=None, min_service_ms=0, clock=None, max_hz=0):
         validate_service_floor(min_service_ms)
+        self.admission_schedule = AdmissionSchedule(max_hz)
+        self.max_hz = max_hz
         self.port = port
         self.min_service_ms = min_service_ms
         self.clock = clock or RealClock()
@@ -97,18 +110,24 @@ class VisionWorker:
         self.error = None
         self.submitted = 0
         self.completed = 0
+        self.offered_frames = 0
         self.skipped_frames = 0
+        self.admissions = []
         self.latencies = []
         self.rpc_times = []
         self.stop_time = None
+        self.stop_requested_s = None
         self.dropped_at_stop = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def offer(self, observation):
         with self.condition:
+            self.offered_frames += 1
             if self.queue.offer(observation) is not None:
                 self.skipped_frames += 1
+            if self.stopping and self.queue.drop_pending() is not None:
+                self.dropped_at_stop += 1
             self.condition.notify()
 
     def snapshot(self):
@@ -134,13 +153,55 @@ class VisionWorker:
         try:
             while True:
                 with self.condition:
-                    self.condition.wait_for(
-                        lambda: self.stopping or self.queue.pending is not None
-                    )
+                    wait_started = None
+                    while not self.stopping:
+                        self.condition.wait_for(
+                            lambda: self.stopping or self.queue.pending is not None
+                        )
+                        if self.stopping:
+                            break
+                        admitted = self.clock.now()
+                        remaining = self.admission_schedule.remaining(admitted)
+                        if remaining <= 0:
+                            break
+                        if wait_started is None:
+                            wait_started = admitted
+                        self.queue.events.emit(
+                            "vision_admission_wait",
+                            t_s=admitted,
+                            vision_max_hz=self.max_hz,
+                            admission_eligible_s=self.admission_schedule.next_admission_s,
+                            admission_wait_started_s=wait_started,
+                            camera_queue=self.queue.snapshot(),
+                        )
+                        # Keep the pending frame replaceable until admission.
+                        # Every offer and stop wakes this wait to recheck state.
+                        self.condition.wait(min(remaining, threading.TIMEOUT_MAX))
                     if self.stopping:
                         break
+                    admission = {
+                        "admitted_s": admitted,
+                        "admission_eligible_s": self.admission_schedule.next_admission_s,
+                        "admission_wait_started_s": wait_started,
+                        "admission_wait_seconds": admitted - wait_started
+                        if wait_started is not None
+                        else 0.0,
+                        "vision_max_hz": self.max_hz,
+                    }
+                    self.admission_schedule.record_admission(admitted)
                     observation = self.queue.take()
                     self.submitted += 1
+                    self.admissions.append(admission)
+                    self.queue.events.emit(
+                        "vision_admitted",
+                        t_s=admitted,
+                        source_tick=observation.tick,
+                        capture_s=observation.capture_s,
+                        camera_queue=self.queue.snapshot(),
+                        **admission,
+                    )
+                # RPC entry is distinct from admission: stop can be observed
+                # after an admission while this already-owned request starts.
                 start = self.clock.now()
                 result = client.call_endpoint(
                     "vision",
@@ -165,6 +226,7 @@ class VisionWorker:
                     raw_service_seconds=raw_completed - start,
                     service_floor_ms=self.min_service_ms,
                     server_vlm_seconds=result["meta"]["vlm_seconds"],
+                    **admission,
                 )
                 timing = release_service(
                     start, raw_completed, self.min_service_ms, self.clock
@@ -174,6 +236,7 @@ class VisionWorker:
                 self.rpc_times.append(
                     {
                         "started_s": start,
+                        **admission,
                         **timing,
                         "source_tick": observation.tick,
                         "capture_s": observation.capture_s,
@@ -193,8 +256,16 @@ class VisionWorker:
 
     def request_stop(self, cutoff=None):
         with self.condition:
-            if self.stop_time is None:
-                self.stop_time = self.clock.now() if cutoff is None else cutoff
+            if not self.stopping:
+                self.stop_requested_s = self.clock.now()
+                self.stop_time = self.stop_requested_s if cutoff is None else cutoff
+                self.queue.events.emit(
+                    "vision_stop_requested",
+                    t_s=self.stop_requested_s,
+                    control_end_cutoff_s=self.stop_time,
+                    vision_max_hz=self.max_hz,
+                    camera_queue=self.queue.snapshot(),
+                )
             if self.queue.drop_pending() is not None:
                 self.dropped_at_stop += 1
             self.stopping = True
@@ -205,7 +276,25 @@ class VisionWorker:
         self.thread.join()
         if self.error is not None:
             raise RuntimeError("VLM worker failed") from self.error
+        starts = [row["admitted_s"] for row in self.admissions]
+        span = starts[-1] - starts[0] if starts else 0
         return {
+            "vision_max_hz": self.max_hz,
+            "offered_sensor_frames": self.offered_frames,
+            "admitted": len(starts),
+            "admission_starts_s": starts,
+            "admission_wait_seconds": [
+                row["admission_wait_seconds"] for row in self.admissions
+            ],
+            "actual_admission_hz": (len(starts) - 1) / span if span > 0 else None,
+            "stop_requested_s": self.stop_requested_s,
+            "control_end_cutoff_s": self.stop_time,
+            "admitted_after_stop_request": sum(
+                started > self.stop_requested_s for started in starts
+            ),
+            "admitted_after_control_end": sum(
+                started > self.stop_time for started in starts
+            ),
             "submitted": self.submitted,
             "completed": self.completed,
             "skipped_sensor_frames": self.skipped_frames,
@@ -765,6 +854,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
     period = 1 / args.control_hz
     action_floor = getattr(args, "action_min_service_ms", 0)
     vision_floor = getattr(args, "vision_min_service_ms", 0)
+    vision_max_hz = getattr(args, "vision_max_hz", 0)
     fixed_delay = getattr(args, "deployment_fixed_delay", None)
     capture = time.monotonic()
     if not hasattr(args, "slow_warmup"):
@@ -864,7 +954,9 @@ def deployment_episode(env, observation, client, args, seed, trace):
         },
         min_service_ms=action_floor,
     )
-    vision = VisionWorker(args.slow_port, events=events, min_service_ms=vision_floor)
+    vision = VisionWorker(
+        args.slow_port, events=events, min_service_ms=vision_floor, max_hz=vision_max_hz
+    )
 
     def advance(action):
         from evaluate_libero_protocol import checked_env_step
@@ -902,6 +994,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
     result["service_controls"] = {
         "action_min_service_ms": action_floor,
         "vision_min_service_ms": vision_floor,
+        "vision_max_hz": vision_max_hz,
         "deployment_fixed_delay": fixed_delay,
         "calibrated_delay_ticks": calibration["selected_delay_ticks"],
         "effective_initial_delay_ticks": d,

@@ -289,6 +289,12 @@ def build_parser():
         help="Deployment: hold real VLM result until worker start plus this duration",
     )
     parser.add_argument(
+        "--vision-max-hz",
+        type=float,
+        default=0,
+        help="Deployment: cap scored VLM admissions; zero keeps unlimited admission",
+    )
+    parser.add_argument(
         "--deployment-fixed-delay",
         type=int,
         choices=range(1, 6),
@@ -300,15 +306,19 @@ def build_parser():
 def validate_deployment_controls(args):
     from libero_wallclock import validate_service_floor
 
+    from coexecution.libero.scheduling import validate_vision_max_hz
+
     validate_service_floor(args.action_min_service_ms)
     validate_service_floor(args.vision_min_service_ms)
+    validate_vision_max_hz(args.vision_max_hz)
     if args.protocol != "deployment" and (
         args.action_min_service_ms
         or args.vision_min_service_ms
+        or args.vision_max_hz
         or args.deployment_fixed_delay is not None
     ):
         raise ValueError(
-            "Service floors and fixed deployment delay require the deployment protocol"
+            "Service floors, vision admission limits and fixed delay require the deployment protocol"
         )
 
 
@@ -370,7 +380,7 @@ def main():
     config["checkpoint"] = identity
     config["suite"] = "libero_spatial"
     config["initial_state_indices"] = list(range(args.episodes_per_task))
-    config["version"] = 6
+    config["version"] = 7
     config["measurement_mode"] = "success_terminated_closed_loop"
     config["input_dependencies"] = {
         "camera": "physical observation released at each control tick; latest waiting frame replaces older waiting frames",
@@ -400,6 +410,7 @@ def main():
         "coexecution/libero/loading.py",
         "coexecution/libero/backend.py",
         "coexecution/libero/service.py",
+        "coexecution/libero/scheduling.py",
         "scripts/libero_streaming_client.py",
         "scripts/libero_observations.py",
         "upstream/learning/Isaac-GR00T/gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
@@ -439,6 +450,15 @@ def main():
                 "vision_anchor": "worker RPC start; feature publication and next VLM admission withheld until release",
                 "target_overruns": "real completion beyond target retained; raw and visible times both recorded",
                 "calibration": "same per-role floors as scored workers; bootstrap is outside scored service timing",
+            },
+            "vision_admission_contract": {
+                "max_hz": args.vision_max_hz,
+                "scope": "scored asynchronous vision worker only; bootstrap and solo warmup remain uncapped",
+                "anchor": "actual monotonic admission under mailbox lock, selecting the newest pending frame; distinct from RPC started_s",
+                "spacing": "zero disables the limit; first admission immediate, subsequent admissions at least 1/max_hz after the previous actual admission; no catch-up",
+                "camera": "physical 20Hz offers continue, replacing the latest waiting frame until admission",
+                "publication": "admission waits never hold completed feature publication; service floors remain independent",
+                "stop": "no new admission after stop observed under the same lock; already admitted RPCs may start or complete afterward; control cutoff stays unchanged",
             },
         }
     config = save_run_configuration(args.output, config)

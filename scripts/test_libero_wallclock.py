@@ -1,5 +1,6 @@
 """Test actual controller scheduling with fake time/transport, not model accuracy."""
 
+import inspect
 import io
 import json
 import threading
@@ -54,10 +55,12 @@ class ServiceFloors(unittest.TestCase):
         defaults = parser.parse_args(common)
         self.assertEqual(defaults.action_min_service_ms, 0)
         self.assertEqual(defaults.vision_min_service_ms, 0)
+        self.assertEqual(defaults.vision_max_hz, 0)
         self.assertIsNone(defaults.deployment_fixed_delay)
         for controls in (
             ["--action-min-service-ms", "80"],
             ["--vision-min-service-ms", "160"],
+            ["--vision-max-hz", "15"],
             ["--deployment-fixed-delay", "2"],
         ):
             args = parser.parse_args(common + controls)
@@ -128,6 +131,7 @@ class ServiceFloors(unittest.TestCase):
             control_hz=20,
             action_min_service_ms=80,
             vision_min_service_ms=160,
+            vision_max_hz=15,
             deployment_fixed_delay=2,
             slow_warmup={},
             calibration=(4, {"selected_delay_ticks": 4}),
@@ -167,6 +171,8 @@ class ServiceFloors(unittest.TestCase):
         self.assertEqual(loop.call_args.kwargs["fixed_delay"], 2)
         self.assertEqual(actor.call_args.kwargs["min_service_ms"], 80)
         self.assertEqual(vision.call_args.kwargs["min_service_ms"], 160)
+        self.assertEqual(vision.call_args.kwargs["max_hz"], 15)
+        self.assertEqual(result["service_controls"]["vision_max_hz"], 15)
         self.assertEqual(result["service_controls"]["calibrated_delay_ticks"], 4)
         self.assertEqual(result["service_controls"]["effective_initial_delay_ticks"], 2)
 
@@ -277,6 +283,380 @@ class ServiceFloors(unittest.TestCase):
         self.assertAlmostEqual(stats["rpc_times"][0]["raw_service_seconds"], 0.02)
         self.assertEqual(stats["completed_after_control_end"], 1)
         self.assertEqual(stats["rpc_times"][0]["server_vlm_seconds"], 0.015)
+
+
+class VisionAdmission(unittest.TestCase):
+    def run_worker(
+        self, on_call, on_wait=None, *, max_hz=10, min_service_ms=0, on_event=None
+    ):
+        """Run the real worker loop with scripted transport and condition wakes."""
+        from libero_queue_trace import QueueTrace
+        from libero_wallclock import Observation, VisionWorker
+
+        self.assertIn("max_hz", inspect.signature(VisionWorker).parameters)
+        clock = Clock()
+
+        class Trace(QueueTrace):
+            def emit(self, kind, **fields):
+                seq = super().emit(kind, **fields)
+                if on_event is not None:
+                    on_event(worker, clock, kind)
+                return seq
+
+        events = Trace(clock=clock.now)
+        calls, waits = [], []
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.socket = SimpleNamespace(close=lambda: None)
+                self.context = SimpleNamespace(term=lambda: None)
+
+            def call_endpoint(self, endpoint, payload):
+                self_test.assertEqual(endpoint, "vision")
+                calls.append((clock.now(), payload))
+                on_call(worker, clock, payload)
+                return {
+                    "vl_embeds": [],
+                    "meta": {
+                        "capture_s": payload["capture_s"],
+                        "source_tick": payload["source_tick"],
+                        "vlm_forward_calls": 1,
+                        "vlm_seconds": 0.005,
+                    },
+                }
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            self.assertIsNotNone(on_wait, "Unexpected condition wait")
+            self.assertIsNotNone(timeout)
+            self.assertGreater(timeout, 0)
+            on_wait(worker, clock, timeout)
+
+        self_test = self
+        with (
+            patch.dict(
+                "sys.modules",
+                {"gr00t.policy.server_client": SimpleNamespace(PolicyClient=Client)},
+            ),
+            patch("threading.Thread.start"),
+            patch("threading.Thread.join"),
+        ):
+            worker = VisionWorker(
+                1,
+                events=events,
+                clock=clock,
+                max_hz=max_hz,
+                min_service_ms=min_service_ms,
+            )
+            worker.offer(Observation({"state.x": [0]}, 0, 9.95))
+            with patch.object(worker.condition, "wait", side_effect=wait):
+                worker._run()
+            stats = worker.close()
+        return worker, stats, events.records(), calls, waits
+
+    def test_first_admission_is_immediate_and_publication_precedes_next_admission(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            clock.t += 0.01
+            if payload["source_tick"] == 0:
+                worker.offer(Observation({"state.x": [1]}, 1, clock.now()))
+            else:
+                worker.request_stop()
+
+        worker, stats, rows, calls, waits = self.run_worker(
+            on_call, lambda worker, clock, timeout: clock.sleep_until(clock.t + timeout)
+        )
+        np.testing.assert_allclose([t for t, _ in calls], [10, 10.1])
+        self.assertEqual(stats["vision_max_hz"], 10)
+        self.assertEqual(stats["admitted"], 2)
+        self.assertEqual(stats["offered_sensor_frames"], 2)
+        self.assertEqual(stats["submitted"], stats["completed"])
+        np.testing.assert_allclose(stats["admission_starts_s"], [10, 10.1])
+        self.assertAlmostEqual(stats["actual_admission_hz"], 10)
+        np.testing.assert_allclose(stats["admission_wait_seconds"], [0, 0.09])
+        self.assertEqual(len(waits), 1)
+        published = [r for r in rows if r["kind"] == "feature_published"]
+        np.testing.assert_allclose([r["t_s"] for r in published], [10.01, 10.11])
+        self.assertLess(published[0]["t_s"], calls[1][0])
+        for timing, (started, payload) in zip(stats["rpc_times"], calls, strict=True):
+            self.assertEqual(timing["started_s"], started)
+            self.assertLessEqual(timing["admitted_s"], started)
+            self.assertEqual(timing["capture_s"], payload["capture_s"])
+            self.assertEqual(timing["source_tick"], payload["source_tick"])
+            self.assertEqual(timing["vision_max_hz"], 10)
+            self.assertEqual(timing["added_wait_seconds"], 0)
+        self.assertEqual(worker.snapshot()["feature_source_tick"], 1)
+
+    def test_wait_keeps_latest_frame_pending_and_preserves_selected_source(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            if payload["source_tick"] == 0:
+                clock.t = 10.01
+                worker.offer(Observation({"state.x": [1]}, 1, clock.now()))
+            else:
+                self.assertEqual(payload["source_tick"], 3)
+                self.assertEqual(payload["capture_s"], 10.08)
+                self.assertEqual(payload["observation"]["state"]["x"].item(), 3)
+                worker.request_stop()
+
+        wakes = iter([(10.04, 2), (10.08, 3), (10.1, None)])
+
+        def on_wait(worker, clock, timeout):
+            self.assertIsNone(worker.snapshot()["inflight_tick"])
+            self.assertEqual(worker.snapshot()["feature_source_tick"], 0)
+            clock.t, tick = next(wakes)
+            if tick is not None:
+                worker.offer(Observation({"state.x": [tick]}, tick, clock.now()))
+
+        worker, stats, rows, calls, waits = self.run_worker(on_call, on_wait)
+        self.assertEqual([p["source_tick"] for _, p in calls], [0, 3])
+        self.assertEqual(stats["skipped_sensor_frames"], 2)
+        self.assertEqual(stats["offered_sensor_frames"], 4)
+        self.assertEqual(stats["admitted"] + stats["skipped_sensor_frames"], 4)
+        self.assertEqual(len(waits), 3)
+        waiting = [r for r in rows if r["kind"] == "vision_admission_wait"]
+        self.assertEqual(
+            [r["camera_queue"]["waiting_tick"] for r in waiting], [1, 2, 3]
+        )
+        self.assertTrue(all(r["vision_max_hz"] == 10 for r in waiting))
+        self.assertIsNone(worker.ready(Observation({}, 2, 10.06)))
+        self.assertEqual(
+            worker.ready(Observation({}, 3, 10.08))["meta"]["source_tick"], 3
+        )
+
+    def test_late_wake_anchors_next_slot_to_actual_admission_without_catchup(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            tick = payload["source_tick"]
+            clock.t += 0.01
+            if tick < 2:
+                worker.offer(Observation({}, tick + 1, clock.now()))
+            else:
+                worker.request_stop()
+
+        wakes = iter([10.37, 10.47])
+
+        def on_wait(worker, clock, timeout):
+            clock.t = next(wakes)
+
+        _, stats, _, calls, waits = self.run_worker(on_call, on_wait)
+        np.testing.assert_allclose([t for t, _ in calls], [10, 10.37, 10.47])
+        np.testing.assert_allclose(stats["admission_starts_s"], [10, 10.37, 10.47])
+        self.assertEqual(len(waits), 2)
+
+    def test_slow_rpc_overrun_does_not_add_a_period_after_completion(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            tick = payload["source_tick"]
+            clock.t += 0.25
+            if tick == 0:
+                worker.offer(Observation({}, 1, clock.now()))
+            else:
+                worker.request_stop()
+
+        _, stats, _, calls, waits = self.run_worker(on_call)
+        np.testing.assert_allclose([t for t, _ in calls], [10, 10.25])
+        self.assertEqual(waits, [])
+        self.assertEqual(stats["admission_wait_seconds"], [0, 0])
+
+    def test_disabled_limit_preserves_immediate_next_request(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            clock.t += 0.01
+            if payload["source_tick"] == 0:
+                worker.offer(Observation({}, 1, clock.now()))
+            else:
+                worker.request_stop()
+
+        _, stats, _, calls, waits = self.run_worker(on_call, max_hz=0)
+        np.testing.assert_allclose([t for t, _ in calls], [10, 10.01])
+        self.assertEqual(stats["admission_wait_seconds"], [0, 0])
+        self.assertEqual(waits, [])
+
+    def test_service_floor_remains_independent_of_admission_wait(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            clock.t += 0.01
+            if payload["source_tick"] == 0:
+                worker.offer(Observation({}, 1, clock.now()))
+            else:
+                worker.request_stop()
+
+        _, stats, rows, calls, _ = self.run_worker(
+            on_call,
+            lambda worker, clock, timeout: clock.sleep_until(clock.t + timeout),
+            min_service_ms=40,
+        )
+        np.testing.assert_allclose([t for t, _ in calls], [10, 10.1])
+        np.testing.assert_allclose(stats["admission_wait_seconds"], [0, 0.06])
+        published = [r["t_s"] for r in rows if r["kind"] == "feature_published"]
+        np.testing.assert_allclose(published, [10.04, 10.14])
+        np.testing.assert_allclose(
+            [r["added_wait_seconds"] for r in stats["rpc_times"]], [0.03, 0.03]
+        )
+
+    def test_stop_waiting_drops_latest_and_preserves_backdated_control_cutoff(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            clock.t += 0.01
+            worker.offer(Observation({}, 1, clock.now()))
+
+        def on_wait(worker, clock, timeout):
+            clock.t = 10.03
+            worker.request_stop(9.99)
+            worker.offer(Observation({}, 2, clock.now()))
+
+        _, stats, _, calls, waits = self.run_worker(on_call, on_wait)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(stats["dropped_at_stop"], 2)
+        self.assertEqual(stats["offered_sensor_frames"], 3)
+        self.assertEqual(stats["stop_requested_s"], 10.03)
+        self.assertEqual(stats["admitted_after_stop_request"], 0)
+        self.assertEqual(stats["started_after_control_end"], 1)
+        self.assertEqual(stats["admission_starts_s"], [10])
+
+    def test_stop_inflight_publishes_owned_result_without_new_admission(self):
+        from libero_wallclock import Observation
+
+        def on_call(worker, clock, payload):
+            self.assertEqual(worker.snapshot()["inflight_tick"], 0)
+            clock.t += 0.01
+            worker.offer(Observation({}, 1, clock.now()))
+            worker.request_stop()
+            clock.t += 0.2
+
+        worker, stats, rows, calls, waits = self.run_worker(on_call)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(waits, [])
+        self.assertEqual(stats["completed_after_control_end"], 1)
+        self.assertEqual(stats["admitted_after_stop_request"], 0)
+        self.assertEqual(stats["dropped_at_stop"], 1)
+        self.assertEqual(worker.snapshot()["feature_source_tick"], 0)
+        self.assertEqual(len([r for r in rows if r["kind"] == "feature_published"]), 1)
+
+    def test_stop_between_admission_and_rpc_keeps_both_actual_timestamps(self):
+        def on_event(worker, clock, kind):
+            if kind == "vision_admitted":
+                clock.t = 10.002
+                worker.request_stop()
+                clock.t = 10.004
+
+        def on_call(worker, clock, payload):
+            clock.t += 0.01
+
+        _, stats, rows, calls, _ = self.run_worker(on_call, on_event=on_event)
+        self.assertEqual(stats["admission_starts_s"], [10])
+        self.assertEqual(stats["rpc_times"][0]["started_s"], 10.004)
+        self.assertEqual(calls[0][0], 10.004)
+        self.assertEqual(stats["stop_requested_s"], 10.002)
+        self.assertEqual(stats["admitted_after_stop_request"], 0)
+        self.assertEqual(stats["started_after_control_end"], 1)
+        admitted = [r for r in rows if r["kind"] == "vision_admitted"]
+        self.assertEqual(admitted[0]["t_s"], 10)
+
+    def test_future_cutoff_does_not_postpone_observing_stop(self):
+        def on_call(worker, clock, payload):
+            clock.t += 0.01
+            worker.request_stop(20.0)
+
+        _, stats, _, calls, waits = self.run_worker(on_call)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(waits, [])
+        self.assertEqual(stats["control_end_cutoff_s"], 20.0)
+        self.assertEqual(stats["stop_requested_s"], 10.01)
+        self.assertEqual(stats["admitted_after_stop_request"], 0)
+
+    def test_real_condition_wakes_for_newest_frame_and_stop(self):
+        from queue import Queue
+
+        from libero_queue_trace import QueueTrace
+        from libero_wallclock import Observation, VisionWorker
+
+        self.assertIn("max_hz", inspect.signature(VisionWorker).parameters)
+        waiting = Queue()
+        clock = Clock()
+
+        class Trace(QueueTrace):
+            def emit(self, kind, **fields):
+                seq = super().emit(kind, **fields)
+                if kind == "vision_admission_wait":
+                    waiting.put(fields["camera_queue"]["waiting_tick"])
+                return seq
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.socket = SimpleNamespace(close=lambda: None)
+                self.context = SimpleNamespace(term=lambda: None)
+
+            def call_endpoint(self, endpoint, payload):
+                worker.offer(Observation({}, 1, clock.now()))
+                return {
+                    "meta": {
+                        **{k: payload[k] for k in ("capture_s", "source_tick")},
+                        "vlm_forward_calls": 1,
+                        "vlm_seconds": 0.005,
+                    }
+                }
+
+        with patch.dict(
+            "sys.modules",
+            {"gr00t.policy.server_client": SimpleNamespace(PolicyClient=Client)},
+        ):
+            worker = VisionWorker(
+                1, clock=clock, events=Trace(clock=clock.now), max_hz=0.01
+            )
+            try:
+                worker.offer(Observation({}, 0, clock.now()))
+                self.assertEqual(waiting.get(timeout=2), 1)
+                worker.offer(Observation({}, 2, clock.now()))
+                self.assertEqual(waiting.get(timeout=2), 2)
+                worker.request_stop()
+                worker.thread.join(timeout=2)
+                self.assertFalse(worker.thread.is_alive())
+            finally:
+                stats = worker.close()
+        self.assertEqual(stats["admitted"], 1)
+        self.assertEqual(stats["skipped_sensor_frames"], 1)
+        self.assertEqual(stats["dropped_at_stop"], 1)
+
+    def test_invalid_worker_rates_fail_before_starting_thread(self):
+        from libero_wallclock import VisionWorker
+
+        self.assertIn("max_hz", inspect.signature(VisionWorker).parameters)
+        with patch("threading.Thread.start") as start:
+            for rate in (-1, float("nan"), float("inf"), -float("inf")):
+                with (
+                    self.subTest(rate=rate),
+                    self.assertRaisesRegex(ValueError, "finite.*nonnegative"),
+                ):
+                    VisionWorker(1, max_hz=rate)
+            start.assert_not_called()
+
+    def test_invalid_cli_rates_and_algorithm_use_are_rejected(self):
+        from evaluate_libero_protocol import build_parser, validate_deployment_controls
+
+        parser = build_parser()
+        common = ["--protocol", "deployment", "--variant", "flow", "--output", "unused"]
+        self.assertIn("--vision-max-hz", parser.format_help())
+        for rate in ("-1", "nan", "inf", "-inf"):
+            with (
+                self.subTest(rate=rate),
+                self.assertRaisesRegex(ValueError, "finite.*nonnegative"),
+            ):
+                validate_deployment_controls(
+                    parser.parse_args(common + [f"--vision-max-hz={rate}"])
+                )
+        defaults = parser.parse_args(common)
+        defaults.protocol = "algorithm"
+        validate_deployment_controls(defaults)
 
 
 class QueueAccounting(unittest.TestCase):
