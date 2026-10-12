@@ -29,6 +29,8 @@ class OptimizationConfig:
     tokenizer_cache: bool = False
     static_vlm: bool = False
     vlm_graph: bool = False
+    image_array_preparation: bool = False
+    compiled_host_guards: bool = False
 
     def __post_init__(self):
         if self.action_graph and self.precision not in ("bf16", "w8a8", "w4a4"):
@@ -94,6 +96,8 @@ class OptimizationConfig:
             or self.tokenizer_cache
             or self.static_vlm
             or self.vlm_graph
+            or self.image_array_preparation
+            or self.compiled_host_guards
         )
 
     def validate_variant(self, variant):
@@ -129,6 +133,8 @@ def add_optimization_arguments(parser):
     parser.add_argument("--tokenizer-cache", action="store_true")
     parser.add_argument("--static-vlm", action="store_true")
     parser.add_argument("--vlm-cuda-graph", action="store_true")
+    parser.add_argument("--image-array-preparation", action="store_true")
+    parser.add_argument("--compiled-host-guards", action="store_true")
     parser.add_argument("--norm-modulation-quant", action="store_true")
     parser.add_argument("--residual-norm-quant", action="store_true")
     parser.add_argument("--fp8-fast-quant", action="store_true")
@@ -156,6 +162,8 @@ def optimization_config(args):
         tokenizer_cache=args.tokenizer_cache,
         static_vlm=args.static_vlm,
         vlm_graph=args.vlm_cuda_graph,
+        image_array_preparation=args.image_array_preparation,
+        compiled_host_guards=args.compiled_host_guards,
         norm_modulation_quant=args.norm_modulation_quant,
         residual_norm_quant=args.residual_norm_quant,
         fp8_fast_quant=args.fp8_fast_quant,

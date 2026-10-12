@@ -28,6 +28,15 @@ def test_measurement_import_and_help_do_not_load_models():
     assert result.returncode == 0, result.stderr
 
 
+def test_new_runtime_measurement_modes_require_explicit_selection():
+    module = measurement()
+    action = next(
+        action for action in module.build_parser()._actions if action.dest == "modes"
+    )
+    assert "images" in action.choices and "compiled" in action.choices
+    assert "images" not in action.default and "compiled" not in action.default
+
+
 def test_prepared_forward_keeps_the_original_model_body_and_options():
     module = measurement()
     log, features, prediction, options = [], object(), object(), {"image_delay": 2}
@@ -67,7 +76,15 @@ def test_runtime_settings_are_precision_independent_and_layered():
     module = measurement()
     empty = module.runtime_settings("baseline")
     assert empty == dict.fromkeys(
-        ("input_preparation", "tokenizer_cache", "static_vlm", "vlm_graph"), False
+        (
+            "input_preparation",
+            "tokenizer_cache",
+            "static_vlm",
+            "vlm_graph",
+            "image_array_preparation",
+            "compiled_host_guards",
+        ),
+        False,
     )
     assert module.runtime_settings("prepared") == {**empty, "input_preparation": True}
     assert module.runtime_settings("tokenized") == {
@@ -75,7 +92,18 @@ def test_runtime_settings_are_precision_independent_and_layered():
         "input_preparation": True,
         "tokenizer_cache": True,
     }
-    assert all(module.runtime_settings("graph").values())
+    assert module.runtime_settings("graph") == {
+        **empty,
+        "input_preparation": True,
+        "tokenizer_cache": True,
+        "static_vlm": True,
+        "vlm_graph": True,
+    }
+    assert module.runtime_settings("images") == {
+        **module.runtime_settings("graph"),
+        "image_array_preparation": True,
+    }
+    assert all(module.runtime_settings("compiled").values())
     with pytest.raises(ValueError):
         module.runtime_settings("unknown")
 

@@ -146,12 +146,13 @@ def execution_stamp(model):
 class CompiledExecutionGuard(HostGuardPlan):
     """The same frozen VLM state discovered once, with deduplicated hot checks."""
 
-    def __init__(self, model):
+    def __init__(self, model, *, backend=None):
         super().__init__(
             model,
             methods=_CAPTURED_METHODS,
             fields=_CAPTURED_FIELDS,
             global_bindings=_GLOBAL_BINDINGS,
+            backend=backend,
         )
 
 
@@ -220,7 +221,15 @@ class PolicyStaticS2:
     teardown, but does not make arbitrary multi-stream callers safe.
     """
 
-    def __init__(self, policy, *, cuda_graph=False, vision_rope=None, max_entries=32):
+    def __init__(
+        self,
+        policy,
+        *,
+        cuda_graph=False,
+        vision_rope=None,
+        max_entries=32,
+        guard_backend=None,
+    ):
         if type(max_entries) is not int or max_entries < 1:
             raise ValueError("Static policy max_entries must be a positive integer")
         if type(cuda_graph) is not bool:
@@ -246,6 +255,7 @@ class PolicyStaticS2:
         self.core = StaticS2(workload, vision_rope=vision_rope)
         self.norm = self.core.inner.language_model.norm
         self.max_entries, self.cuda_graph = max_entries, cuda_graph
+        self.guard_backend = guard_backend
         self.bindings, self.graphs = OrderedDict(), OrderedDict()
         self._cpu_metadata, self._resident_keys = {}, {}
         self.counts, self.restore = Counter(), []
@@ -280,14 +290,18 @@ class PolicyStaticS2:
             raise ValueError("Static policy only supports Qwen3Backbone and Qwen3-VL")
         check_policy_parameter(next(self.model.parameters()), self.torch.bfloat16)
         if self._policy_topology is None:
-            self._policy_topology = ModelTopologyGuard(self.model)
+            self._policy_topology = ModelTopologyGuard(
+                self.model, backend=self.guard_backend
+            )
             self._vlm_modules = tuple(core.inner.modules())
         if self._policy_topology.training_changed():
             raise ValueError("Static policy only supports eval/inference")
         if not self._policy_topology.unchanged():
             if not rebuild:
                 raise ValueError("Static policy topology changed; prepare again")
-            self._policy_topology = ModelTopologyGuard(self.model)
+            self._policy_topology = ModelTopologyGuard(
+                self.model, backend=self.guard_backend
+            )
             self._vlm_modules = tuple(core.inner.modules())
             if self._policy_topology.training_changed():
                 raise ValueError("Static policy only supports eval/inference")
@@ -344,7 +358,9 @@ class PolicyStaticS2:
                 # producer without changing its function identity/code. A shared
                 # epoch invalidates BOTH input and visual derived caches.
                 self.core.metadata_epoch = getattr(self.core, "metadata_epoch", 0) + 1
-            self._execution_guard = CompiledExecutionGuard(self.core.inner)
+            self._execution_guard = CompiledExecutionGuard(
+                self.core.inner, backend=getattr(self, "guard_backend", None)
+            )
             self._execution_guard.attribute(self.core, "vision_rope")
             self._execution_guard.attribute(self.core, "_causal_mask_original")
             self._execution_epoch += 1

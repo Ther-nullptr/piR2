@@ -1,5 +1,12 @@
 {
   "version": 1,
+  "optional_build_dependencies": {
+    "compiled_host_guards": {
+      "Cython": "3.1.2",
+      "setuptools": "84.0.0",
+      "note": "Cython is enforced; the tested setuptools version is recorded here and each build records its actual toolchain. No compiler or generated extension is redistributed."
+    }
+  },
   "sources": {
     "groot": {
       "url": "https://github.com/pi-r2-flow/pi-r2-flow.git",

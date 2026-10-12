@@ -150,12 +150,13 @@ class ActionGraph:
     Explicit close restores the original methods and hooks transactionally.
     """
 
-    def __init__(self, policy, *, max_entries=8):
+    def __init__(self, policy, *, max_entries=8, guard_backend=None):
         if type(max_entries) is not int or max_entries < 1:
             raise ValueError("Action graph max_entries must be a positive integer")
         self.policy, self.model = policy, policy.model
         self.head = self.model.action_head
         self.max_entries = max_entries
+        self.guard_backend = guard_backend
         self.graphs, self.counts = OrderedDict(), Counter()
         self.lock = threading.Lock()
         self._entered = False
@@ -276,6 +277,7 @@ class ActionGraph:
             ),
             global_bindings=_GLOBAL_BINDINGS,
             observer_hooks=observers,
+            backend=self.guard_backend,
         )
         self._execution_guard.value(vars(self.head.config))
         for name in (

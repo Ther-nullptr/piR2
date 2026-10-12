@@ -35,6 +35,8 @@ class GrootOptimizations:
         self.boundary = None
         self.preparation = None
         self.tokenizer_cache = None
+        self.image_preparation = None
+        self.guard_backend = None
         self.graphs = None
         self.action_graph = None
         self.static_vlm = None
@@ -253,6 +255,20 @@ class GrootOptimizations:
         self._bind_runtime_model(model)
 
     def _install_runtime_adapters(self):
+        self.guard_backend = None
+        if self.config.compiled_host_guards:
+            from coexecution.optimization.execution.compiled_guards import (
+                load_compiled_guards,
+            )
+
+            self.guard_backend = load_compiled_guards()
+        if self.config.image_array_preparation:
+            from coexecution.optimization.execution.images import ImageArrayPreparation
+
+            if self.image_preparation is None:
+                self.image_preparation = ImageArrayPreparation(self.policy)
+            self.runtime_stack.callback(self.image_preparation.close)
+            self.image_preparation.__enter__()
         if self.config.input_preparation:
             from coexecution.optimization.execution.preparation import InputPreparation
 
@@ -275,11 +291,13 @@ class GrootOptimizations:
             if (
                 self.static_vlm is None
                 or self.static_vlm.cuda_graph != self.config.vlm_graph
+                or self.static_vlm.guard_backend is not self.guard_backend
             ):
                 self.static_vlm = PolicyStaticS2(
                     self.policy,
                     cuda_graph=self.config.vlm_graph,
                     vision_rope=None if self.fusion is None else self.fusion.vision,
+                    guard_backend=self.guard_backend,
                 )
             self.runtime_stack.callback(self.static_vlm.close)
             self.static_vlm.__enter__()
@@ -297,8 +315,13 @@ class GrootOptimizations:
         if self.config.action_graph:
             from coexecution.optimization.groot.action import ActionGraph
 
-            if self.action_graph is None:
-                self.action_graph = ActionGraph(self.policy)
+            if (
+                self.action_graph is None
+                or self.action_graph.guard_backend is not self.guard_backend
+            ):
+                self.action_graph = ActionGraph(
+                    self.policy, guard_backend=self.guard_backend
+                )
             self.runtime_stack.callback(self.action_graph.close)
             self.action_graph.__enter__()
 
@@ -306,6 +329,7 @@ class GrootOptimizations:
     def _runtime_guard(self):
         with ExitStack() as guards:
             for adapter in (
+                self.image_preparation,
                 self.preparation,
                 self.tokenizer_cache,
                 self.static_vlm,
@@ -322,6 +346,8 @@ class GrootOptimizations:
         tokenizer_cache=None,
         static_vlm=None,
         vlm_graph=None,
+        image_array_preparation=None,
+        compiled_host_guards=None,
     ):
         """Switch common runtime scopes; retain fixed precision, layouts and DiT graphs."""
         if not self._active:
@@ -333,6 +359,8 @@ class GrootOptimizations:
             ("tokenizer_cache", tokenizer_cache),
             ("static_vlm", static_vlm),
             ("vlm_graph", vlm_graph),
+            ("image_array_preparation", image_array_preparation),
+            ("compiled_host_guards", compiled_host_guards),
         ):
             if value is not None and type(value) is not bool:
                 raise ValueError(f"Runtime {name} must be a bool or None")
@@ -345,6 +373,8 @@ class GrootOptimizations:
                     ("tokenizer_cache", tokenizer_cache),
                     ("static_vlm", static_vlm),
                     ("vlm_graph", vlm_graph),
+                    ("image_array_preparation", image_array_preparation),
+                    ("compiled_host_guards", compiled_host_guards),
                 )
                 if value is not None
             },
@@ -397,6 +427,17 @@ class GrootOptimizations:
             "config": config,
             "coverage": self.coverage,
             "backend": self.backend,
+            "image_array_preparation": (
+                None
+                if self.image_preparation is None
+                or not self.config.image_array_preparation
+                else self.image_preparation.evidence()
+            ),
+            "compiled_host_guards": (
+                None
+                if self.guard_backend is None or not self.config.compiled_host_guards
+                else self.guard_backend.evidence()
+            ),
             "input_preparation": (
                 None
                 if self.preparation is None or not self.config.input_preparation

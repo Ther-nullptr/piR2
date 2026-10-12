@@ -198,10 +198,11 @@ def runtime_interface(monkeypatch):
     class Adapter:
         label = "preparation"
 
-        def __init__(self, actual_policy):
+        def __init__(self, actual_policy, *, guard_backend=None):
             assert actual_policy is policy
             self.closed = True
             self.active_call = False
+            self.guard_backend = guard_backend
             events.append("created " + self.label)
 
         def __enter__(self):
@@ -229,13 +230,16 @@ def runtime_interface(monkeypatch):
     class Tokenizer(Adapter):
         label = "tokenizer"
 
+    class Images(Adapter):
+        label = "images"
+
     class Static(Adapter):
         label = "static"
 
         def __init__(
             self, actual_policy, *, cuda_graph=False, vision_rope=None, **kwargs
         ):
-            super().__init__(actual_policy)
+            super().__init__(actual_policy, **kwargs)
             self.cuda_graph, self.vision_rope = cuda_graph, vision_rope
 
     class Action(Adapter):
@@ -287,6 +291,10 @@ def runtime_interface(monkeypatch):
             "coexecution.optimization.execution.tokenization",
             {"TokenizerCacheScope": Tokenizer},
         ),
+        (
+            "coexecution.optimization.execution.images",
+            {"ImageArrayPreparation": Images},
+        ),
         ("coexecution.optimization.groot.vlm", {"PolicyStaticS2": Static}),
         ("coexecution.optimization.groot.action", {"ActionGraph": Action}),
         ("coexecution.optimization.execution.graph", {"DitGraphs": Graphs}),
@@ -304,6 +312,74 @@ def runtime_interface(monkeypatch):
         "coexecution.optimization.session.preflight_backend", lambda *args: {}
     )
     return SimpleNamespace(policy=policy, model=model, events=events, failures=failures)
+
+
+@pytest.mark.parametrize("flag", ["image_array_preparation", "compiled_host_guards"])
+@pytest.mark.parametrize("precision", ["bf16", "w8a8", "w4a4"])
+def test_common_host_optimizations_are_explicit_and_precision_independent(
+    flag, precision
+):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            ["--inference-precision", precision, "--" + flag.replace("_", "-")]
+        )
+    )
+    assert getattr(config, flag) and config.enabled
+    assert not getattr(OptimizationConfig(), flag)
+
+
+def test_runtime_image_preparation_switch_rollback_and_live_call(runtime_interface):
+    with GrootOptimizations(
+        runtime_interface.policy, OptimizationConfig(image_array_preparation=True)
+    ) as session:
+        assert session.evidence()["image_array_preparation"] == {"adapter": "images"}
+        session.image_preparation.active_call = True
+        with pytest.raises(RuntimeError, match="active call"):
+            session.set_runtime(image_array_preparation=False)
+        session.image_preparation.active_call = False
+        runtime_interface.failures.append("tokenizer")
+        with pytest.raises(RuntimeError, match="installation failed"):
+            session.set_runtime(image_array_preparation=False, tokenizer_cache=True)
+        assert (
+            session.config.image_array_preparation
+            and not session.image_preparation.closed
+        )
+        session.set_runtime(image_array_preparation=False)
+        assert session.image_preparation.closed
+
+
+def test_runtime_compiled_backend_reinstalls_guards_and_rolls_back(
+    runtime_interface, monkeypatch
+):
+    from coexecution.optimization.execution import compiled_guards
+
+    backend = SimpleNamespace(evidence=lambda: {"backend": "cython"})
+    monkeypatch.setattr(compiled_guards, "load_compiled_guards", lambda: backend)
+    with GrootOptimizations(
+        runtime_interface.policy, OptimizationConfig(action_graph=True, static_vlm=True)
+    ) as session:
+        old_action, old_vlm = session.action_graph, session.static_vlm
+        session.set_runtime(compiled_host_guards=True)
+        assert old_action.closed and old_vlm.closed
+        assert session.action_graph.guard_backend is backend
+        assert session.static_vlm.guard_backend is backend
+        assert session.evidence()["compiled_host_guards"] == {"backend": "cython"}
+        session.set_runtime(compiled_host_guards=False)
+        assert (
+            session.action_graph.guard_backend is None
+            and session.static_vlm.guard_backend is None
+        )
+
+        def unavailable():
+            raise RuntimeError("native backend unavailable")
+
+        monkeypatch.setattr(compiled_guards, "load_compiled_guards", unavailable)
+        with pytest.raises(RuntimeError, match="native backend unavailable"):
+            session.set_runtime(compiled_host_guards=True)
+        assert not session.config.compiled_host_guards
+        assert not session.action_graph.closed and not session.static_vlm.closed
 
 
 def test_action_graph_installs_after_boundary_and_supersedes_nested_dit(

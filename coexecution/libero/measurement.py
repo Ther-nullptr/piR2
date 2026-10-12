@@ -16,8 +16,15 @@ from dataclasses import fields, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MODES = ("baseline", "prepared", "tokenized", "static", "graph")
-RUNTIME_FIELDS = ("input_preparation", "tokenizer_cache", "static_vlm", "vlm_graph")
+MODES = ("baseline", "prepared", "tokenized", "static", "graph", "images", "compiled")
+RUNTIME_FIELDS = (
+    "input_preparation",
+    "tokenizer_cache",
+    "static_vlm",
+    "vlm_graph",
+    "image_array_preparation",
+    "compiled_host_guards",
+)
 
 
 def runtime_settings(mode):
@@ -155,7 +162,7 @@ def build_parser():
         nargs="+",
         default=["bf16", "w8a8", "w4a4"],
     )
-    parser.add_argument("--modes", choices=MODES, nargs="+", default=list(MODES))
+    parser.add_argument("--modes", choices=MODES, nargs="+", default=list(MODES[:5]))
     parser.add_argument("--observations", type=int, default=3)
     parser.add_argument("--episodes", type=int, nargs="+")
     parser.add_argument("--rounds", type=int, default=20)

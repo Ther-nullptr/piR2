@@ -19,6 +19,7 @@ from coexecution import groot_optimization as legacy
 from coexecution.optimization import config, session, tactics
 from coexecution.optimization.groot import action
 from coexecution.optimization.execution import tensor_graph
+from coexecution.optimization.execution import compiled_guards, images
 
 assert callable(action.ActionGraph)
 assert callable(tensor_graph.TensorGraphCall)
@@ -36,7 +37,7 @@ with legacy.GrootOptimizations(object()) as scope:
     assert scope.evidence()["coverage"] == {}
 
 for name in sys.modules:
-    assert not name.startswith(("torch", "triton", "robotics_kernels")), name
+    assert not name.startswith(("torch", "triton", "robotics_kernels", "Cython", "setuptools", "numpy")), name
     assert not name.startswith("coexecution.optimization.backends"), name
 """,
         ],

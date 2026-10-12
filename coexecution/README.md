@@ -57,15 +57,38 @@ The separate SO100/queue tools retain their existing modules and tests.
 
 ### Common policy runtime / 公共推理路径
 
-Four independent options apply to the same BF16 or quantized CUDA policy:
+Common runtime options apply to the same BF16 or quantized CUDA policy:
 `--input-preparation` routes only consumed tensor fields to each model component;
 `--tokenizer-cache` caches exact expanded text after fresh image processing;
 `--static-vlm` prepares fixed text/grid/mask metadata without device-side scalar
 reads; `--vlm-cuda-graph` captures the complete VLM and requires `--static-vlm`.
+`--image-array-preparation` replaces the pinned GR00T processor's PIL conversion
+with owned contiguous uint8 RGB arrays. Its original conversation, chat template,
+crop/resize, state and Qwen collation still run; every image buffer is fresh.
+Scope entry checks pinned GR00T/Transformers source and live method code and
+admits the stock Qwen2VL fast or slow pixel processor. Replacement processors or
+methods require closing the scope; unsupported implementations fail admission.
+Heights of 1 or 3 pixels are rejected because ndarray channel inference would be
+ambiguous; normal task images retain their original preprocessing.
+`--compiled-host-guards` compiles the exact Python guard source with Cython and
+binds its predicate methods to each guard instance. Discovery and all frozen
+execution checks retain the Python reference behavior, including tracked weight
+mutations, methods, hooks, closures, defaults, configuration and topology.
 Images, robot state and VLM features are recomputed for every observation.
 These options default off. Graph and metadata caches are bounded, and new input
 signatures require warmup. Runtime changes through `optimized.set_runtime(...)`
 retain the selected precision controller and the separate DiT graph cache.
+
+Compiled guards require CPython, a working host C compiler and the optional
+`Cython==3.1.2` and `setuptools` packages in the model environment. Install them
+with `python -m pip install Cython==3.1.2 setuptools==84.0.0` when using that flag.
+Startup builds a native extension from the unchanged guard source; generated
+source, binaries and build logs stay in `~/.cache/pir2/host-guards`, or the directory
+specified by `PIR2_HOST_GUARD_CACHE`. The cache is locked across processes and
+keyed by exact source, CPython ABI, platform, compiler identity and build settings.
+Evidence records those inputs and the compiled binary hash. Missing dependencies
+or build failures fail explicitly. Normal imports, CLI help and the default
+Python backend never invoke a compiler.
 
 Use `python -m coexecution.libero.measurement --help` for paired measurements of
 raw-observation policy wall time, prepared-input complete-model time, CUDA event
@@ -74,6 +97,19 @@ must not be added or subtracted as a CPU/GPU decomposition. The module validates
 same-precision actions and checks that timed graph calls replay without capture.
 It requires CUDA, the official Spatial task checkpoint and its dataset; profiler
 output and numerical archives stay local.
+The cumulative modes are `baseline`, `prepared`, `tokenized`, `static`, `graph`,
+`images` and `compiled`; the last two add image arrays and compiled guards to the
+preceding mode. Keep `--action-cuda-graph` and precision settings fixed for each
+paired run. Use the same runtime flags for BF16, W8A8 and W4A4 comparisons.
+The default mode list remains `baseline` through `graph`; explicitly select
+`--modes graph images compiled` to measure the new host optimizations.
+
+Run `PIR2_NATIVE_TESTS=1 python -m pytest tests/native/test_compiled_host_guards.py`
+for native predicate/mutation gates, and
+`PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_image_preparation_gpu.py` in the
+pinned environment for actual image/collator equality and ownership checks.
+The latter performs deployment preprocessing only; complete policy action/RNG
+gates still require CUDA.
 
 `--action-cuda-graph` additionally captures S1 visual/state conditioning and the
 unchanged four-step Flow action head. It supports BF16, W8A8 and W4A4, requires

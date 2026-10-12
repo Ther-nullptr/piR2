@@ -38,7 +38,7 @@ def _tensor_state(tensor):
 class ModelTopologyGuard:
     """Cache complete policy modules cold; check registry/training fields hot."""
 
-    def __init__(self, model):
+    def __init__(self, model, *, backend=None):
         self.modules = tuple(model.modules())
         self.records = []
         for module in self.modules:
@@ -47,6 +47,8 @@ class ModelTopologyGuard:
             self.records.append(
                 (module, state, type(module), registry, tuple(registry.items()))
             )
+        if backend is not None:
+            backend.bind(self, "ModelTopologyGuard")
 
     def training_changed(self):
         return any(
@@ -71,7 +73,16 @@ class ModelTopologyGuard:
 class HostGuardPlan:
     """Discover once; batch owner/header/container checks without hot recursion."""
 
-    def __init__(self, model, *, methods, fields, global_bindings, observer_hooks=()):
+    def __init__(
+        self,
+        model,
+        *,
+        methods,
+        fields,
+        global_bindings,
+        observer_hooks=(),
+        backend=None,
+    ):
         self.checks, self.seen, self.attributes, self.owners = [], set(), set(), set()
         self.owner_checks, self.attribute_checks, self.method_checks = [], [], []
         self.tensor_checks, self.function_checks, self.cell_checks = [], [], []
@@ -119,6 +130,8 @@ class HostGuardPlan:
                 ):
                     self.attribute(owner, field)
             self.value(tensor)
+        if backend is not None:
+            backend.bind(self, "HostGuardPlan")
 
     def _append(self, group, record):
         group.append(record)
