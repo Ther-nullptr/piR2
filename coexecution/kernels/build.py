@@ -92,14 +92,15 @@ def build_inputs(backend="integer"):
     includes = []
     cutlass_revision = None
     if spec["cutlass"]:
+        from coexecution.kernels.sources import require_submodule
+
+        cutlass = require_submodule()
+        directory = Path(cutlass["directory"])
         includes = [
-            _owned_path("vendor/cutlass/include"),
-            _owned_path("vendor/cutlass/tools/util/include"),
+            directory / "include",
+            directory / "tools/util/include",
         ]
-        provenance = json.loads(
-            _owned_path("vendor/cutlass/PROVENANCE.json").read_text()
-        )
-        cutlass_revision = provenance["revision"]
+        cutlass_revision = cutlass["revision"]
     return {
         "backend": backend,
         "namespace": spec["namespace"],
@@ -157,8 +158,8 @@ def build_extension(backend, *, verbose=False):
         "--expt-relaxed-constexpr",
         "-lineinfo",
         *inputs["cuda_flags"],
-        # Torch's extension cache normally omits included-header contents. This
-        # source-tree digest invalidates it when a vendored header changes.
+        # Includes the actual dependency revision, or its header fingerprint
+        # for modified/non-Git trees; the recommended pin is not a version gate.
         f"-DPIR2_SOURCE_{identity['source_sha256']}=1",
         *definitions,
     ]

@@ -1,6 +1,5 @@
 """Reject generated assets, secrets, local paths and dangling documentation links."""
 
-import hashlib
 import json
 import re
 import subprocess
@@ -32,54 +31,33 @@ DOCUMENTS = {
 }
 
 
-def pinned_vendor_files():
-    """Only the declared, byte-identical CUTLASS source may exceed 1 MB."""
-    kernel_root = ROOT / "coexecution/kernels"
-    manifest_path = kernel_root / "SOURCE_MANIFEST.json"
-    if not manifest_path.is_file():
-        return {}
-    manifest = json.loads(manifest_path.read_text())
-    allowed = {}
-    for vendor in manifest.get("vendors", []):
-        if vendor["path"] != "vendor/cutlass":
-            continue
-        metadata = kernel_root / vendor["manifest"]
-        if (
-            metadata.resolve()
-            != (kernel_root / "vendor/cutlass/PROVENANCE.json").resolve()
-            or hashlib.sha256(metadata.read_bytes()).hexdigest() != vendor["sha256"]
-        ):
-            raise ValueError("Vendored CUTLASS manifest does not match its pin")
-        files = json.loads(metadata.read_text())["files"]
-        for relative, digest in files.items():
-            path = kernel_root / "vendor/cutlass" / relative
-            if not path.resolve().is_relative_to(
-                (kernel_root / "vendor/cutlass").resolve()
-            ):
-                raise ValueError("Vendored CUTLASS path escapes its source directory")
-            allowed[path.relative_to(ROOT).as_posix()] = digest
-    return allowed
-
-
 def main():
-    names = (
-        subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT)
+    entries = (
+        subprocess.check_output(["git", "ls-files", "--stage", "-z"], cwd=ROOT)
         .decode()
         .split("\0")
     )
+    files = []
+    for entry in filter(None, entries):
+        metadata, name = entry.split("\t", 1)
+        mode, revision, stage = metadata.split()
+        files.append((name, mode, revision, stage))
     errors = []
-    vendored = pinned_vendor_files()
-    for name in filter(None, names):
+    cutlass = json.loads((ROOT / "sources.lock.json").read_text())["sources"]["cutlass"]
+    for name, mode, revision, stage in files:
+        if stage != "0":
+            errors.append(f"Unresolved Git index entry: {name}")
+            continue
+        if mode == "160000":
+            if name != cutlass["path"] or revision != cutlass["revision"]:
+                errors.append(f"Unrecorded or mismatched submodule pin: {name}")
+            continue
         path = ROOT / name
         if FORBIDDEN.intersection(path.relative_to(ROOT).parts):
             errors.append(f"Generated/dependency path: {name}")
         if name.startswith("docs/") and name.removeprefix("docs/") not in DOCUMENTS:
             errors.append(f"Document outside allowlist: {name}")
-        pinned_source = (
-            name in vendored
-            and hashlib.sha256(path.read_bytes()).hexdigest() == vendored[name]
-        )
-        if path.is_symlink() or (path.stat().st_size > 1_000_000 and not pinned_source):
+        if path.is_symlink() or path.stat().st_size > 1_000_000:
             errors.append(f"Symlink or oversized artifact: {name}")
         try:
             text = path.read_text()

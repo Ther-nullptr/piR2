@@ -21,6 +21,74 @@ implementation. Full-checkpoint validation still rejects missing, unexpected or
 mismatched weights, apart from the training adapter's explicitly initialized new
 streaming parameters. Do not use this loading context for a bare backbone checkpoint.
 
+## CUTLASS submodule
+
+The CUDA implementations remain ordinary source files under
+`coexecution/kernels`. Their general CUTLASS dependency can come from the official
+[NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) submodule or an existing
+compatible header tree. The submodule lives at
+`coexecution/kernels/vendor/cutlass`; its Git link and source metadata record
+`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` as the default reproducible version.
+Other authors do not have to use that exact SHA. The selected headers must
+provide the APIs used by these kernels and work with the installed CUDA/C++
+toolchain; this does not promise compatibility with every CUTLASS release.
+
+For a new environment, use the default submodule:
+
+```bash
+git clone --recurse-submodules https://github.com/Ther-nullptr/piR2.git
+cd piR2
+```
+
+For an existing piR2 clone using the default dependency, initialize it from the
+repository root:
+
+```bash
+git submodule update --init --recursive coexecution/kernels/vendor/cutlass
+```
+
+Authors with an existing CUTLASS clone or complete compatible header installation
+can select it directly:
+
+```bash
+export CUTLASS_ROOT=/path/to/cutlass
+```
+
+`CUTLASS_ROOT` takes precedence over the submodule. It points at the CUTLASS root,
+with the complete required `include/` tree (including `include/cutlass` and
+`include/cute`) and `tools/util/include/`. A headers-only installation is usable
+when that structure and the needed APIs are present; Git metadata is optional.
+The tools record the actual selected source and Git revision when available.
+They do not reject a dependency solely because its SHA differs from the default
+pin. This environment path selects the CUTLASS dependency; piR2's CUDA operator
+implementations continue to build from this repository. Unset `CUTLASS_ROOT` to
+return to the local submodule.
+
+You may also keep a compatible local revision checked out inside the submodule.
+Record that actual revision with the experiment, and leave personal Git-link
+changes out of unrelated piR2 commits. After pulling or switching piR2 branches,
+run the submodule update command when you want that branch's default dependency;
+it will select the recorded Git link. Preserve local work and any intentional
+version choice before doing so. Routine default setup does not need `--remote`,
+which follows a remote branch tip instead. Updating the project's shared default
+pin remains a separate reviewed change to the Git link and dependency metadata.
+
+An existing independent CUTLASS Git clone can alternatively serve as a download
+cache during first initialization of the default submodule:
+
+```bash
+git submodule update --init --recursive \
+  --reference /path/to/existing/cutlass --dissociate \
+  coexecution/kernels/vendor/cutlass
+```
+
+`--reference` reuses available Git objects to reduce network transfer;
+`--dissociate` makes the needed local copies so the new submodule stops borrowing
+objects afterward. Missing objects are fetched from the configured official
+remote. This optional optimization leaves the existing clone unchanged and
+applies only when cloning the submodule. A headers-only installation has no Git
+object cache, but can still be selected directly with `CUTLASS_ROOT` as above.
+
 ## Optional GR00T fusion and integer inference
 
 Use a separate Linux CUDA model environment for the experimental GR00T fusion and
@@ -32,25 +100,33 @@ its model dependencies, including Transformers 4.57.3 and Diffusers 0.35.1. Do n
 upgrade the working model environment merely to install the optional backend.
 
 The extension requires a CUDA toolkit with `nvcc`, a compatible C++17 compiler,
-Ninja, and the Torch-compatible Triton package. Explicit builds or the first opted-in backend load use Torch's extension cache;
+Ninja, and the Torch-compatible Triton package. Explicit builds or the first
+opted-in backend load use Torch's extension cache;
 compilation belongs outside timed inference. The integer source uses SM80-compatible
 integer kernels on Ampere/Ada; the GR00T integration's recorded GPU validation is
 on Ada, not a claim of validation on every supported architecture.
 
-From the repository root, with the intended model environment activated:
+From the repository root, with the intended model environment activated, the
+default-submodule setup is:
 
 ```bash
+git submodule update --init --recursive coexecution/kernels/vendor/cutlass
 python tools/prepare_sources.py --component robotics-kernels
 export PYTHONPATH="$PWD:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
 python -m coexecution.kernels.build --help
 python -m coexecution.kernels.build --backend integer --describe
 ```
 
-The first command verifies the selected source hashes already stored under
-`coexecution/kernels`; it does not fetch, reset or overwrite that directory.
+The Git command initializes the default CUTLASS checkout. When using an existing
+compatible installation, set `CUTLASS_ROOT` and omit that Git command. The
+preparation command verifies owned operator sources and records the selected
+CUTLASS dependency; it does not fetch, reset or overwrite either source tree.
+Make one usable CUTLASS root available before requesting build-input metadata
+or compiling.
 `--help`, `--describe` and the operator inventory are CPU-only metadata access and
-do not import Torch or Triton. CUDA/CUTLASS inputs are resolved inside the
-repository, and runtime adapters import `coexecution.kernels` directly. No
+do not import Torch or Triton. CUDA implementations are resolved inside the
+repository, CUTLASS comes from the selected dependency root, and runtime adapters
+import `coexecution.kernels` directly. No
 `robotics-inference-bench` installation, external robotics source path or
 `ROBOTICS_CUTLASS_*_SO` setting is needed or read by the owned loaders.
 
@@ -65,8 +141,9 @@ python -m coexecution.kernels.build --backend bf16_fusion
 
 The two metadata commands above can run without CUDA. These three build commands
 require the intended CUDA toolkit and model environment; they do not execute a
-model or choose an optimization profile. CUTLASS's exact header snapshot and
-original notices live under `coexecution/kernels/vendor/cutlass`. Review the
+model or choose an optimization profile. The default CUTLASS submodule or the
+selected compatible `CUTLASS_ROOT` supplies headers under its original terms.
+Review the
 [source and licensing boundaries](../THIRD_PARTY_NOTICES.md), including the
 upstream integer/common code's unselected project license.
 
@@ -103,9 +180,10 @@ model as root or change shared device permissions from the project setup.
 
 With the owned sources and an existing compatible CUDA toolkit, build the
 floating backends explicitly. The build definitions target Thor `sm_110a` and
-use the same repository-owned CUTLASS headers:
+use the same CUTLASS root-selection rules. The default-submodule setup is:
 
 ```bash
+git submodule update --init --recursive coexecution/kernels/vendor/cutlass
 python tools/prepare_sources.py --component robotics-kernels
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -118,8 +196,10 @@ export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
 export TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"
 ```
 
-There is no external CUTLASS-root or shared-library override. The runtime's
-`require_fp8_backend` / `require_fp4_backend` loaders validate SM110 before an
+An existing compatible `CUTLASS_ROOT` can replace the initialization command
+above. The loaders build this repository's operators and do not load an external
+prebuilt robotics shared library. The runtime's `require_fp8_backend` /
+`require_fp4_backend` loaders validate SM110 before an
 on-demand build. Metadata access remains GPU-free. The retained decode-policy
 settings use `PIR2_FP8_DECODE_POLICY` / `PIR2_FP4_DECODE_POLICY` (default `auto`),
 with `PIR2_FP8_SWAP_AB=1` by default; ordinary GR00T projection tactics remain

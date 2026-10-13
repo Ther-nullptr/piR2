@@ -20,7 +20,6 @@ from coexecution.kernels.ampere_ada._candidate_support import (
     require_pre_capture_build,
 )
 
-_CUTLASS_REVISION = "982748aa7356fa838c2ea4994ddcb0b2a4b4cefa"
 _FAILED_BUILDS = set()
 
 
@@ -53,8 +52,6 @@ def load_split_k_extension():
     from coexecution.kernels.ampere_ada.build import build_inputs
 
     inputs = build_inputs()
-    if inputs.get("cutlass_revision") != _CUTLASS_REVISION:
-        raise RuntimeError("CUTLASS revision does not match the pinned snapshot")
     if hasattr(torch.ops.pir2_integer_split_k, "gemm"):
         return _registered_extension(identity)
     require_pre_capture_build()

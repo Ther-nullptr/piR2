@@ -42,8 +42,9 @@ session imports only its selected implementation. Backends do not import LIBERO
 schedulers or RPC services; integer and floating implementations share model
 inventory and Graph handling, not packed formats. Actual CUDA sources and the
 selected shared Triton primitives now live under `coexecution/kernels`: `common`,
-`ampere_ada`, `blackwell`, and the pinned `vendor/cutlass` headers. Model-specific
-connections remain in `optimization/groot`; Python entrypoints do not resolve an
+`ampere_ada` and `blackwell`. The official `vendor/cutlass` submodule is the default
+header dependency; a compatible `CUTLASS_ROOT` can select existing headers.
+Model-specific connections remain in `optimization/groot`; Python entrypoints do not resolve an
 external robotics source tree or prebuilt shared-library path.
 
 原有 `coexecution.groot_optimization`、`quantization`、`floating_quantization`
@@ -93,7 +94,7 @@ This is a server invocation, not a completed closed-loop protocol. The existing 
 The source layout separates a shared model contract from platform-specific
 implementations:
 
-| Location | Owned implementation |
+| Location | Implementation or dependency |
 | --- | --- |
 | `kernels/common/csrc/` | Native vision RoPE and AdaLN BF16 fusion |
 | `kernels/common/fused.py`, `graph.py` | Shared Triton primitives and graph lifecycle |
@@ -101,11 +102,13 @@ implementations:
 | `kernels/ampere_ada/csrc/integer_dispatch.cu` | Native activation preparation plus integer dispatch |
 | `kernels/ampere_ada/` | Integer formats, modulation producers and optional Ada candidates |
 | `kernels/blackwell/csrc/` | FP8/FP4 CUDA GEMM and packing, with focused lazy loaders |
-| `kernels/vendor/cutlass/` | Unchanged pinned CUTLASS headers, license and provenance |
+| `kernels/vendor/cutlass/` | Default official CUTLASS submodule; compatible `CUTLASS_ROOT` also supported |
 
-From the repository root, metadata and source verification are GPU-free:
+For the default dependency, initialize CUTLASS from the repository root, then
+inspect GPU-free source and build metadata:
 
 ```bash
+git submodule update --init --recursive coexecution/kernels/vendor/cutlass
 python tools/prepare_sources.py --component robotics-kernels
 python -m coexecution.kernels.build --help
 python -m coexecution.kernels.build --backend integer --describe
@@ -118,7 +121,35 @@ extension cache stores generated binaries outside the tracked source tree;
 `TORCH_EXTENSIONS_DIR` can point to a personal `.local/` directory. Runtime
 backends also load lazily when explicitly enabled. Build and warm all selected
 kernels before timing or CUDA Graph capture. The source manifest records imported
-and adapted hashes; loaded binary identity is separate evidence.
+and adapted operator hashes and the default CUTLASS submodule revision. Actual
+selected dependency and loaded binary identity are separate runtime evidence.
+The Git link records `982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` for reproducibility;
+it does not require every author to run that exact SHA.
+
+An existing compatible CUTLASS clone or complete headers-only installation can
+be used directly:
+
+```bash
+export CUTLASS_ROOT=/path/to/cutlass
+```
+
+With this variable set, omit the submodule initialization command above.
+The selected root needs the full required `include/` tree, including `cutlass`
+and `cute`, plus `tools/util/include/`. Its APIs and CUDA/C++ toolchain must
+support the selected operators; arbitrary versions are not promised to work.
+Tools record the actual Git revision when present rather than rejecting a
+source solely for differing from the default. The CUDA operator implementations
+remain local piR2 files regardless of the general CUTLASS header location.
+
+New environments can use `git clone --recurse-submodules`. Repeat the submodule
+update command after pulling or switching branches when selecting that branch's
+default. Compatible local submodule revisions are also usable; preserve those
+intentional choices and keep their personal Git-link changes out of unrelated
+commits. `--reference /path/to/existing/cutlass --dissociate` is an optional
+first-clone download optimization, not a prerequisite for reusing an existing
+installation. See [CUTLASS setup](../docs/environment.md#cutlass-submodule).
+Routine default setup does not need `--remote`; changing the project's shared
+default pin remains a separate reviewed change.
 
 The inventory API reports implementation language, source, architecture,
 precision, shape/layout constraints and numerical contract without importing

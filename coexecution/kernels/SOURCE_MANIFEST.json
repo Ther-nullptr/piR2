@@ -8,7 +8,7 @@
   "files": {
     "UPSTREAM_NOTICE.txt": {
       "origin": "pir2-project",
-      "sha256": "c074c0bc747133e3dea730d11c243de48acb2844ee428cc782e3beb8761a3677"
+      "sha256": "40eda68bc45a688083d36a6cfc6da0f445f4935fbb8dd769c69bcc4f5f180b97"
     },
     "__init__.py": {
       "origin": "pir2-project",
@@ -109,7 +109,7 @@
       "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
       "origin_path": "coexecution/quantization_epilogue.py",
       "origin_sha256": "8ce4100405e7a21c554c337f33781074fd7aca902f7756df419e34a96977b755",
-      "sha256": "d6537043305be12bf737c54bb077ec2f5b912eec30b837760243a809318670cd",
+      "sha256": "25b676d0315864505922404386e3ff7c0362d7a34676e1899c45eec4b034cd78",
       "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
     },
     "ampere_ada/int4_gemv.py": {
@@ -127,7 +127,7 @@
       "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
       "origin_path": "coexecution/quantization_small_m.py",
       "origin_sha256": "1dd2de9412a1466244ecc172cd8de9c7cb27d5e24d291f8dd04be0d31abf3521",
-      "sha256": "6c0bcddc3da8be13fcf3812d94c54ec057cc691ae14aca2660981a55b676a699",
+      "sha256": "8a68fff093275854475375543fd5ad422e244a691c6ec241a8a96c12a88bd163",
       "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
     },
     "ampere_ada/integer.py": {
@@ -181,7 +181,7 @@
       "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
       "origin_path": "coexecution/quantization_split_k.py",
       "origin_sha256": "beb12328b3029759df27e9c7adbc7f1b06caf0830de72cafbea024e0092182f1",
-      "sha256": "28e89a2e90d12bfec6f2de43660e80afe629c40e79cca5f16eca4b7777721c21",
+      "sha256": "d9e8c3477d760b22f8970be45cac249f7208be2f41ca9250bad0e26b1263f681",
       "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
     },
     "blackwell/LICENSE": {
@@ -267,7 +267,7 @@
     },
     "build.py": {
       "origin": "pir2-project",
-      "sha256": "891d7bf3cabc40c87fea9d956dd417b8ea9485f38ae5ad0565435334d6f3b36c"
+      "sha256": "e249ca8ca13d102b5ce0a630389610e4d054b4c9e807f499323348a544f1b096"
     },
     "common/__init__.py": {
       "origin": "pir2-project",
@@ -324,25 +324,25 @@
     },
     "sources.py": {
       "origin": "pir2-project",
-      "sha256": "8c35197e5a10a79bb1bac501c95290f0580158ff6cb2cbacd0050dc58a7e729f"
+      "sha256": "8865b394b260db4576933787d6f7365eea1ed7038b2b0b94b19237d0087839b2"
     }
   },
-  "vendors": [
-    {
-      "path": "vendor/cutlass",
-      "manifest": "vendor/cutlass/PROVENANCE.json",
-      "sha256": "ed6811c925bc90b826b0b016065d6724692e3e82a5e020d3fb43ed724021d92a",
-      "revision": "982748aa7356fa838c2ea4994ddcb0b2a4b4cefa",
-      "scope": [
-        "include/",
-        "tools/util/include/",
-        "LICENSE.txt"
-      ]
-    }
-  ],
   "runtime_dependencies": [
     "PyTorch headers and runtime",
     "CUDA Toolkit",
     "Triton"
+  ],
+  "submodules": [
+    {
+      "name": "cutlass",
+      "path": "vendor/cutlass",
+      "url": "https://github.com/NVIDIA/cutlass.git",
+      "revision": "982748aa7356fa838c2ea4994ddcb0b2a4b4cefa",
+      "scope": [
+        "include",
+        "tools/util/include",
+        "LICENSE.txt"
+      ]
+    }
   ]
 }

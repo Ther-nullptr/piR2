@@ -18,9 +18,19 @@ preceding source is streaming-inference-infra-code/vlm/streaming_vlm_kernels at
 1c6f8b8ac31c49e401ee267647b3f967725cd26e. The old provenance describes the earlier
 source tree; SOURCE_MANIFEST.json identifies the selected files imported here.
 
-The unchanged CUTLASS include/ and tools/util/include/ snapshot is NVIDIA/cutlass
-982748aa7356fa838c2ea4994ddcb0b2a4b4cefa, with its original BSD-3-Clause license,
-file-specific notices and original hashes in vendor/cutlass/.
+The default CUTLASS dependency is the official NVIDIA/cutlass Git submodule at
+vendor/cutlass/, with the reproducible default commit
+982748aa7356fa838c2ea4994ddcb0b2a4b4cefa recorded by the Git link and source
+manifest. Its original BSD-3-Clause license and file-specific notices are
+retained upstream. CUDA implementations outside this dependency remain piR2
+source files. Compatible CUTLASS roots can also be selected through CUTLASS_ROOT,
+including complete headers-only installations, or a compatible local submodule
+revision. Exact SHA equality is not required; the needed include/ and
+tools/util/include/ structure, APIs and CUDA/C++ toolchain must be compatible.
+Runtime provenance records the selected source and Git revision when available.
+Alternate installations retain their supplied notices. Changing the project's
+default pin is a separate reviewed change; personal version choices do not
+implicitly update it.
 
 The optional layernorm_pack and rms_statistics kernels retain their documented
 PyTorch 2.7.1 derivation and requirements. The original PyTorch license is retained

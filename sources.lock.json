@@ -34,6 +34,13 @@
       "license": "SIL-OFL-1.1",
       "optional": true,
       "patches": []
+    },
+    "cutlass": {
+      "url": "https://github.com/NVIDIA/cutlass.git",
+      "revision": "982748aa7356fa838c2ea4994ddcb0b2a4b4cefa",
+      "path": "coexecution/kernels/vendor/cutlass",
+      "mode": "submodule",
+      "patches": []
     }
   },
   "adapted_sources": {

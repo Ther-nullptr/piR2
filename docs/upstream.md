@@ -4,7 +4,7 @@
 
 The parent is pinned to `3af52ca400a6ec7d141416879aa531a6f62f697a`, and the GR00T fork to `2a39d591a3af24c42bb1d1c9cd708a2dddac0600`. Our repository owns the experiment entrypoints, LIBERO adaptation, timing/evaluation tooling and explicitly recorded corrections. It does not present the algorithm as newly invented here.
 
-Source locations and commits live in [sources.lock.json](../sources.lock.json). Model and simulation dependencies are downloaded into ignored directories without nested Git history. The operator sources used at runtime are owned under `coexecution/kernels/`, with explicit origin revisions, file hashes and retained notices. GR00T corrections remain patches against its pinned model source; kernel updates modify the owned implementation directly.
+Source locations and commits live in [sources.lock.json](../sources.lock.json). Model and simulation dependencies are downloaded into ignored working directories. The operator implementations used at runtime are owned under `coexecution/kernels/`, with explicit origin revisions, file hashes and retained notices. CUTLASS has an official Git submodule as its reproducible default; compatible environment installations are also supported. GR00T corrections remain patches against its pinned model source; kernel updates modify the owned implementation directly.
 
 The official release focuses on xArm6 + XHand deployment and GR00T training. Our LIBERO experiments and reconstructed Leap data therefore require separate validation; they are not the authors' original experiment assets.
 
@@ -12,11 +12,39 @@ The official release focuses on xArm6 + XHand deployment and GR00T training. Our
 
 The `robotics-kernels` origin is [Speedup Paradox](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/tree/239b4a3ef2268048571c9f508ad5700f98398c2f)
 at `239b4a3ef2268048571c9f508ad5700f98398c2f`. The selected integer/common
-runtime, CUDA GEMMs, Thor FP8/FP4 kernels and pinned CUTLASS headers now live in
+runtime, CUDA GEMMs and Thor FP8/FP4 kernels now live in
 [coexecution/kernels](../coexecution/kernels/). Their source manifest distinguishes
-original upstream bytes from repository adaptations. The preparation command
+original upstream bytes from repository adaptations and records the default
+CUTLASS dependency. The preparation command
 `python tools/prepare_sources.py --component robotics-kernels` verifies these
-owned files; it does not fetch an external runtime checkout or apply patches.
+owned files and records the actual selected CUTLASS source; it does not fetch an
+external runtime checkout, initialize the submodule, or apply patches.
+
+CUTLASS defaults to [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) at
+`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa`, the same revision previously recorded
+for the copied headers. piR2 tracks this default Git link at
+`coexecution/kernels/vendor/cutlass`, together with dependency metadata, rather
+than tracking each upstream header as a piR2 file. The original
+[CUTLASS license](https://github.com/NVIDIA/cutlass/blob/982748aa7356fa838c2ea4994ddcb0b2a4b4cefa/LICENSE.txt)
+and file-specific notices remain with the submodule. Actual piR2 CUDA operators
+remain local files outside that submodule.
+
+Initialize the default checkout with
+`git submodule update --init --recursive coexecution/kernels/vendor/cutlass`.
+Authors can alternatively set `CUTLASS_ROOT=/path/to/cutlass` for a compatible
+Git checkout or complete header installation, or select a compatible local
+submodule revision. Required `include/` and `tools/util/include/` structure and
+kernel/toolchain APIs must be available; arbitrary versions are not guaranteed
+to work. Actual Git revisions are recorded when available, and a different SHA
+alone is not rejected. Existing Git clones can also be used as optional download
+caches through `--reference` and `--dissociate`.
+
+After pulling or switching piR2 branches, use the update command when selecting
+that branch's recorded default. Preserve intentional local version choices;
+routine default setup does not need `--remote`. Keep personal submodule version
+changes out of unrelated commits. Changing the project's default CUTLASS pin
+remains a separate reviewed change. See the
+[setup choices](environment.md#cutlass-submodule).
 
 [PR #21](https://github.com/Ther-nullptr/piR2/pull/21)'s two biased M=41 FP4
 Swap-AB configurations are implemented directly in the owned FP4 CUDA source.

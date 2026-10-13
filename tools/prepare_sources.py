@@ -3,6 +3,8 @@
 import argparse
 import hashlib
 import json
+import os
+import sys
 import subprocess
 from pathlib import Path
 
@@ -40,7 +42,7 @@ def _verify_file(root, relative, expected):
 
 
 def prepare_vendored(spec):
-    """Verify reviewed source hashes without Git, model imports, or CUDA work."""
+    """Verify owned files and resolve headers without model imports or CUDA work."""
     target = ROOT / spec["path"]
     if (
         not target.is_dir()
@@ -70,34 +72,60 @@ def prepare_vendored(spec):
     for relative, record in files.items():
         _verify_file(target, relative, record["sha256"])
     count = len(files)
-    for vendor in manifest.get("vendors", []):
-        vendor_root = target / vendor["path"]
-        if (
-            Path(vendor["path"]).is_absolute()
-            or ".." in Path(vendor["path"]).parts
-            or vendor_root.is_symlink()
-            or not vendor_root.resolve().is_relative_to(target.resolve())
-        ):
-            raise RuntimeError("Vendor directory escapes its owned source tree")
-        metadata_path = _owned_path(target, vendor["manifest"])
-        if not metadata_path.resolve().is_relative_to(vendor_root.resolve()):
-            raise RuntimeError(
-                "Vendor manifest must reside inside its vendor directory"
-            )
-        metadata_path = _verify_file(target, vendor["manifest"], vendor["sha256"])
-        metadata = json.loads(metadata_path.read_text())
-        if metadata.get("revision") != vendor["revision"]:
-            raise RuntimeError("Vendored dependency revision differs from its manifest")
-        for relative, digest in metadata["files"].items():
-            _verify_file(vendor_root, relative, digest)
-        count += len(metadata["files"]) + 1
+    for submodule in manifest.get("submodules", []):
+        path = target / submodule["path"]
+        if not path.resolve().is_relative_to(target.resolve()):
+            raise RuntimeError("Submodule path escapes its owned source directory")
+        resolve_cutlass()
     print(f"Verified {count} owned source files in {target}; no checkout or build")
+
+
+def resolve_cutlass():
+    """Resolve compatible headers without requiring the default Git revision."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from coexecution.kernels.sources import require_submodule
+
+    dependency = require_submodule("cutlass")
+    print(
+        f"CUTLASS source: {dependency['directory']} "
+        f"(revision: {dependency.get('revision', 'unknown')})"
+    )
+    return dependency
+
+
+def prepare_submodule(spec):
+    if os.environ.get("CUTLASS_ROOT"):
+        resolve_cutlass()
+        return
+    target = ROOT / spec["path"]
+    if target.is_symlink() or not target.resolve().is_relative_to(ROOT.resolve()):
+        raise RuntimeError("Submodule path escapes the repository")
+    entry = git(ROOT, "ls-files", "--stage", "--", spec["path"]).stdout.strip()
+    metadata, separator, name = entry.partition("\t")
+    if (
+        not separator
+        or name != spec["path"]
+        or metadata.split() != ["160000", spec["revision"], "0"]
+    ):
+        raise RuntimeError("Submodule gitlink differs from sources.lock.json")
+    if not (target / ".git").exists():
+        subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive", "--", spec["path"]],
+            cwd=ROOT,
+            check=True,
+        )
+    resolve_cutlass()
+    print(f"Prepared CUTLASS dependency at {spec['path']}")
 
 
 def prepare(spec):
     mode = spec.get("mode", "git")
     if mode == "vendored":
         prepare_vendored(spec)
+        return
+    if mode == "submodule":
+        prepare_submodule(spec)
         return
     if mode != "git":
         raise ValueError(f"Unknown source preparation mode: {mode}")

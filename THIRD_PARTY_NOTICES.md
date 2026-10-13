@@ -19,8 +19,9 @@ The `robotics-kernels` record in [sources.lock.json](sources.lock.json) retains
 [robotics-the-speedup-paradox](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/tree/239b4a3ef2268048571c9f508ad5700f98398c2f)
 at `239b4a3ef2268048571c9f508ad5700f98398c2f` as its original source. Its mode is
 `vendored`: selected runtime modules and CUDA translation units now reside in
-[coexecution/kernels](coexecution/kernels/). No separate robotics checkout,
-external source directory or prebuilt robotics shared library is used at runtime.
+[coexecution/kernels](coexecution/kernels/). No separate robotics runtime checkout
+or prebuilt robotics shared library is used. The general CUTLASS header dependency
+can be selected independently as described below.
 [The owned source manifest](coexecution/kernels/SOURCE_MANIFEST.json) records the
 original path, revision and SHA-256 separately from each adapted file's SHA-256.
 `prepare_sources.py --component robotics-kernels` verifies this manifest without
@@ -41,15 +42,25 @@ project-wide license. That statement is preserved in
 and attribution do not assign a new license or treat a nested dependency license
 as an unrestricted license for the imported reference code or this repository.
 
-The unchanged NVIDIA CUTLASS snapshot at
-`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` is stored in
-[coexecution/kernels/vendor/cutlass](coexecution/kernels/vendor/cutlass/), limited
-to `include/`, `tools/util/include/`, the original
-[LICENSE.txt](coexecution/kernels/vendor/cutlass/LICENSE.txt), and
-[per-file provenance](coexecution/kernels/vendor/cutlass/PROVENANCE.json).
-Copyright 2017–2026 NVIDIA CORPORATION & AFFILIATES; BSD-3-Clause and file-specific
-notices remain intact. These terms cover that header snapshot, not upstream's
-independently written integer operator or the entire piR2 repository.
+The official [NVIDIA/CUTLASS repository](https://github.com/NVIDIA/cutlass) is a
+Git submodule at `coexecution/kernels/vendor/cutlass`, with piR2's Git link
+recording `982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` as the reproducible default.
+This is the same revision previously used for the copied headers. CUTLASS files
+are supplied by the submodule or a compatible `CUTLASS_ROOT` installation rather
+than duplicated as piR2-tracked files. The owned manifest retains the default
+submodule path and revision; runtime provenance records the source actually
+selected, including its Git revision when available. Integer and floating CUDA
+builds require a complete compatible `include/` tree and `tools/util/include/`.
+Exact SHA equality with the default is not a compatibility requirement.
+Copyright 2017–2026 NVIDIA CORPORATION & AFFILIATES; the original
+[BSD-3-Clause license](https://github.com/NVIDIA/cutlass/blob/982748aa7356fa838c2ea4994ddcb0b2a4b4cefa/LICENSE.txt)
+and file-specific notices remain intact. These terms cover CUTLASS, not the
+reference's independently written integer operator or the entire piR2 repository.
+Preserve the notices supplied with any alternate compatible installation.
+See [CUTLASS setup](docs/environment.md#cutlass-submodule) for the default
+submodule, direct reuse of complete headers, compatible local revisions and
+optional Git object-cache reuse. CUTLASS APIs and the CUDA/C++ toolchain still
+need to be compatible; selecting a different root is not a claim of validation.
 
 Blackwell sources retain the [MIT license](coexecution/kernels/blackwell/LICENSE),
 copyright 2025 MIT HAN Lab, and their preceding

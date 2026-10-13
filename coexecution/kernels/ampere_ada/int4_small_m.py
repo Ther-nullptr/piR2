@@ -23,7 +23,6 @@ from coexecution.kernels.ampere_ada._candidate_support import (
 )
 
 _BACKEND_SHA256 = "78689a96089653d3cf2f9fabb1fa64eeb5bb7ee835b7d3316297c7ef884a431f"
-_CUTLASS_REVISION = "982748aa7356fa838c2ea4994ddcb0b2a4b4cefa"
 _DISPATCH_MARKER = b"template <int Bits, bool WithBias>\nat::Tensor dispatch_tactic"
 _CACHED_HEADER = "pir2_int4_small_m_backend.cuh"
 _FAILED_BUILDS = set()
@@ -31,8 +30,6 @@ _FAILED_BUILDS = set()
 
 def _pinned_run_header(inputs):
     """Verify the run prefix and adapt only its swizzle and optional arguments."""
-    if inputs.get("cutlass_revision") != _CUTLASS_REVISION:
-        raise RuntimeError("CUTLASS revision does not match the pinned snapshot")
     try:
         source = Path(inputs["sources"][0]).read_bytes()
     except (OSError, KeyError, IndexError) as error:

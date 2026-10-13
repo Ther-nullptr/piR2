@@ -19,7 +19,23 @@ Modules are introduced through focused pull requests. Model weights, datasets, e
 
 ## Start / 开始
 
-Read [source provenance](docs/upstream.md), [environment boundaries](docs/environment.md) and [contribution rules](CONTRIBUTING.md). Fetch pinned upstream source only when needed:
+Read [source provenance](docs/upstream.md), [environment boundaries](docs/environment.md) and [contribution rules](CONTRIBUTING.md). New users can initialize the default official CUTLASS dependency with the clone:
+
+```bash
+git clone --recurse-submodules https://github.com/Ther-nullptr/piR2.git
+cd piR2
+```
+
+For an existing piR2 checkout using the default CUTLASS version, run
+`git submodule update --init --recursive coexecution/kernels/vendor/cutlass`
+after pulling or switching branches. The Git link records
+`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` as the reproducible default. Authors may
+instead set `CUTLASS_ROOT=/path/to/cutlass` to use an existing compatible full
+header tree, or keep a compatible local submodule revision; the exact SHA need
+not match. Actual CUDA operator implementations remain in this repository.
+[Setup instructions](docs/environment.md#cutlass-submodule) describe the required
+header structure, toolchain compatibility and optional Git object-cache reuse.
+Fetch the separately pinned model source when needed:
 
 ```bash
 python3 tools/prepare_sources.py --component groot
