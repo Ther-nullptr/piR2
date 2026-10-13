@@ -32,6 +32,7 @@ def main():
         "tests/contracts/test_vlm_patching.py",
         "tests/contracts/test_policy_vlm.py",
         "tests/contracts/test_policy_measurement.py",
+        "tests/contracts/test_prepared_inference.py",
         "tests/contracts/test_libero_profiling.py",
         "tests/contracts/test_libero_experiments.py",
         "tests/contracts/test_feature_transport.py",

@@ -1,6 +1,12 @@
 """Exclusive GPU activity accounting; CPU records never become GPU work."""
 
 import importlib
+import json
+import sys
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
 
 
 def test_leaf_device_work_and_active_union_are_distinct():
@@ -100,3 +106,76 @@ def test_measured_norm_producers_are_separate_from_standalone_activation_packing
     ]
     assert report["gpu_work_ms"] == 1.5
     assert report["device_event_count"] == 3
+
+
+def test_model_only_profile_prepares_before_capture_and_marks_actual_request_scopes(
+    monkeypatch, tmp_path
+):
+    module = importlib.import_module("coexecution.libero.profiling")
+    measurement = importlib.import_module("coexecution.libero.measurement")
+    calls = []
+
+    class Profile:
+        def __enter__(self):
+            calls.append("capture_start")
+            return self
+
+        def __exit__(self, *exc):
+            calls.append("capture_end")
+
+        def export_chrome_trace(self, path):
+            with open(path, "w") as output:
+                json.dump({"traceEvents": []}, output)
+
+    @contextmanager
+    def record(name):
+        calls.append(name)
+        yield
+
+    def prepare(observation):
+        calls.append("prepare")
+        return {"inputs": observation}, None
+
+    model = SimpleNamespace(
+        prepare_input=lambda value: (value, value),
+        backbone=lambda value: calls.append("vlm") or value,
+        action_head=SimpleNamespace(get_action=lambda *args: calls.append("action")),
+    )
+    policy = SimpleNamespace(
+        model=model,
+        _collate_observation=prepare,
+        get_action=lambda value: pytest.fail("Raw policy entered model-only profile"),
+    )
+    session = SimpleNamespace(
+        graphs=None, action_graph=None, config=SimpleNamespace(vlm_graph=False)
+    )
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(synchronize=lambda device: None),
+        profiler=SimpleNamespace(
+            profile=lambda **kwargs: Profile(),
+            record_function=record,
+            ProfilerActivity=SimpleNamespace(CPU="cpu", CUDA="cuda"),
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(measurement, "_seed_reset", lambda *args: None)
+    result = module.collect_model_profile(
+        policy,
+        [{"pixel": 1}, {"pixel": 2}],
+        session,
+        tmp_path / "trace.json",
+        rounds=2,
+        seed=3,
+        device="cuda:0",
+        model_only=True,
+        observation_ids=["obs-a", "obs-b"],
+    )
+    assert calls.count("prepare") == 2
+    assert "prepare" not in calls[calls.index("capture_start") :]
+    assert calls.count("vlm") == 6 and calls.count("action") == 6
+    assert result["input_preparation_included"] is False
+    assert result["instrumented"] is True and result["calls"] == 4
+    assert len({row["request_id"] for row in result["requests"]}) == 4
+    assert {row["observation_id"] for row in result["requests"]} == {"obs-a", "obs-b"}
+    for row in result["requests"]:
+        assert row["annotation"] in calls

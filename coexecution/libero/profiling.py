@@ -10,14 +10,30 @@ import re
 from collections import defaultdict
 
 STAGE_PREFIX = "GR00T_BENCH/stage/"
+REQUEST_PREFIX = "GR00T_BENCH/request/"
 
 
 def collect_model_profile(
-    policy, observations, session, output, *, rounds, seed, device
+    policy,
+    observations,
+    session,
+    output,
+    *,
+    rounds,
+    seed,
+    device,
+    model_only=False,
+    observation_ids=None,
+    max_prepared_observations=16,
 ):
     """Separate instrumented model probe after priming; never a clean wall sample."""
     import torch
 
+    from coexecution.libero.inference import (
+        PreparedInferenceEngine,
+        PreparedInputs,
+        prepare_observations,
+    )
     from coexecution.libero.measurement import (
         _prepare,
         _seed_reset,
@@ -25,30 +41,69 @@ def collect_model_profile(
         graph_snapshot,
     )
 
+    if type(rounds) is not int or rounds < 1:
+        raise ValueError("Profile rounds must be positive")
+    if observation_ids is None:
+        observation_ids = [f"obs-{index}" for index in range(len(observations))]
+    if len(observations) != len(observation_ids) or len(set(observation_ids)) != len(
+        observation_ids
+    ):
+        raise ValueError("One unique profile identity is required per observation")
+    prepared = None
+    engine = PreparedInferenceEngine(policy.model)
+    if model_only:
+        prepared = prepare_observations(
+            policy, observations, observation_ids, limit=max_prepared_observations
+        )
     for index, observation in enumerate(observations):
         _seed_reset(policy, seed + index, device)
-        policy.get_action(observation)
+        if model_only:
+            engine.full(prepared[index])
+        else:
+            policy.get_action(observation)
+    torch.cuda.synchronize(device)
+    engine = PreparedInferenceEngine(
+        policy.model,
+        stage=lambda name: torch.profiler.record_function(STAGE_PREFIX + name),
+    )
     before = graph_snapshot(session)
     output.parent.mkdir(parents=True, exist_ok=True)
+    requests = []
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ]
     ) as profiler:
-        for _ in range(rounds):
+        for round_index in range(rounds):
             for index, observation in enumerate(observations):
                 _seed_reset(policy, seed + index, device)
-                with torch.profiler.record_function(
-                    STAGE_PREFIX + "preparation_transfer"
-                ):
-                    backbone, action, _states = _prepare(policy, observation)
+                request_id = f"profile-r{round_index}-o{index}"
+                annotation = REQUEST_PREFIX + request_id
+                requests.append(
+                    {
+                        "request_id": request_id,
+                        "annotation": annotation,
+                        "round": round_index,
+                        "observation": index,
+                        "observation_id": observation_ids[index],
+                        "seed": seed + index,
+                    }
+                )
+                with torch.profiler.record_function(annotation):
+                    if model_only:
+                        inputs = prepared[index]
+                    else:
+                        with torch.profiler.record_function(
+                            STAGE_PREFIX + "preparation_transfer"
+                        ):
+                            backbone, action, states = _prepare(policy, observation)
+                            torch.cuda.synchronize(device)
+                        inputs = PreparedInputs(
+                            backbone, action, states, observation_ids[index]
+                        )
+                    engine.full(inputs)
                     torch.cuda.synchronize(device)
-                with torch.profiler.record_function(STAGE_PREFIX + "vlm"):
-                    features = policy.model.backbone(backbone)
-                with torch.profiler.record_function(STAGE_PREFIX + "action"):
-                    policy.model.action_head.get_action(features, action, None)
-                torch.cuda.synchronize(device)
     profiler.export_chrome_trace(str(output))
     after = graph_snapshot(session)
     calls = rounds * len(observations)
@@ -76,7 +131,15 @@ def collect_model_profile(
         calls=calls,
         trace=str(output),
         graph_audit=audit,
-        scope="Instrumented preparation + full VLM and Flow4; output decoding excluded; separate from unprofiled wall/event spans",
+        scope=(
+            "Instrumented prepared full VLM and Flow4"
+            if model_only
+            else "Instrumented preparation + full VLM and Flow4"
+        )
+        + "; output decoding excluded; separate from clean wall/event spans",
+        instrumented=True,
+        input_preparation_included=not model_only,
+        requests=requests,
     )
     return result
 
