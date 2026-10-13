@@ -169,7 +169,18 @@ class NonGemmAdapters:
         )
 
     def set(self, mode):
-        assert mode in ("baseline", "rope_rms", "all")
+        components = {
+            "baseline": set(),
+            "vision_rope": {"vision_rope"},
+            "text_rope": {"text_rope"},
+            "rope": {"vision_rope", "text_rope"},
+            "rmsnorm": {"rmsnorm"},
+            "rope_rms": {"vision_rope", "text_rope", "rmsnorm"},
+            "all": {"vision_rope", "text_rope", "rmsnorm", "adaln"},
+        }
+        if mode not in components:
+            raise ValueError(f"Unknown non-GEMM fusion mode: {mode}")
+        enabled = components[mode]
         for name, m, original, had, kind in self.records:
             if had:
                 m.forward = original
@@ -177,7 +188,11 @@ class NonGemmAdapters:
                 del m.forward
             if mode == "baseline":
                 continue
-            if kind.endswith("Attention"):
+            rope = {
+                "Qwen3VLVisionAttention": "vision_rope",
+                "Qwen3VLTextAttention": "text_rope",
+            }.get(kind)
+            if rope in enabled:
                 fn = clone_forward(
                     original.__func__,
                     {
@@ -186,7 +201,7 @@ class NonGemmAdapters:
                     },
                 )
                 m.forward = types.MethodType(fn, m)
-            elif kind == "Qwen3VLTextRMSNorm":
+            elif kind == "Qwen3VLTextRMSNorm" and "rmsnorm" in enabled:
 
                 def forward(mod, x, _ref=original):
                     return self.checked(
@@ -197,7 +212,7 @@ class NonGemmAdapters:
                     )
 
                 m.forward = types.MethodType(forward, m)
-            elif mode == "all":
+            elif kind == "AdaLayerNorm" and "adaln" in enabled:
 
                 def forward(mod, x, temb=None, _ref=original):
                     scale, shift = mod.linear(mod.silu(temb)).chunk(2, dim=-1)
