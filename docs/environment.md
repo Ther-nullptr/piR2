@@ -1,6 +1,6 @@
 # Environment boundaries
 
-Use separate environments for GR00T training/inference, LIBERO simulation, and JAX/MJX Leap simulation. Model computations require CUDA. The source preparation tool downloads Git repositories only; it does not install a working GPU environment or download gated weights.
+Use separate environments for GR00T training/inference, LIBERO simulation, and JAX/MJX Leap simulation. Model computations require CUDA. The source preparation tool downloads pinned Git repositories or verifies repository-owned source manifests; it does not install a GPU environment or download gated weights.
 
 ```bash
 python3 tools/prepare_sources.py --component groot
@@ -32,8 +32,8 @@ its model dependencies, including Transformers 4.57.3 and Diffusers 0.35.1. Do n
 upgrade the working model environment merely to install the optional backend.
 
 The extension requires a CUDA toolkit with `nvcc`, a compatible C++17 compiler,
-Ninja, and the Torch-compatible Triton package. Compilation happens on first
-use and belongs outside timed inference. The reference uses SM80-compatible
+Ninja, and the Torch-compatible Triton package. Explicit builds or the first opted-in backend load use Torch's extension cache;
+compilation belongs outside timed inference. The integer source uses SM80-compatible
 integer kernels on Ampere/Ada; the GR00T integration's recorded GPU validation is
 on Ada, not a claim of validation on every supported architecture.
 
@@ -41,23 +41,44 @@ From the repository root, with the intended model environment activated:
 
 ```bash
 python tools/prepare_sources.py --component robotics-kernels
-export PYTHONPATH="$PWD:$PWD/third_party/robotics-the-speedup-paradox/src:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$PWD:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
+python -m coexecution.kernels.build --help
+python -m coexecution.kernels.build --backend integer --describe
 ```
 
-This source-path setup preserves the packaged CUDA sources and CUTLASS headers.
-Alternatively, install the same checkout as an editable package in that model
-environment, retaining the GR00T source path:
+The first command verifies the selected source hashes already stored under
+`coexecution/kernels`; it does not fetch, reset or overwrite that directory.
+`--help`, `--describe` and the operator inventory are CPU-only metadata access and
+do not import Torch or Triton. CUDA/CUTLASS inputs are resolved inside the
+repository, and runtime adapters import `coexecution.kernels` directly. No
+`robotics-inference-bench` installation, external robotics source path or
+`ROBOTICS_CUTLASS_*_SO` setting is needed or read by the owned loaders.
+
+Build the selected native backends before timed inference or Graph capture:
 
 ```bash
-python -m pip install --no-deps --no-build-isolation -e third_party/robotics-the-speedup-paradox
+export TORCH_EXTENSIONS_DIR="$PWD/.local/torch-extensions"
+python -m coexecution.kernels.build --backend integer
+python -m coexecution.kernels.build --backend integer_dispatch
+python -m coexecution.kernels.build --backend bf16_fusion
 ```
 
-The pinned `pyproject.toml` names the distribution `robotics-inference-bench`,
-requires Python >=3.10 and setuptools >=68, and declares no runtime dependencies.
-Neither command installs or replaces Torch, Triton, CUDA or the model packages;
-install compatible prerequisites deliberately in the chosen environment. Keep
-the editable dependency checkout in place: its CUDA build reads the bundled
-headers and provenance at runtime. Review its [source and licensing boundaries](../THIRD_PARTY_NOTICES.md).
+The two metadata commands above can run without CUDA. These three build commands
+require the intended CUDA toolkit and model environment; they do not execute a
+model or choose an optimization profile. CUTLASS's exact header snapshot and
+original notices live under `coexecution/kernels/vendor/cutlass`. Review the
+[source and licensing boundaries](../THIRD_PARTY_NOTICES.md), including the
+upstream integer/common code's unselected project license.
+
+Additional native Ada candidates are optional and restricted to SM89. Their
+shape/layout guards retain the reference path when ineligible. Native LayerNorm
+packing additionally requires PyTorch 2.7.1; native RMS statistics requires
+`2.7.1+cu126`, the recorded Torch Git revision and the exact installed reduction
+header hash. These narrow contracts do not establish compatibility for all
+candidates in the historical PyTorch 2.9 environment. Use the
+[operator inventory and explicit profiles](../coexecution/README.md#owned-operators-and-explicit-profiles)
+to inspect each implementation before enabling it; organization has not added
+new measured speedups or task-quality evidence.
 
 The adapters are opt-in for standard Flow and serial πR² inference, with optional pure-DiT CUDA Graph.
 Streaming condition grouping and paired optimized workers remain unsupported.
@@ -80,25 +101,29 @@ machine). A successful SSH login or Torch import does not establish that access.
 Have the administrator provide an approved GPU execution context; do not run the
 model as root or change shared device permissions from the project setup.
 
-With the pinned complete `robotics-kernels` checkout and a compatible existing
-CUDA toolkit, build both backends explicitly for Thor:
+With the owned sources and an existing compatible CUDA toolkit, build the
+floating backends explicitly. The build definitions target Thor `sm_110a` and
+use the same repository-owned CUTLASS headers:
 
 ```bash
-ref="$PWD/third_party/robotics-the-speedup-paradox"
-cutlass="$ref/src/robotics_kernels/ampere_ada/third_party/cutlass"
+python tools/prepare_sources.py --component robotics-kernels
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
 export CPATH="$CUDA_HOME/include${CPATH:+:$CPATH}"
-for precision in fp8 fp4; do
-  python "$ref/tools/build_blackwell.py" --backend "$precision" --arch 11.0a \
-    --cutlass-root "$cutlass" --build-dir "$PWD/.local/build/$precision"
-done
-export ROBOTICS_CUTLASS_FP8_SO="$PWD/.local/build/fp8/robotics_cutlass_fp8_ext.so"
-export ROBOTICS_CUTLASS_FP4_SO="$PWD/.local/build/fp4/robotics_cutlass_fp4_ext.so"
-export PYTHONPATH="$PWD:$ref/src:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
+export TORCH_EXTENSIONS_DIR="$PWD/.local/torch-extensions"
+export PYTHONPATH="$PWD:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
+python -m coexecution.kernels.build --backend fp8
+python -m coexecution.kernels.build --backend fp4
 export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
 export TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"
 ```
+
+There is no external CUTLASS-root or shared-library override. The runtime's
+`require_fp8_backend` / `require_fp4_backend` loaders validate SM110 before an
+on-demand build. Metadata access remains GPU-free. The retained decode-policy
+settings use `PIR2_FP8_DECODE_POLICY` / `PIR2_FP4_DECODE_POLICY` (default `auto`),
+with `PIR2_FP8_SWAP_AB=1` by default; ordinary GR00T projection tactics remain
+explicit in the Thor adapter.
 
 Triton 3.6 selects a separate Blackwell assembler; on the tested installation its
 bundled binary did not recognize `sm_110a`. The second assembler variable is needed

@@ -137,13 +137,13 @@ def test_integer_loadability_does_not_claim_hardware_validation(
     _, namespace, device = runtime(monkeypatch, "w8a8", architecture)
     loader(monkeypatch, "w8a8", lambda: operators(namespace, "w8a8"))
     report = capabilities.preflight_backend(config("w8a8"), device)
-    assert report["backend_id"] == "robotics_integer"
+    assert report["backend_id"] == "pir2_integer"
     assert report["validated_architectures"] == ["sm_89"]
     assert report["runtime_arch_validated"] is validated
 
 
 def test_observed_library_hash_uses_loaded_path_not_environment(monkeypatch, tmp_path):
-    actual = tmp_path / "robotics_cutlass_fp8_ext.so"
+    actual = tmp_path / "pir2_cutlass_fp8_ext.so"
     actual.write_bytes(b"loaded backend")
     requested = tmp_path / "requested-but-not-loaded.so"
     requested.write_bytes(b"unrelated binary")
@@ -161,13 +161,13 @@ def test_observed_library_hash_uses_loaded_path_not_environment(monkeypatch, tmp
         report["binary"]["selected"]["sha256"]
         == hashlib.sha256(actual.read_bytes()).hexdigest()
     )
-    assert report["backend_id"] == "robotics_cutlass_fp8"
+    assert report["backend_id"] == "pir2_cutlass_fp8"
     assert report["device_arch"] == "sm_110"
     assert report["runtime"]["torch"] == "test-torch"
 
 
 def test_preloaded_operator_origin_remains_unknown(monkeypatch, tmp_path):
-    actual = tmp_path / "robotics_integer_ext.so"
+    actual = tmp_path / "pir2_integer_ext.so"
     actual.write_bytes(b"already loaded")
     _, namespace, device = runtime(monkeypatch, "w8a8", (8, 9), loaded=(actual,))
     operators(namespace, "w8a8")
@@ -184,7 +184,7 @@ def test_preloaded_operator_origin_remains_unknown(monkeypatch, tmp_path):
 def test_partially_preloaded_namespace_has_no_unique_binary_identity(
     monkeypatch, tmp_path
 ):
-    actual = tmp_path / "robotics_integer_ext.so"
+    actual = tmp_path / "pir2_integer_ext.so"
     actual.write_bytes(b"additional operators")
     fake, namespace, device = runtime(monkeypatch, "w8a8", (8, 9))
     namespace.gemm = lambda: None
@@ -199,23 +199,19 @@ def test_partially_preloaded_namespace_has_no_unique_binary_identity(
     assert report["binary"]["selected"] is None
 
 
-def test_source_identity_does_not_mistake_parent_repository_for_backend(
-    monkeypatch, tmp_path
-):
+def test_source_identity_does_not_mistake_parent_repository_for_backend(tmp_path):
     module = tmp_path / "site-packages/robotics_kernels/integer.py"
     module.parent.mkdir(parents=True)
     module.write_text("# packaged module\n")
-    monkeypatch.setattr(
-        capabilities.subprocess, "check_output", lambda *args, **kwargs: str(tmp_path)
-    )
     result = capabilities._source_identity(SimpleNamespace(__file__=str(module)))
     assert result["revision"] == "unknown"
     assert result["dirty"] == "unknown"
     assert result["module_sha256"] == hashlib.sha256(module.read_bytes()).hexdigest()
-    assert result["expected_revision"] == "239b4a3ef2268048571c9f508ad5700f98398c2f"
+    assert result["expected_revision"].startswith("sha256:")
+    assert result["upstream_revision"] == "239b4a3ef2268048571c9f508ad5700f98398c2f"
 
 
-def test_source_identity_requires_tracked_module_and_detects_untracked_source(tmp_path):
+def test_external_git_tracking_cannot_claim_owned_kernel_identity(tmp_path):
     def git(*args):
         return subprocess.check_output(
             [
@@ -247,13 +243,13 @@ def test_source_identity_requires_tracked_module_and_detects_untracked_source(tm
     git("add", "src/robotics_kernels/ampere_ada/integer.py")
     git("commit", "-qm", "track runtime source")
     result = capabilities._source_identity(SimpleNamespace(__file__=str(module)))
-    assert result["module_tracked"] is True
-    assert result["revision"] == git("rev-parse", "HEAD").strip()
-    assert result["dirty"] is False
+    assert result["module_tracked"] is False
+    assert result["revision"] == "unknown"
+    assert result["dirty"] == "unknown"
 
     (module.parent / "custom_kernel.cu").write_text("// untracked backend source\n")
     result = capabilities._source_identity(SimpleNamespace(__file__=str(module)))
-    assert result["dirty"] is True
+    assert result["dirty"] == "unknown"
 
 
 def test_modified_source_cannot_claim_a_clean_profile_revision(monkeypatch):

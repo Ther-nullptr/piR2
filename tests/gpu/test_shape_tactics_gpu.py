@@ -9,8 +9,8 @@ if os.environ.get("PIR2_GPU_TESTS") != "1":
     pytest.skip("Set PIR2_GPU_TESTS=1 for explicit CUDA tests", allow_module_level=True)
 
 import torch
-from robotics_kernels.ampere_ada.integer import IntegerProjectionGroup
-from robotics_kernels.common.graph import CudaGraphCall
+from coexecution.kernels.ampere_ada.integer import IntegerProjectionGroup
+from coexecution.kernels.common.graph import CudaGraphCall
 
 from coexecution.optimization.backends.integer.linear import (
     PreparedLinear,

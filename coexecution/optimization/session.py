@@ -31,6 +31,7 @@ class GrootOptimizations:
         self.stack = ExitStack()
         self.coverage = {}
         self.backend = {}
+        self.operator_profile = None
         self.boundary = None
 
     def __enter__(self):
@@ -78,6 +79,19 @@ class GrootOptimizations:
         # Validate the selected backend/profile before modifying model methods
         # or weight layouts. Dependency loading is allowed, patching is not.
         self.backend = preflight_backend(self.config, next(model.parameters()).device)
+        if self.config.operator_profile is not None:
+            from coexecution.optimization.operators import OperatorProfile
+
+            data = self.backend["operator_profile"]
+            self.operator_profile = OperatorProfile(
+                data["architecture"],
+                data["precision"],
+                data["implementations"],
+                data.get("parameters", {}),
+            )
+        profile = self.operator_profile
+        implementations = {} if profile is None else dict(profile.implementations)
+        pointwise = None
         clear_cache = lambda: None
         if self.config.vision_channels_last:
             proj = model.backbone.model.visual.patch_embed.proj
@@ -95,12 +109,17 @@ class GrootOptimizations:
             from coexecution.groot_fusion import NonGemmAdapters
             from coexecution.groot_pointwise import PointwiseFusion
 
-            fusion = NonGemmAdapters(self.policy, "native")
+            fusion = NonGemmAdapters(
+                self.policy,
+                "native" if self.config.fusion_mode == "all" else "triton",
+                implementations=implementations,
+            )
             self.stack.callback(fusion.close)
-            fusion.set("all")
-            pointwise = PointwiseFusion(self.policy)
-            self.stack.callback(pointwise.close)
-            pointwise.set("dit")
+            fusion.set(self.config.fusion_mode)
+            if self.config.fusion_mode == "all":
+                pointwise = PointwiseFusion(self.policy)
+                self.stack.callback(pointwise.close)
+                pointwise.set("dit")
         if self.config.precision in ("fp8", "fp4"):
             from coexecution.optimization.groot.floating import FloatingProjections
 
@@ -132,15 +151,21 @@ class GrootOptimizations:
             from coexecution.optimization.groot.integer_connections import (
                 AdditionalConnections,
             )
+            from coexecution.optimization.installation import (
+                configure_integer_controller,
+                fuse_integer_modulation,
+                install_integer_adapters,
+            )
 
             controller = TransformerINT(
                 model,
                 executed,
-                native=True,
+                native=implementations.get("activation_pack", "native") == "native",
                 expanded=expanded,
                 condition_group=self.config.group_conditioning,
             )
             self.stack.callback(controller.close)
+            configure_integer_controller(controller, profile)
             extra = AdditionalConnections(self.policy, controller, categories)
             self.stack.callback(extra.close)
             apply_tactics(
@@ -150,7 +175,7 @@ class GrootOptimizations:
             extra.set(
                 self.config.precision,
                 expanded=expanded,
-                fuse=self.config.fusion,
+                fuse=fuse_integer_modulation(self.config, profile),
                 norm_quant=self.config.norm_modulation_quant,
                 residual_quant=self.config.residual_norm_quant,
             )
@@ -163,6 +188,9 @@ class GrootOptimizations:
                 "projection_groups": controller.groups,
                 "tactic_policy": "Exact runtime shape, then explicit site/group, then 0",
             }
+            self.coverage["operator_adapters"] = install_integer_adapters(
+                self, controller, pointwise, profile
+            )
             clear_cache = controller.clear_projection_cache
         if self.config.dit_graph:
             from coexecution.optimization.execution.graph import DitGraphs
@@ -188,7 +216,13 @@ class GrootOptimizations:
 
     def evidence(self):
         config = asdict(self.config)
-        for key in ("coverage", "tactics", "group_tactics", "shape_tactics"):
+        for key in (
+            "coverage",
+            "tactics",
+            "group_tactics",
+            "shape_tactics",
+            "operator_profile",
+        ):
             path = config[key]
             config[key] = (
                 None
@@ -199,6 +233,11 @@ class GrootOptimizations:
             "config": config,
             "coverage": self.coverage,
             "backend": self.backend,
+            "operator_selection": (
+                None
+                if self.operator_profile is None
+                else self.operator_profile.to_dict()
+            ),
             "scope": "Experimental serial inference; replay checks do not establish task quality",
         }
 

@@ -11,7 +11,7 @@ if os.environ.get("PIR2_GPU_TESTS") != "1":
 
 import torch
 import torch.nn.functional as F
-from robotics_kernels.ampere_ada.modulation import prepare_modulation
+from coexecution.kernels.ampere_ada.modulation import prepare_modulation
 
 from coexecution.optimization.config import OptimizationConfig
 from coexecution.optimization.groot import integer_connections as connections

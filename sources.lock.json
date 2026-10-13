@@ -20,8 +20,10 @@
     "robotics-kernels": {
       "url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox.git",
       "revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
-      "path": "third_party/robotics-the-speedup-paradox",
-      "patches": []
+      "path": "coexecution/kernels",
+      "patches": [],
+      "mode": "vendored",
+      "manifest": "coexecution/kernels/SOURCE_MANIFEST.json"
     },
     "source_han_sans": {
       "url": "https://github.com/adobe-fonts/source-han-sans",
@@ -32,6 +34,33 @@
       "license": "SIL-OFL-1.1",
       "optional": true,
       "patches": []
+    }
+  },
+  "adapted_sources": {
+    "pytorch-layernorm": {
+      "url": "https://github.com/pytorch/pytorch/blob/v2.7.1/aten/src/ATen/native/cuda/layer_norm_kernel.cu",
+      "version": "2.7.1",
+      "sha256": "33918b0ff55731188917a16740b03e9b4982cba70fb0e65af8d17b8fc41d5473",
+      "local_adapter": "coexecution/kernels/ampere_ada/csrc/layernorm_pack.cu",
+      "license": "BSD-3-Clause",
+      "license_file": "licenses/PYTORCH_LICENSE"
+    },
+    "cutlass-group-store": {
+      "url": "https://github.com/NVIDIA/cutlass/blob/982748aa7356fa838c2ea4994ddcb0b2a4b4cefa/include/cutlass/epilogue/threadblock/fusion/visitor_store.hpp",
+      "version": "982748aa7356fa838c2ea4994ddcb0b2a4b4cefa",
+      "sha256": "79df769d67b7301f76749a2699cdebb265d32ff60d46b3acb526303a00e03af9",
+      "local_adapter": "coexecution/kernels/ampere_ada/csrc/integer_epilogue.cu",
+      "license": "BSD-3-Clause",
+      "license_file": "coexecution/kernels/vendor/cutlass/LICENSE.txt"
+    },
+    "pytorch-rms-reduction": {
+      "url": "https://github.com/pytorch/pytorch/blob/v2.7.1/aten/src/ATen/native/cuda/Reduce.cuh",
+      "version": "2.7.1",
+      "git_revision": "e2d141dbde55c2a4370fac5165b0561b6af4798b",
+      "sha256": "afde4f3f5831bec60eacf9ebeaf2e4e0ac82e0a48b5fd8296520a67c9645a412",
+      "local_adapter": "coexecution/kernels/ampere_ada/csrc/rms_statistics.cu",
+      "license": "BSD-3-Clause",
+      "license_file": "licenses/PYTORCH_LICENSE"
     }
   }
 }

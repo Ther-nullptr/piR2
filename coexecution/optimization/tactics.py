@@ -41,10 +41,8 @@ def read_shape_tactics(path, *, backend_evidence=None):
                 raise ValueError(
                     f"Shape tactic profile {key} does not match the runtime backend"
                 )
-        if profile["backend_id"] != "robotics_integer":
-            raise ValueError(
-                "Integer shape tactics require the robotics_integer backend"
-            )
+        if profile["backend_id"] != "pir2_integer":
+            raise ValueError("Integer shape tactics require the pir2_integer backend")
         formats = {"w8a8-symmetric-row-v1": 8, "w4a4-symmetric-row-v1": 4}
         if profile["quant_format"] not in formats:
             raise ValueError("Unsupported integer shape tactic quant_format")

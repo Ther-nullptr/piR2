@@ -24,8 +24,29 @@ class OptimizationConfig:
     fp_grouped: bool = False
     fp_swiglu: bool = False
     component: str = "all"
+    fusion_mode: str = "all"
+    operator_profile: Path | None = None
 
     def __post_init__(self):
+        if self.fusion_mode not in (
+            "vision_rope",
+            "text_rope",
+            "rope",
+            "rmsnorm",
+            "rope_rms",
+            "all",
+        ):
+            raise ValueError("Unknown operator fusion mode")
+        if self.fusion_mode != "all" and not self.fusion:
+            raise ValueError("Selective mode requires operator fusion")
+        if self.fusion_mode != "all" and (
+            self.group_conditioning or self.norm_modulation_quant
+        ):
+            raise ValueError("DiT producer options require all operator fusion")
+        if self.operator_profile is not None and not (
+            self.fusion or self.precision != "bf16"
+        ):
+            raise ValueError("Operator profile requires fusion or low-bit precision")
         if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
             raise ValueError("Precision must be bf16, w8a8, w4a4, fp8 or fp4")
         if self.fp8_fast_quant and self.precision != "fp8":
@@ -94,6 +115,12 @@ def add_optimization_arguments(parser):
         default="bf16",
     )
     parser.add_argument("--operator-fusion", action="store_true")
+    parser.add_argument(
+        "--operator-fusion-mode",
+        choices=["vision_rope", "text_rope", "rope", "rmsnorm", "rope_rms", "all"],
+        default="all",
+    )
+    parser.add_argument("--operator-profile", type=Path)
     parser.add_argument("--dit-cuda-graph", action="store_true")
     parser.add_argument(
         "--quantization-scope", choices=["transformer", "all"], default="transformer"
@@ -120,6 +147,8 @@ def optimization_config(args):
     return OptimizationConfig(
         precision=args.inference_precision,
         fusion=args.operator_fusion,
+        fusion_mode=args.operator_fusion_mode,
+        operator_profile=args.operator_profile,
         dit_graph=args.dit_cuda_graph,
         scope=args.quantization_scope,
         component=args.quantization_component,

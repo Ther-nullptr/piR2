@@ -7,7 +7,6 @@ kernels preserve upstream rounding; see THIRD_PARTY_NOTICES.md for provenance.
 import json
 import types
 from collections import Counter
-from pathlib import Path
 
 import torch
 import triton
@@ -62,6 +61,21 @@ def modulation(x, s, h):
     return y
 
 
+def native_modulation(x, scale, shift):
+    """Use the measured CUDA specialization only for its complete input contract."""
+    if (
+        tuple(x.shape) == (1, 41, 1536)
+        and tuple(scale.shape) == tuple(shift.shape) == (1, 1536)
+        and all(value.is_cuda for value in (x, scale, shift))
+        and x.device == scale.device == shift.device
+        and x.dtype == scale.dtype == shift.dtype == torch.bfloat16
+        and all(value.is_contiguous() for value in (x, scale, shift))
+        and not any(value.requires_grad for value in (x, scale, shift))
+    ):
+        return torch.ops.pir2_bf16_fusion.adaln_modulation(x, scale, shift)
+    return modulation(x, scale, shift)
+
+
 def same(a, b):
     if isinstance(a, tuple):
         return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
@@ -103,7 +117,7 @@ def clone_forward(fn, replacements):
 
 
 class NonGemmAdapters:
-    def __init__(self, policy, adaln_backend="triton"):
+    def __init__(self, policy, adaln_backend="triton", *, implementations=None):
         from transformers.models.qwen3_vl import modeling_qwen3_vl as q
 
         if policy.model.training or adaln_backend not in ("triton", "native"):
@@ -116,17 +130,17 @@ class NonGemmAdapters:
         self.fixtures = {}
         self.records = []
         self.modulation = modulation
-        if adaln_backend == "native":
-            from torch.utils.cpp_extension import load
+        self.implementations = dict(implementations or {})
+        adaln_backend = self.implementations.get("adaln", adaln_backend)
+        if (
+            adaln_backend == "native"
+            or self.implementations.get("vision_rope") == "native"
+        ):
+            from coexecution.kernels.build import build_extension
 
-            source = Path(__file__).with_name("csrc") / "fusion_torch.cu"
-            load(
-                name="gr00t_exact_fusion",
-                sources=[str(source)],
-                extra_cuda_cflags=["-O3", "-lineinfo", "--fmad=false", "--ftz=false"],
-                is_python_module=False,
-            )
-            self.modulation = torch.ops.gr00t_exact_fusion.adaln_modulation
+            build_extension("bf16_fusion")
+        if adaln_backend == "native":
+            self.modulation = native_modulation
         for name, m in policy.model.named_modules():
             kind = type(m).__name__
             if kind in (
@@ -150,8 +164,26 @@ class NonGemmAdapters:
         return out
 
     def vision(self, *args):
+        candidate = ops.vision_rope
+        if self.implementations.get("vision_rope") == "native":
+            q, k, cos, sin = args
+            if (
+                q.ndim == k.ndim == 3
+                and q.shape == k.shape
+                and tuple(q.shape[1:]) == (16, 64)
+                and 1 <= q.shape[0] <= 4096
+                and tuple(q.stride()[1:]) == tuple(k.stride()[1:]) == (64, 1)
+                and q.stride(0) in (1024, 3072)
+                and k.stride(0) in (1024, 3072)
+                and tuple(cos.shape) == tuple(sin.shape) == (q.shape[0], 64)
+                and cos.dtype == sin.dtype
+                and cos.dtype in (torch.float32, torch.bfloat16)
+                and cos.is_contiguous()
+                and sin.is_contiguous()
+            ):
+                candidate = torch.ops.pir2_bf16_fusion.vision_rope
         return self.checked(
-            "vision_rope", self.q.apply_rotary_pos_emb_vision, ops.vision_rope, args
+            "vision_rope", self.q.apply_rotary_pos_emb_vision, candidate, args
         )
 
     def text(self, *args, **kwargs):
@@ -181,6 +213,11 @@ class NonGemmAdapters:
         if mode not in components:
             raise ValueError(f"Unknown non-GEMM fusion mode: {mode}")
         enabled = components[mode]
+        enabled = {
+            component
+            for component in enabled
+            if self.implementations.get(component) != "reference"
+        }
         for name, m, original, had, kind in self.records:
             if had:
                 m.forward = original
@@ -207,7 +244,12 @@ class NonGemmAdapters:
                     return self.checked(
                         "rmsnorm",
                         _ref,
-                        lambda a: ops.rmsnorm(a, mod.weight, mod.variance_epsilon),
+                        lambda a: ops.rmsnorm(
+                            a,
+                            mod.weight,
+                            mod.variance_epsilon,
+                            statistics=self.implementations.get("rmsnorm", "triton"),
+                        ),
                         (x,),
                     )
 
