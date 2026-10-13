@@ -122,6 +122,7 @@ class GrootOptimizations:
                 pointwise.set("dit")
         if self.config.precision in ("fp8", "fp4"):
             from coexecution.optimization.groot.floating import FloatingProjections
+            from coexecution.optimization.installation import selected_fp4_swap_ab
 
             floating = FloatingProjections(
                 model,
@@ -129,6 +130,7 @@ class GrootOptimizations:
                 expanded=expanded,
                 precision=self.config.precision,
                 fast_fp8=self.config.fp8_fast_quant,
+                fp4_swap_ab=selected_fp4_swap_ab(self.config, profile),
                 shared_inputs=self.config.fp_shared_inputs,
                 grouped=self.config.fp_grouped,
                 swiglu=self.config.fp_swiglu,

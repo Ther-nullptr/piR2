@@ -3,6 +3,7 @@
 import torch
 
 from coexecution.optimization.backends.thor.linear import (
+    THOR_FP4_SWAP_AB_SHAPES,
     FloatingInputGroup,
     FloatingLinear,
     FloatingProjectionGroup,
@@ -21,12 +22,15 @@ class FloatingProjections:
         expanded=False,
         precision="fp8",
         fast_fp8=False,
+        fp4_swap_ab=False,
         shared_inputs=False,
         grouped=False,
         swiglu=False,
     ):
         if precision not in ("fp8", "fp4"):
             raise ValueError("Floating precision must be fp8 or fp4")
+        if fp4_swap_ab and precision != "fp4":
+            raise ValueError("FP4 Swap-AB requires precision=fp4")
         alignment = 16 if precision == "fp8" else 32
         all_sites, groups, _, text = inventory(model, expanded=True)
         selected = all_sites if expanded else inventory(model)[0]
@@ -55,6 +59,14 @@ class FloatingProjections:
                 else "0 for M>1 (bias-aware), 3 for M=1"
             ),
             "activation_scale_refresh": "Every invocation",
+            "fp4_swap_ab": {
+                "enabled": fp4_swap_ab,
+                "shapes_mkn_bias": sorted(THOR_FP4_SWAP_AB_SHAPES)
+                if fp4_swap_ab
+                else [],
+                "operator": "pir2_cutlass_fp4.linear_forward_packed_gemm_bf16_swap_ab",
+                "fallback": "Existing FP4 tactic outside exact shapes or without bias",
+            },
             "activation_quantizer": "Triton two-pass"
             if fast_fp8
             else "Pinned reference",
@@ -95,7 +107,9 @@ class FloatingProjections:
             raise ValueError("Floating quantization selected no supported projections")
         try:
             for name, (module, role, scope) in selected.items():
-                quantized = FloatingLinear(module, name, precision, fast_fp8=fast_fp8)
+                quantized = FloatingLinear(
+                    module, name, precision, fast_fp8=fast_fp8, fp4_swap_ab=fp4_swap_ab
+                )
                 self.linears[name] = quantized
                 self.coverage["linears"].append(
                     {
@@ -163,6 +177,7 @@ class FloatingProjections:
                             owner_name,
                             precision,
                             fast_fp8,
+                            fp4_swap_ab=fp4_swap_ab,
                             contiguous=selected[names[0]][1:] == ("AttnQ", "text"),
                         )
                         # Individual packed weights are no longer used by grouped sites.

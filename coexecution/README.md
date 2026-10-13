@@ -379,6 +379,37 @@ All options default off. Close the scope before changing weights or configuratio
   bias-aware tactic 0 for M>1 and tactic 3 for M=1. The pinned FP4 backend's
   nonzero prefill tactics omit the bias epilogue and are deliberately avoided.
   Ada integer tactic files, category selection and condition grouping are rejected.
+
+`--fp4-swap-ab` (Python: `OptimizationConfig(precision="fp4", fp4_swap_ab=True)`)
+is an additional opt-in SM110 dispatch. It uses the repository-owned FP4 CUDA
+backend described in [environment setup](../docs/environment.md). The unified
+operator profile can select the same implementation with
+`"floating_gemm": "swap_ab"`; `native` retains the original floating dispatch. Only
+`(M,K,N,has_bias)=(41,256,1536,true)` and `(41,1536,1536,true)` use the new API;
+all other signatures, including biasless and M=1 calls, keep the previous path.
+The selected tile is `(128,64,256)` after swapping W and X, with cluster
+`(2,1,1)`/two stages for K=256 and `(4,1,1)`/automatic stages for K=1536.
+Both use the reference dynamic scheduler. Column-major output writes directly
+to the original contiguous `[M,N]` result; there is no output transpose kernel.
+Weights/activations remain E2M1 with block-16 UE4M3 scales, FP32 accumulation
+and BF16 output. Packing, masks and attention are unchanged.
+
+The two shapes were selected by repeated CUDA Graph event timing over actual
+module weights, followed by numerical and full-replay checks. Their measured
+operator gains do not establish a complete-policy speedup: paired full-replay
+wall timing did not show a consistent improvement. BF16 rounding boundaries
+may differ on arbitrary inputs, and existing FP4 quantization error remains;
+this option is not LIBERO closed-loop quality acceptance. Disable the flag to
+restore the original FP4 dispatch, or leave the optimization scope to restore
+BF16. Public CI does not execute CUDA; run the explicit tests on Thor:
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_fp4_swap_ab_gpu.py
+```
+
+These tests cover dynamic Graph inputs, nonzero bias, unsupported-shape fallback,
+buffer rejection and exception restoration. Recalibrate before expanding the
+signature table or claiming gains on a different checkpoint or workload.
 - `scope=all` covers eligible ordinary Linear projections, including vocabulary
   and conditioning projections. FP8 requires K/N divisible by 16; FP4 by 32.
   CategorySpecificLinear and excluded/unaligned sites remain BF16 and are listed

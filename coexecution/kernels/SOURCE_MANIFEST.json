@@ -212,8 +212,13 @@
       "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "origin_path": "src/robotics_kernels/blackwell/csrc/fp4_cutlass_linear.cu",
       "origin_sha256": "57a8f0aef04a8889e9698c1ba32618ec2fe1b1d80c9303ec07fbc4013f03fb42",
-      "sha256": "23cfbe3dbebded58547c0d58bd4a205b74fcc5e64d719c79b1cc7a78b82364d1",
-      "adaptation": "Operator registration namespace renamed to pir2; CUDA algorithm and formatting retained."
+      "sha256": "62e489ad470dfc0ccd76968b9947389d9d589fe872f05a7054743c6cc71d4097",
+      "adaptation": "Owned namespace; PR #21 FP4 Swap-AB integrated directly, with input alignment and inference guards.",
+      "integrated_change": {
+        "url": "https://github.com/Ther-nullptr/piR2/pull/21",
+        "revision": "4147186b973fb85b32045208b9ba4028342ceacb",
+        "original_patch_path": "patches/robotics-thor-fp4-swap-ab.patch"
+      }
     },
     "blackwell/csrc/fp8_cutlass_linear.cu": {
       "origin": "robotics-the-speedup-paradox",
@@ -248,7 +253,7 @@
       "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "origin_path": "src/robotics_kernels/blackwell/fp4_linear.py",
       "origin_sha256": "d447a2427b5b494593ffb5a8bb63a91110263dbca5ae8c5f14cfb597045c7b3f",
-      "sha256": "21b0dd0d26a5c9db317906560ad887fcaf25cabe6f7d398b5efe235c5d6fe301",
+      "sha256": "5572192413f6cd4071de49c948adc10ac0d0c2f572c1a7da588176a50858552d",
       "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
     },
     "blackwell/fp8_linear.py": {
@@ -262,7 +267,7 @@
     },
     "build.py": {
       "origin": "pir2-project",
-      "sha256": "b0457249824bfb420076da690de8624b940bb4b759a6e08c7348e86af3171b42"
+      "sha256": "891d7bf3cabc40c87fea9d956dd417b8ea9485f38ae5ad0565435334d6f3b36c"
     },
     "common/__init__.py": {
       "origin": "pir2-project",

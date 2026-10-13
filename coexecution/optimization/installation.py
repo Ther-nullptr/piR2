@@ -15,6 +15,11 @@ FUSION_COMPONENTS = {
 
 
 def validate_selection(config, profile):
+    if (
+        getattr(config, "fp4_swap_ab", False)
+        and profile.get("floating_gemm") == "native"
+    ):
+        raise ValueError("Explicit native floating GEMM and FP4 Swap-AB overlap")
     enabled = FUSION_COMPONENTS[config.fusion_mode] if config.fusion else set()
     for family in ("vision_rope", "text_rope", "rmsnorm", "adaln"):
         implementation = profile.get(family, "reference")
@@ -67,6 +72,12 @@ def fuse_integer_modulation(config, profile):
         config.fusion
         and config.fusion_mode == "all"
         and (profile is None or "adaln" not in profile.implementations)
+    )
+
+
+def selected_fp4_swap_ab(config, profile):
+    return getattr(config, "fp4_swap_ab", False) or (
+        profile is not None and profile.get("floating_gemm") == "swap_ab"
     )
 
 

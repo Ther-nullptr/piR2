@@ -245,6 +245,16 @@ _INVENTORY = (
         ("fp8", "fp4"),
         ("sm_110",),
     ),
+    _implementation(
+        "floating_gemm",
+        "swap_ab",
+        "coexecution/kernels/blackwell/csrc/fp4_cutlass_linear.cu",
+        "cuda+cutlass",
+        "Thor FP4 with bias: exact (M,K,N)=(41,256,1536)/(41,1536,1536); native otherwise",
+        "Preserves NVFP4 format; tested-input equivalence, not universal BF16 bitwise equality",
+        ("fp4",),
+        ("sm_110",),
+    ),
     *(
         _implementation(
             family,

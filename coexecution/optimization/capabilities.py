@@ -172,6 +172,16 @@ def preflight_backend(config, device):
         report["operator_profile"] = operator_profile.to_dict()
     if precision != "bf16":
         spec = BACKENDS[precision]
+        from coexecution.optimization.installation import selected_fp4_swap_ab
+
+        if precision == "fp4" and selected_fp4_swap_ab(config, operator_profile):
+            spec = dict(
+                spec,
+                operators=(
+                    *spec["operators"],
+                    "linear_forward_packed_gemm_bf16_swap_ab",
+                ),
+            )
         before = _loaded_libraries(torch)
         missing_before = _missing_operators(torch, spec)
         backend = importlib.import_module(spec["module"])

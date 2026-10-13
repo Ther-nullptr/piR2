@@ -9,6 +9,7 @@ REQUIRED_OPS = (
     "pack_linear_weight_gemm_bf16",
     "pack_activation_gemm_bf16",
     "linear_forward_packed_gemm_bf16_tactic",
+    "linear_forward_packed_gemm_bf16_swap_ab",
 )
 
 

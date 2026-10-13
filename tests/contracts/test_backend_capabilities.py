@@ -113,6 +113,20 @@ def test_exact_selected_api_is_required(monkeypatch, precision, missing):
         capabilities.preflight_backend(config(precision), device)
 
 
+def test_fp4_swap_ab_requires_new_api_only_when_enabled(monkeypatch):
+    _, namespace, device = runtime(monkeypatch, "fp4", (11, 0))
+    loader(monkeypatch, "fp4", lambda *args: operators(namespace, "fp4"))
+    cfg = config("fp4")
+    report = capabilities.preflight_backend(cfg, device)
+    name = "linear_forward_packed_gemm_bf16_swap_ab"
+    assert name not in report["required_operators"]
+    cfg.fp4_swap_ab = True
+    with pytest.raises(RuntimeError, match=name):
+        capabilities.preflight_backend(cfg, device)
+    setattr(namespace, name, lambda *args: pytest.fail("No GPU execution in CI"))
+    assert name in capabilities.preflight_backend(cfg, device)["required_operators"]
+
+
 @pytest.mark.parametrize("precision", ["w8a8", "w4a4"])
 def test_integer_loader_rejection_propagates_without_precision_fallback(
     monkeypatch, precision

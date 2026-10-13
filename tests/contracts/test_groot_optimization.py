@@ -30,6 +30,19 @@ def test_default_does_not_import_gpu_modules_or_touch_policy():
     assert set(sys.modules) == before
 
 
+def test_fp4_swap_ab_is_opt_in_and_precision_specific():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", "fp4", "--fp4-swap-ab"])
+    )
+    assert config.fp4_swap_ab
+    assert not OptimizationConfig(precision="fp4").fp4_swap_ab
+    for precision in ("bf16", "fp8", "w8a8", "w4a4"):
+        with pytest.raises(ValueError, match="Swap-AB requires precision=fp4"):
+            OptimizationConfig(precision=precision, fp4_swap_ab=True)
+
+
 @pytest.mark.parametrize("precision", ["fp8", "fp4"])
 def test_floating_precision_is_opt_in_and_accepts_serial_graph(precision):
     parser = argparse.ArgumentParser()

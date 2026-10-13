@@ -86,3 +86,15 @@ and retains its CUTLASS notice. Exact upstream hashes and license paths are also
 recorded under `adapted_sources` in the lock file. These candidates remain
 explicit opt-ins with guarded fallback; this organization does not establish a
 new speedup or LIBERO closed-loop result.
+
+## Owned Thor FP4 Swap-AB implementation
+
+The implementation introduced by [piR2 PR #21](https://github.com/Ther-nullptr/piR2/pull/21)
+at `4147186b973fb85b32045208b9ba4028342ceacb` is integrated directly into
+`coexecution/kernels/blackwell/csrc/fp4_cutlass_linear.cu`. It adapts the pinned
+Blackwell `fp4_mx_cutlass_linear.cu::mx_swap_gemm` layout and bias epilogue to
+NVFP4 on both operands. Copyright 2025 MIT HAN Lab and the original
+[MIT license](coexecution/kernels/blackwell/LICENSE) remain with the source.
+The former external dependency patch is no longer applied or required. The
+source manifest records this additional adaptation without replacing the
+original Blackwell file provenance.

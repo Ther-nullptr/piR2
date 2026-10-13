@@ -2785,7 +2785,189 @@ std::vector<at::Tensor> fused_prefill_cache_update_rope_bf16(
 
 } // namespace
 
+// Integrated from piR2 PR #21, commit 4147186b973fb85b32045208b9ba4028342ceacb.
+// Adapted from the pinned Blackwell fp4_mx_cutlass_linear.cu::mx_swap_gemm.
+// Copyright (c) 2025 MIT HAN Lab. MIT license: ../LICENSE.
+// Swap W/X, retain block-16 scales, and store column-major [N,M] directly into
+// contiguous [M,N]. Per-row bias is the original output-channel bias.
+namespace thor_fp4_swap_ab {
+
+using namespace cute;
+
+using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+using ElementC = cutlass::bfloat16_t;
+using ElementD = cutlass::bfloat16_t;
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm100;
+using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::ColumnMajor;
+using LayoutCD = cutlass::layout::ColumnMajor;
+constexpr int AlignmentA = 32;
+constexpr int AlignmentB = 32;
+constexpr int AlignmentCD = 8;
+
+template <int CM, int Stages> struct Spec {
+  using MmaTileShape = Shape<_128, _64, _256>;
+  using ClusterShape = Shape<Int<CM>, _1, _1>;
+  using FusionOperation = cutlass::epilogue::fusion::LinCombPerRowBias<
+      ElementD, ElementAccumulator, ElementD, ElementC, ElementAccumulator,
+      AlignmentCD>;
+
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, MmaTileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+          ElementAccumulator, ElementC, LayoutCD, AlignmentCD, ElementD,
+          LayoutCD, AlignmentCD,
+          cutlass::epilogue::collective::EpilogueScheduleAuto,
+          FusionOperation>::CollectiveOp;
+
+  using CollectiveMainloop =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB,
+          LayoutB, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
+          std::conditional_t<
+              Stages == 0,
+              cutlass::gemm::collective::StageCountAutoCarveout<static_cast<
+                  int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+              cutlass::gemm::collective::StageCount<Stages>>,
+          cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+template <typename S>
+void run(at::Tensor &output, const at::Tensor &packed_input,
+         const at::Tensor &input_scale, const at::Tensor &packed_weight,
+         const at::Tensor &weight_scale, const at::Tensor *bias, int64_t m,
+         int64_t n, int64_t k, cudaStream_t stream) {
+  using Gemm = typename S::Gemm;
+  using GemmKernel = typename S::GemmKernel;
+  using CollectiveMainloop = typename S::CollectiveMainloop;
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideB = typename GemmKernel::StrideB;
+  using StrideC = typename GemmKernel::StrideC;
+  using StrideD = typename GemmKernel::StrideD;
+  using ArrayElementA = typename CollectiveMainloop::ElementA;
+  using ArrayElementB = typename CollectiveMainloop::ElementB;
+  using ScaleTypeA = ElementA::ScaleFactorType;
+  using ScaleTypeB = ElementB::ScaleFactorType;
+  using ScaleConfig = typename CollectiveMainloop::Sm1xxBlkScaledConfig;
+  int ni = static_cast<int>(n);
+  int mi = static_cast<int>(m);
+  int ki = static_cast<int>(k);
+  auto stride_a = cutlass::make_cute_packed_stride(StrideA{}, {ni, ki, 1});
+  auto stride_b = cutlass::make_cute_packed_stride(StrideB{}, {mi, ki, 1});
+  auto stride_c = cutlass::make_cute_packed_stride(StrideC{}, {ni, mi, 1});
+  auto stride_d = cutlass::make_cute_packed_stride(StrideD{}, {ni, mi, 1});
+  // The pinned SFA/SFB layout atoms are identical: swapping the packed matrix
+  // pointers must also swap the corresponding block-16 scale pointers.
+  auto layout_sfa =
+      ScaleConfig::tile_atom_to_shape_SFA(make_shape(ni, mi, ki, 1));
+  auto layout_sfb =
+      ScaleConfig::tile_atom_to_shape_SFB(make_shape(ni, mi, ki, 1));
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {ni, mi, ki, 1},
+      {reinterpret_cast<const ArrayElementA *>(
+           packed_weight.data_ptr<uint8_t>()),
+       stride_a,
+       reinterpret_cast<const ArrayElementB *>(
+           packed_input.data_ptr<uint8_t>()),
+       stride_b,
+       reinterpret_cast<const ScaleTypeA *>(weight_scale.data_ptr<uint8_t>()),
+       layout_sfa,
+       reinterpret_cast<const ScaleTypeB *>(input_scale.data_ptr<uint8_t>()),
+       layout_sfb},
+      {{},
+       reinterpret_cast<const ElementC *>(output.data_ptr<at::BFloat16>()),
+       stride_c,
+       reinterpret_cast<ElementD *>(output.data_ptr<at::BFloat16>()),
+       stride_d}};
+  arguments.hw_info.device_id = packed_input.get_device();
+  arguments.hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+          arguments.hw_info.device_id);
+  arguments.epilogue.thread.alpha = 1.0f;
+  arguments.epilogue.thread.beta = 0.0f;
+  arguments.epilogue.thread.bias_ptr =
+      bias == nullptr
+          ? nullptr
+          : reinterpret_cast<const ElementD *>(bias->data_ptr<at::BFloat16>());
+  Gemm gemm;
+  auto status = gemm.can_implement(arguments);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "CUTLASS Thor FP4 Swap-AB cannot implement M=", m, ", N=", n,
+              ", K=", k);
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  auto workspace = at::empty({static_cast<int64_t>(workspace_size)},
+                             packed_input.options().dtype(at::kByte));
+  status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "CUTLASS Thor FP4 Swap-AB initialization failed");
+  status = gemm.run(arguments, workspace.data_ptr(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "CUTLASS Thor FP4 Swap-AB launch failed");
+}
+
+} // namespace thor_fp4_swap_ab
+
+at::Tensor linear_forward_packed_gemm_bf16_swap_ab(const at::Tensor &a,
+                                                   const at::Tensor &z,
+                                                   const at::Tensor &w,
+                                                   const at::Tensor &ws,
+                                                   const at::Tensor &bias) {
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && a.size(1) == w.size(1),
+              "Swap-AB packed input/weight shapes mismatch");
+  for (const auto &t : {a, z, w, ws}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == a.device() &&
+                    t.scalar_type() == at::kByte && t.is_contiguous(),
+                "Swap-AB requires contiguous CUDA uint8 buffers on one device");
+  }
+  const int64_t m = a.size(0), n = w.size(0), packed_k = a.size(1);
+  TORCH_CHECK(m == 41 && n == 1536 && (packed_k == 128 || packed_k == 768),
+              "Swap-AB supports only (M,K,N)=(41,256,1536)/(41,1536,1536)");
+  const int64_t k = packed_k * 2;
+  TORCH_CHECK(z.numel() >= ((m + 127) / 128) * 128 * ((k + 63) / 64) * 4 &&
+                  ws.numel() >= ((n + 127) / 128) * 128 * ((k + 63) / 64) * 4,
+              "Swap-AB scale buffer too small");
+  TORCH_CHECK(bias.is_cuda() && bias.device() == a.device() &&
+                  bias.scalar_type() == at::kBFloat16 && bias.is_contiguous() &&
+                  bias.dim() == 1 && bias.numel() == n && !bias.requires_grad(),
+              "Swap-AB requires a contiguous BF16 output-channel bias without "
+              "autograd");
+  // Owned packers return aligned allocations. Reject shifted contiguous views
+  // before TMA descriptors or vectorized bias loads consume their base
+  // pointers.
+  for (const auto &t : {a, z, w, ws, bias}) {
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+        "Swap-AB requires 16-byte aligned packed, scale and bias buffers");
+  }
+  const c10::cuda::CUDAGuard guard(a.device());
+  const auto *properties = at::cuda::getDeviceProperties(a.get_device());
+  TORCH_CHECK(properties->major == 11 && properties->minor == 0,
+              "Swap-AB supports only Thor SM110");
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+  auto output = at::empty({m, n}, a.options().dtype(at::kBFloat16));
+  if (k == 256) {
+    thor_fp4_swap_ab::run<thor_fp4_swap_ab::Spec<2, 2>>(output, a, z, w, ws,
+                                                        &bias, m, n, k, stream);
+  } else {
+    thor_fp4_swap_ab::run<thor_fp4_swap_ab::Spec<4, 0>>(output, a, z, w, ws,
+                                                        &bias, m, n, k, stream);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
+
 TORCH_LIBRARY(pir2_cutlass_fp4, m) {
+  m.def("linear_forward_packed_gemm_bf16_swap_ab(Tensor a, Tensor z, "
+        "Tensor w, Tensor ws, Tensor bias) -> Tensor");
   m.def("supports_device(int cc) -> bool");
   m.def("set_decode_policy(int policy) -> ()");
   m.def("get_decode_policy() -> int");
@@ -2852,6 +3034,8 @@ TORCH_LIBRARY(pir2_cutlass_fp4, m) {
 }
 
 TORCH_LIBRARY_IMPL(pir2_cutlass_fp4, CUDA, m) {
+  m.impl("linear_forward_packed_gemm_bf16_swap_ab",
+         &linear_forward_packed_gemm_bf16_swap_ab);
   m.impl("pack_linear_weight", &pack_linear_weight);
   m.impl("pack_linear_weight_gemm_bf16", &pack_linear_weight_gemm_bf16);
   m.impl("linear_forward", &linear_forward);

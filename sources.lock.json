@@ -61,6 +61,15 @@
       "local_adapter": "coexecution/kernels/ampere_ada/csrc/rms_statistics.cu",
       "license": "BSD-3-Clause",
       "license_file": "licenses/PYTORCH_LICENSE"
+    },
+    "thor-fp4-swap-ab": {
+      "url": "https://github.com/Ther-nullptr/piR2/pull/21",
+      "revision": "4147186b973fb85b32045208b9ba4028342ceacb",
+      "origin_patch_sha256": "edfbcc9675de78b45babe0cc148949387a8f0d4369dedebcc0948e20f9592527",
+      "local_implementation": "coexecution/kernels/blackwell/csrc/fp4_cutlass_linear.cu",
+      "license": "MIT",
+      "license_file": "coexecution/kernels/blackwell/LICENSE",
+      "integration": "Direct owned source; no external patch application"
     }
   }
 }

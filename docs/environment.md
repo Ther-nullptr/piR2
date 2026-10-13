@@ -125,6 +125,12 @@ settings use `PIR2_FP8_DECODE_POLICY` / `PIR2_FP4_DECODE_POLICY` (default `auto`
 with `PIR2_FP8_SWAP_AB=1` by default; ordinary GR00T projection tactics remain
 explicit in the Thor adapter.
 
+The optional `--fp4-swap-ab` path is implemented directly in the owned
+`coexecution/kernels/blackwell/csrc/fp4_cutlass_linear.cu`, including its new
+registered operator. Rebuild the local `fp4` backend after updating this source;
+there is no external patch to apply. The two exact biased M=41 signatures retain
+their explicit opt-in dispatch; other signatures use the existing FP4 path.
+
 Triton 3.6 selects a separate Blackwell assembler; on the tested installation its
 bundled binary did not recognize `sm_110a`. The second assembler variable is needed
 for the optional fast FP8 packer and uses the already installed compatible
