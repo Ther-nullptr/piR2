@@ -13,9 +13,9 @@ from diffusers.models.activations import GELU
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import SinusoidalPositionalEmbedding
 from gr00t.model.modules.dit import AdaLayerNorm, BasicTransformerBlock
-from coexecution.kernels.common.fused import prepare_gelu
 
 from coexecution.groot_pointwise import PreparedAttention
+from coexecution.kernels.common.fused import prepare_gelu
 
 
 def dispatch_residual(controller, q, x, residual, lut=None, up=None):

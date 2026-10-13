@@ -12,17 +12,15 @@ from functools import lru_cache
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from coexecution.kernels.ampere_ada._candidate_support import (
     is_ada_device,
     owned_build_identity,
     require_pre_capture_build,
 )
-import torch.nn.functional as F
 from coexecution.kernels.ampere_ada.integer import PackedActivation
-
 from coexecution.optimization.backends.integer.linear import prepare
-
 
 _FAILED_BUILDS = set()
 

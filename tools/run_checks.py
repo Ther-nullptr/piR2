@@ -29,11 +29,16 @@ def main():
         "tests/contracts/test_backend_capabilities.py",
         "tests/contracts/test_streaming_components.py",
         "tests/contracts/test_tactic_profiles.py",
+        "tests/contracts/test_operator_validation.py",
         "coexecution/test_queue_report.py",
         "coexecution/test_feature_usage.py",
         "tests/contracts/test_libero_inference_backend.py",
         "tests/contracts/test_libero_model_loading.py",
         "tests/contracts/test_libero_imports.py",
+        "tests/contracts/test_contention_cli.py",
+        "tests/contracts/test_contention_worker.py",
+        "tests/contracts/test_contention_campaign.py",
+        "tests/contracts/test_contention_analysis.py",
         "simulator/test_serve.py",
     ]
     tests = [x for x in contracts if (ROOT / x).is_file()]

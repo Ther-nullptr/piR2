@@ -6,9 +6,9 @@ Formats are symmetric signed row-wise activations and output-channel weights,
 float32 scales, int32 accumulation, BF16 output; INT4 uses low-nibble-first bytes.
 """
 
+import weakref
 from dataclasses import dataclass
 from functools import lru_cache
-import weakref
 
 import torch
 import triton

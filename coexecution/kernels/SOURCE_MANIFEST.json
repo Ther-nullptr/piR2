@@ -118,7 +118,7 @@
       "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
       "origin_path": "coexecution/quantization_gemv.py",
       "origin_sha256": "6cfe26b59b6eb89f6b2784696b4d38a2e345ad225dc7559b4ec92c353f5c4653",
-      "sha256": "610038aa48adaa0499fd32c226ef50d8da7f3932a8a2139a663f13c38d397aa6",
+      "sha256": "95abfd3d572fc71aa0b878a5d1bd1d187b360b25f9d3e8af73e9b11e3b3568e6",
       "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
     },
     "ampere_ada/int4_small_m.py": {
@@ -136,7 +136,7 @@
       "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "origin_path": "src/robotics_kernels/ampere_ada/integer.py",
       "origin_sha256": "bbf45987d8098e7e5289db6e2086d1ca322b08b3a928095bcda4a91d0573c5ce",
-      "sha256": "da85327f71ca58d0ef193f75b0010538037289e96064e0a7f2a2c6bfee68e189",
+      "sha256": "d8de21e90077230c8260a036dfc35f1e993c26946256fe5aa052154d78e5c326",
       "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
     },
     "ampere_ada/modulation.py": {
@@ -145,7 +145,7 @@
       "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "origin_path": "src/robotics_kernels/ampere_ada/modulation.py",
       "origin_sha256": "86a3cadd90dc57fbef8410ddf7939bb84c39ebce3c48ce781db4cfce483009d9",
-      "sha256": "86a3cadd90dc57fbef8410ddf7939bb84c39ebce3c48ce781db4cfce483009d9",
+      "sha256": "bf8a20b0cc2a84d229aadfb7ad7d85dc373421d0340f8419ed96dcce5b731385",
       "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
     },
     "ampere_ada/norm.py": {
@@ -154,7 +154,7 @@
       "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
       "origin_path": "coexecution/quantization_norm.py",
       "origin_sha256": "ee1f30a8bf130024a091b4389861c82cc46d526d3b4a0682d13834dbfc6279f5",
-      "sha256": "e5188465a138b898af4445c3241ef1577b0ebc88fab08f956842d8cf3bf0260c",
+      "sha256": "3c5dd63b9b2a3f2dc5d7276ef95c5d3841dbc178df5244fd1e65c1d534b7c785",
       "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
     },
     "ampere_ada/producers.py": {
@@ -163,7 +163,7 @@
       "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
       "origin_path": "coexecution/quantization_producers.py",
       "origin_sha256": "31512d4fd51073442b6c081ced5ebabfe88a7ff33ed95bfe182eb6d428571657",
-      "sha256": "f052eb9730c2535bf82c7d0fbf4e288e8a59549e3585e7599d418d09432d6a3b",
+      "sha256": "e86f94b1014eff6d18beb3f5fda7327b3458c9e452b8f79304d9973b1d81a82b",
       "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
     },
     "ampere_ada/rms_statistics.py": {
@@ -244,8 +244,8 @@
       "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "origin_path": "src/robotics_kernels/blackwell/extension_loader.py",
       "origin_sha256": "808dd31ef6f1f76b3a752d00662c6da23a3a5caf3a644cc3e27afd83896379ce",
-      "sha256": "f53af6d8a91ab771b7d44c120d5c3ccc4dba76f46e59253094037dbdb22139ec",
-      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+      "sha256": "9922a722444181fa3a0c7ed375d12c1c9d9218256c58b7e9ab3f1514a98f5b3c",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere. Environment defaults are strings before the unchanged integer conversion."
     },
     "blackwell/fp4_linear.py": {
       "origin": "robotics-the-speedup-paradox",

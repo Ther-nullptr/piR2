@@ -36,9 +36,10 @@ def validate_selection(config, profile):
             raise ValueError("Selected producers require full DiT fusion")
         if config.component == "vlm":
             raise ValueError("Selected producers require the DiT component")
-    if profile.get("rmsnorm_pack", "reference") != "reference":
-        if "rmsnorm" not in enabled or config.component == "dit":
-            raise ValueError("RMS packing requires selected text RMSNorm fusion")
+    if profile.get("rmsnorm_pack", "reference") != "reference" and (
+        "rmsnorm" not in enabled or config.component == "dit"
+    ):
+        raise ValueError("RMS packing requires selected text RMSNorm fusion")
     if "layernorm_pack" in profile.implementations and config.norm_modulation_quant:
         raise ValueError("Profile LayerNorm and norm_modulation_quant overlap")
     if "adaln" in profile.implementations and config.norm_modulation_quant:
