@@ -1,6 +1,6 @@
 """Instance-local DiT CUDA Graph capture, independent of quantization format."""
 
-from robotics_kernels.common.graph import CudaGraphCall
+from coexecution.kernels.common.graph import CudaGraphCall
 
 
 class DitGraphs:

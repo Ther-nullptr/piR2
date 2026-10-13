@@ -200,21 +200,28 @@ def _rms_tail_kernel(
     tl.store(OUTPUT + offsets, weight * normalized, offsets < N)
 
 
-def rmsnorm(x, weight, eps):
+def rmsnorm(x, weight, eps, *, statistics="triton"):
     """Fused cast/square and tail, retaining PyTorch's exact FP32 mean reduction."""
     assert x.is_cuda and x.device == weight.device
     assert x.dtype == weight.dtype == torch.bfloat16
     assert (
         x.is_contiguous() and weight.is_contiguous() and weight.numel() == x.shape[-1]
     )
-    squared = torch.empty_like(x, dtype=torch.float32)
-    _launch(
-        _square_fp32_kernel,
-        (triton.cdiv(x.numel(), 256),),
-        (x, squared),
-        (x.numel(), 256),
-    )
-    variance = squared.mean(-1, keepdim=True)
+    if statistics == "native":
+        from coexecution.kernels.ampere_ada.rms_statistics import mean_square
+
+        variance = mean_square(x)
+    elif statistics == "triton":
+        squared = torch.empty_like(x, dtype=torch.float32)
+        _launch(
+            _square_fp32_kernel,
+            (triton.cdiv(x.numel(), 256),),
+            (x, squared),
+            (x.numel(), 256),
+        )
+        variance = squared.mean(-1, keepdim=True)
+    else:
+        raise ValueError("RMS statistics implementation must be native or triton")
     output = torch.empty_like(x)
     _launch(
         _rms_tail_kernel,

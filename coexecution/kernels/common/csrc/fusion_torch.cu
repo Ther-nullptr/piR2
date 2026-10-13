@@ -39,10 +39,10 @@ static at::Tensor modulation_op(const at::Tensor& x,const at::Tensor& scale,cons
     C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
 }
 
-TORCH_LIBRARY(gr00t_exact_fusion,m) {
+TORCH_LIBRARY(pir2_bf16_fusion,m) {
     m.def("vision_rope(Tensor q, Tensor k, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
     m.def("adaln_modulation(Tensor x, Tensor scale, Tensor shift) -> Tensor");
 }
-TORCH_LIBRARY_IMPL(gr00t_exact_fusion,CUDA,m) {
+TORCH_LIBRARY_IMPL(pir2_bf16_fusion,CUDA,m) {
     m.impl("vision_rope",rope_op);m.impl("adaln_modulation",modulation_op);
 }

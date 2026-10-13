@@ -5,7 +5,7 @@ Reuses robotics-the-speedup-paradox revision
 """
 
 import torch
-from robotics_kernels.ampere_ada.modulation import (
+from coexecution.kernels.ampere_ada.modulation import (
     PackedActivations,
     prepare_modulation,
     prepare_norm_modulation,

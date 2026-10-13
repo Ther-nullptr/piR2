@@ -44,9 +44,9 @@ class FloatingProjections:
         self.groups = []
         self.coverage = {
             "backend": (
-                "robotics_cutlass_fp8.linear_forward_packed_tactic"
+                "pir2_cutlass_fp8.linear_forward_packed_tactic"
                 if precision == "fp8"
-                else "robotics_cutlass_fp4.linear_forward_packed_gemm_bf16_tactic"
+                else "pir2_cutlass_fp4.linear_forward_packed_gemm_bf16_tactic"
             ),
             "format": (
                 "E4M3 per tensor, FP32 scales and accumulation, BF16 output"
@@ -64,7 +64,7 @@ class FloatingProjections:
                 "shapes_mkn_bias": sorted(THOR_FP4_SWAP_AB_SHAPES)
                 if fp4_swap_ab
                 else [],
-                "operator": "robotics_cutlass_fp4.linear_forward_packed_gemm_bf16_swap_ab",
+                "operator": "pir2_cutlass_fp4.linear_forward_packed_gemm_bf16_swap_ab",
                 "fallback": "Existing FP4 tactic outside exact shapes or without bias",
             },
             "activation_quantizer": "Triton two-pass"

@@ -1,0 +1,41 @@
+Selected operator sources are adapted from:
+https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox
+Revision: 239b4a3ef2268048571c9f508ad5700f98398c2f
+
+SOURCE_MANIFEST.json records original and locally adapted SHA-256 hashes. Imports,
+build inputs, extension namespaces, and loader surfaces are managed by piR2.
+No external robotics source checkout or prebuilt robotics extension is used.
+
+The upstream THIRD_PARTY_NOTICES.md states:
+本项目自有代码的开源许可证尚待维护者确定；当前没有自动选择或添加 LICENSE。
+This means no project-wide open-source license was selected for upstream-owned
+integer/common code. Inclusion and attribution here do not assign it a new
+license or claim an unrestricted license grant.
+
+Blackwell sources retain the MIT HAN Lab MIT license in blackwell/LICENSE and
+the preceding source provenance in blackwell/UPSTREAM_PROVENANCE.json. The
+preceding source is streaming-inference-infra-code/vlm/streaming_vlm_kernels at
+1c6f8b8ac31c49e401ee267647b3f967725cd26e. The old provenance describes the earlier
+source tree; SOURCE_MANIFEST.json identifies the selected files imported here.
+
+The default CUTLASS dependency is the official NVIDIA/cutlass Git submodule at
+vendor/cutlass/, with the reproducible default commit
+982748aa7356fa838c2ea4994ddcb0b2a4b4cefa recorded by the Git link and source
+manifest. Its original BSD-3-Clause license and file-specific notices are
+retained upstream. CUDA implementations outside this dependency remain piR2
+source files. Compatible CUTLASS roots can also be selected through CUTLASS_ROOT,
+including complete headers-only installations, or a compatible local submodule
+revision. Exact SHA equality is not required; the needed include/ and
+tools/util/include/ structure, APIs and CUDA/C++ toolchain must be compatible.
+Runtime provenance records the selected source and Git revision when available.
+Alternate installations retain their supplied notices. Changing the project's
+default pin is a separate reviewed change; personal version choices do not
+implicitly update it.
+
+The optional layernorm_pack and rms_statistics kernels retain their documented
+PyTorch 2.7.1 derivation and requirements. The original PyTorch license is retained
+at licenses/PYTORCH_LICENSE in the repository root; the exact upstream files and
+hashes are recorded in sources.lock.json and THIRD_PARTY_NOTICES.md.
+
+CUDA Toolkit, PyTorch and Triton remain installed framework/toolchain
+dependencies. Source ownership is not new hardware validation or a speed claim.

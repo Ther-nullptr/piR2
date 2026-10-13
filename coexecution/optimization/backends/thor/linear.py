@@ -54,21 +54,21 @@ class FloatingLinear(torch.nn.Module):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         if precision == "fp8":
-            from robotics_kernels.blackwell.fp8_linear import require_fp8_backend
+            from coexecution.kernels.blackwell.fp8_linear import require_fp8_backend
 
             require_fp8_backend(linear.weight.device)
-            self.ops = torch.ops.robotics_cutlass_fp8
+            self.ops = torch.ops.pir2_cutlass_fp8
             pack = self.ops.pack_linear_weight
         else:
-            from robotics_kernels.blackwell.fp4_linear import require_fp4_backend
+            from coexecution.kernels.blackwell.fp4_linear import require_fp4_backend
 
             require_fp4_backend(linear.weight.device)
-            self.ops = torch.ops.robotics_cutlass_fp4
+            self.ops = torch.ops.pir2_cutlass_fp4
             if fp4_swap_ab and not hasattr(
                 self.ops, "linear_forward_packed_gemm_bf16_swap_ab"
             ):
                 raise RuntimeError(
-                    "FP4 Swap-AB requires the patched FP4 backend; rebuild it"
+                    "FP4 Swap-AB requires the owned FP4 backend; rebuild it"
                 )
             pack = self.ops.pack_linear_weight_gemm_bf16
         weight, scale, metadata = pack(

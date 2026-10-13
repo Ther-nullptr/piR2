@@ -26,7 +26,7 @@ GR00T optimization implementations live under `coexecution/optimization`:
 
 | Path | Responsibility / 职责 |
 | --- | --- |
-| `config.py`, `tactics.py` | GPU-free configuration and tactic parsing; 配置与调度表 |
+| `config.py`, `tactics.py`, `operators.py` | GPU-free configuration, tactic parsing and operator inventory/profiles; 配置与算子选择 |
 | `capabilities.py` | Selected-backend preflight and runtime identity; 后端能力与来源 |
 | `session.py` | Reversible installation, restoration and evidence; 安装生命周期 |
 | `groot/projections.py` | Shared model inventory; 共用模型节点发现 |
@@ -40,26 +40,31 @@ GR00T optimization implementations live under `coexecution/optimization`:
 Configuration and default scope imports do not load Torch or GPU kernels. A
 session imports only its selected implementation. Backends do not import LIBERO
 schedulers or RPC services; integer and floating implementations share model
-inventory and Graph handling, not packed formats. The pinned third-party source
-and existing `coexecution/csrc` remain the kernel source of truth.
+inventory and Graph handling, not packed formats. Actual CUDA sources and the
+selected shared Triton primitives now live under `coexecution/kernels`: `common`,
+`ampere_ada` and `blackwell`. The official `vendor/cutlass` submodule is the default
+header dependency; a compatible `CUTLASS_ROOT` can select existing headers.
+Model-specific connections remain in `optimization/groot`; Python entrypoints do not resolve an
+external robotics source tree or prebuilt shared-library path.
 
 原有 `coexecution.groot_optimization`、`quantization`、`floating_quantization`
-等导入路径作为兼容转发保留；新增实现使用上述目录。目录迁移不改变 CLI、默认精度、
-packing、scale、tactic 或融合公式。不同硬件共用模型与调度语义，不复制整套推理服务。
+等导入路径作为兼容转发保留；新增实现使用上述目录。已有默认精度、packing、scale、
+tactic 和融合公式保留；新增 profile 与模式参数用于显式选择。不同硬件共用模型与
+调度语义，不复制整套推理服务。
 
 Optimization contracts are in `tests/contracts`, explicit CUDA tests in
 `tests/gpu`, and reusable fixtures in `tests/helpers`. GPU tests require
 `PIR2_GPU_TESTS=1`; public CI checks configuration, scheduling and accounting only.
 The separate SO100/queue tools retain their existing modules and tests.
 
-这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；依赖固定版本的 Speedup Paradox 整数后端。当前范围是单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝，同进程并发优化服务也不支持。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
+这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；整数后端源码来自固定版本的 Speedup Paradox，现由本仓集中管理。当前范围是单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝，同进程并发优化服务也不支持。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
 
 The modules provide instance-local, reversible adaptations. Weight packing happens during installation; activation scales, quantization and packing run online. Integer GEMM uses INT32 accumulation and a fused scale/bias/BF16 output epilogue. Compatible QKV/KV and gate/up projections share preparation. The native dispatch can combine activation preparation with GELU or SiLU-times-up; AdaLN modulation can produce the packed input directly. Fused SDPA remains floating point. No checkpoint, convolution layout, sampling schedule, observation or VLM-cache policy is changed by enabling quantization.
 
-Prepare the pinned `robotics-kernels` source and its GPU dependencies using [environment setup](../docs/environment.md). Use the existing `serve_libero_protocol.py` entrypoint with explicit options, for example:
+Verify the repository-owned `robotics-kernels` manifest and prepare the GPU environment using [environment setup](../docs/environment.md). Use the existing `serve_libero_protocol.py` entrypoint with explicit options, for example:
 
 ```bash
-export PYTHONPATH="$PWD:$PWD/upstream/learning/Isaac-GR00T:$PWD/third_party/robotics-the-speedup-paradox/src"
+export PYTHONPATH="$PWD:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
 python scripts/serve_libero_protocol.py \
   --checkpoint models/GR00T-N1.7-LIBERO/libero_10 \
   --variant flow --role action --output .local/integer-server \
@@ -69,7 +74,9 @@ python scripts/serve_libero_protocol.py \
 
 This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` is a separate serial-only option for Flow and πR². It captures only the pure DiT forward; rolling buffers, noise, action decoding and the VLM remain eager: first calls and new tensor signatures capture graphs and must be excluded from timing. The current reference Graph helper is not suitable for concurrent S1/S2 capture. Enabled experimental optimizations therefore reject paired `--vlm-device` workers in one process; default BF16 paired workers remain supported. Close the optimization scope before changing weights or using the policy concurrently.
 
-- `--operator-fusion`: BF16 RoPE/RMSNorm, AdaLN modulation, and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
+- `--operator-fusion`: enable BF16 fusion. The default mode `all` retains RoPE/RMSNorm, AdaLN modulation and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
+- `--operator-fusion-mode {vision_rope,text_rope,rope,rmsnorm,rope_rms,all}`: select the BF16 component set while fusion is enabled. `rope` selects both RoPE paths; only `all` installs DiT pointwise preparation. A selective mode requires `--operator-fusion`; condition grouping and norm/residual producer flags require `all`. The option defaults to `all` and does not enable fusion by itself.
+- `--operator-profile FILE`: explicitly override operator implementations for one architecture and precision. Omitted families retain their existing choices; no candidate profile is selected automatically. It requires fusion or a low-bit precision and validates before model patches. See the inventory and profile contract below.
 - `--vision-channels-last`: independently opt into channels-last-3D inputs and weights for the vision patch Conv3D. This can avoid the `SlowDilated3d` fallback; it preserves tensor values but can change BF16 rounding. The original weight storage, layout and hooks are restored on exit. Compare fusion and integer modes with the same explicit layout setting and measure its action differences separately.
 - `--norm-modulation-quant`: experimental fusion of non-affine DiT LayerNorm, AdaLN modulation, dynamic scale and low-bit packing. Requires `w8a8`, `w4a4`, `fp8` or `fp4` precision and `--operator-fusion`; shared and per-token conditions are supported. Integer modes use the pinned reference Triton kernel; floating modes use the separate local producers described in [Thor FP8 and FP4](#experimental-thor-fp8-and-fp4). FP32 reduction order differs from native LayerNorm, so this is not a bitwise-preserving option.
 - `--residual-norm-quant`: additionally fuse the attention-output residual addition, FFN input LayerNorm and low-bit packing. Requires `--norm-modulation-quant` and a quantized FFN input projection. GR00T has no gate/modulation at this boundary: integer modes use unit gate and zero scale/shift with the reference residual kernel, while floating modes use a separate residual producer. Both preserve the residual equation; the FFN output residual remains separate. Only non-affine LayerNorm and blocks without positional embeddings are supported. Both options default off and restore original forwards on exit; checkpoint quality and GPU savings require target-device validation.
@@ -81,6 +88,142 @@ This is a server invocation, not a completed closed-loop protocol. The existing 
 - `--quantization-coverage FILE`: optionally select ordinary Linear sites using a JSON `linears` mapping keyed by module name. Input `shape` fields are needed only for legacy shape-based tactic lookup. Without this file, the selected model inventory is used; category projections are selected separately by `--quantization-category-id`.
 - `--quantization-tactics FILE`: optional `{"8": {"module.name": 0}, "4": {...}}` mapping. `--quantization-group-tactics FILE` accepts rows with `bits`, `members` and `tactic`; legacy shape rows additionally require explicit coverage. Tactics are integers 0–7. Unmatched entries use reference tactic 0, not a measured optimum. No past experiment directory is searched automatically.
 - `--quantization-shape-tactics FILE`: optional rows such as `[{"bits": 8, "shape": [41, 6144, 1536, true], "tactic": 2}]`, with shape `[M, K, N, has_bias]`. An exact match overrides the module/group tactic for that call; other shapes retain their configured tactic. `M` is the flattened input row count, `K`/`N` are the integer projection's logical widths (a grouped projection uses its combined padded output width). This selects existing reference kernels for native, prepared-input and grouped paths without changing quantization or weights. Load the table before CUDA Graph capture; close and recreate the optimization scope to change it. Calibrate on the target device and checkpoint, then validate full streaming replay; an example row is not a recommended preset.
+
+### Owned operators and explicit profiles
+
+The source layout separates a shared model contract from platform-specific
+implementations:
+
+| Location | Implementation or dependency |
+| --- | --- |
+| `kernels/common/csrc/` | Native vision RoPE and AdaLN BF16 fusion |
+| `kernels/common/fused.py`, `graph.py` | Shared Triton primitives and graph lifecycle |
+| `kernels/ampere_ada/csrc/integer_gemm.cu` | Canonical INT4/INT8 CUTLASS GEMM |
+| `kernels/ampere_ada/csrc/integer_dispatch.cu` | Native activation preparation plus integer dispatch |
+| `kernels/ampere_ada/` | Integer formats, modulation producers and optional Ada candidates |
+| `kernels/blackwell/csrc/` | FP8/FP4 CUDA GEMM and packing, with focused lazy loaders |
+| `kernels/vendor/cutlass/` | Default official CUTLASS submodule; compatible `CUTLASS_ROOT` also supported |
+
+For the default dependency, initialize CUTLASS from the repository root, then
+inspect GPU-free source and build metadata:
+
+```bash
+git submodule update --init --recursive coexecution/kernels/vendor/cutlass
+python tools/prepare_sources.py --component robotics-kernels
+python -m coexecution.kernels.build --help
+python -m coexecution.kernels.build --backend integer --describe
+```
+
+The build command accepts `--backend` with `integer`, `integer_dispatch`,
+`bf16_fusion`, `fp8`, or `fp4`, plus `--describe` and `--verbose`. Omit `--describe`
+to explicitly build/load that backend with the installed CUDA toolkit. Torch's
+extension cache stores generated binaries outside the tracked source tree;
+`TORCH_EXTENSIONS_DIR` can point to a personal `.local/` directory. Runtime
+backends also load lazily when explicitly enabled. Build and warm all selected
+kernels before timing or CUDA Graph capture. The source manifest records imported
+and adapted operator hashes and the default CUTLASS submodule revision. Actual
+selected dependency and loaded binary identity are separate runtime evidence.
+The Git link records `982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` for reproducibility;
+it does not require every author to run that exact SHA.
+
+An existing compatible CUTLASS clone or complete headers-only installation can
+be used directly:
+
+```bash
+export CUTLASS_ROOT=/path/to/cutlass
+```
+
+With this variable set, omit the submodule initialization command above.
+The selected root needs the full required `include/` tree, including `cutlass`
+and `cute`, plus `tools/util/include/`. Its APIs and CUDA/C++ toolchain must
+support the selected operators; arbitrary versions are not promised to work.
+Tools record the actual Git revision when present rather than rejecting a
+source solely for differing from the default. The CUDA operator implementations
+remain local piR2 files regardless of the general CUTLASS header location.
+
+New environments can use `git clone --recurse-submodules`. Repeat the submodule
+update command after pulling or switching branches when selecting that branch's
+default. Compatible local submodule revisions are also usable; preserve those
+intentional choices and keep their personal Git-link changes out of unrelated
+commits. `--reference /path/to/existing/cutlass --dissociate` is an optional
+first-clone download optimization, not a prerequisite for reusing an existing
+installation. See [CUTLASS setup](../docs/environment.md#cutlass-submodule).
+Routine default setup does not need `--remote`; changing the project's shared
+default pin remains a separate reviewed change.
+
+The inventory API reports implementation language, source, architecture,
+precision, shape/layout constraints and numerical contract without importing
+Torch, Triton or the model:
+
+```python
+from dataclasses import asdict
+from coexecution.optimization.operators import inventory
+
+for implementation in inventory("integer_gemm"):
+    print(asdict(implementation))
+# inventory() lists every family; it does not benchmark or rank implementations.
+```
+
+The newly consolidated native Ada candidates are explicit opt-ins for SM89:
+INT4 GEMV (`integer_gemm=int4_gemv`), small-M INT4 tiles (`small_m`), integer
+split-K (`split_k`), LayerNorm packing (`layernorm_pack=native`), native RMS
+statistics (`rmsnorm=native`), RMSNorm packing (`rmsnorm_pack=native`), residual
+epilogues (`integer_residual=native`) and grouped output stores
+(`group_writeback=native`). Their per-call guards fall back to the configured
+same-precision reference for unsupported shapes or runtime contracts. Native
+LayerNorm/RMS candidates additionally enforce their pinned PyTorch requirements;
+see [environment boundaries](../docs/environment.md#optional-gr00t-fusion-and-integer-inference).
+The already existing BF16 and activation-pack implementations keep their own
+inventory contracts; platform restrictions are not inferred from language alone.
+
+An operator profile is a partial override. The following is a schema example,
+not a measured preset or a recommendation for every W4A4 shape:
+
+```json
+{
+  "schema_version": 1,
+  "architecture": "sm_89",
+  "precision": "w4a4",
+  "implementations": {
+    "integer_gemm": "small_m",
+    "activation_pack": "native"
+  },
+  "parameters": {
+    "integer_gemm": {"tactic": 0}
+  }
+}
+```
+
+Save a selected profile locally and pass `--operator-profile FILE` to the same
+service command, or set `OptimizationConfig(operator_profile=Path(...))`.
+`small_m` parameters accept tactic 0–5; `split_k` accepts `slices` 2/4/8 and
+`tile` 0–2. These parameters belong to those implementations and are distinct
+from canonical integer GEMM tactics 0–7. Unknown families, implementations,
+parameters, architecture/precision mismatches and incompatible activation flags
+are rejected. Each family must also be applicable to the selected fusion/precision
+configuration. The profile hash and actual installed choices are retained in
+optimization evidence; the profile does not change checkpoint weights, default
+precision or unrelated fusion flags.
+
+DiT LayerNorm, residual, shared-context and final-modulation profile choices
+require full fusion and a DiT-containing component. RMS packing requires text
+RMSNorm fusion. Overlapping producer replacements are rejected: profile
+LayerNorm with `--norm-modulation-quant`, profile residual with
+`--residual-norm-quant`, or profile LayerNorm with final-modulation packing.
+Select one producer implementation for each boundary.
+
+CUDA and Triton alternatives are not globally ranked. The GPU-free
+`read_measurements(path)` and `select_measured(records, baseline="...")` API in
+`coexecution.optimization.operators` consumes retained, normalized measurements
+with an explicit same-precision numerical gate. Comparisons must agree on
+architecture, precision, exact shape, measurement cohort, checkpoint/input
+workload, device/environment identity, measured boundary, timing method and
+statistic. Failed numerical candidates are excluded; mismatched contexts are
+rejected. `deployment=True` additionally requires full-policy wall latency.
+The result applies to that exact context and never changes runtime defaults.
+No new benchmark, cross-platform winner or LIBERO success result is supplied by
+this source organization; historical experiments require matched remeasurement
+after selecting a new combination. Keep records and generated profiles local.
 
 For an already loaded eval-mode BF16 CUDA policy, the same public interface is:
 
@@ -103,8 +246,10 @@ For a focused BF16 operator experiment, `NonGemmAdapters` supports `baseline`,
 `baseline` restores the original forwards. The low-level adapter does not install
 DiT condition/mask preparation, Graphs or quantization. Use one adapter per
 private eval-mode model, change modes only after its work has completed, and
-restore it with `close()` in `finally`. These modes do not add service CLI options
-or relax the paired-worker guard. Test component selection, instance isolation
+restore it with `close()` in `finally`. The service exposes the same enabled
+component choices through `--operator-fusion-mode`; disable `--operator-fusion`
+for the baseline. Neither interface relaxes the paired-worker guard. Test
+component selection, instance isolation
 and restoration explicitly with `tests/gpu/test_groot_fusion_modes_gpu.py`;
 measure performance on the target GPU with matched inputs and invocation counts.
 
@@ -133,24 +278,24 @@ The preset covers 469 executed Linear sites and seven fixed-category projections
 
 To recalibrate, collect executed input shapes on a representative full call, then compare reference tactics 0–7 on actual packed activations and weights using CUDA Graph event timing. Retain raw repetitions and check every candidate against the same-precision reference before choosing a tactic. Export module-name entries and exact group-member entries in the formats above. Recheck complete policy outputs after loading the files in a fresh process, and measure BF16, previous and candidate configurations in one randomized, matched GPU session. Isolated repeated-GEMM timings have different cache behavior from a full policy; a microbenchmark winner alone is not evidence of a full-policy improvement.
 
-The service records the configuration, replaced sites and tactic-file hashes in its local identity output. Before changing model methods or layouts, an enabled scope checks the selected backend's exact operator APIs, including the FP8 packed-tactic and FP4 weight-packing APIs. Runtime evidence separates the pinned source revision from the observed source and loaded-library hashes, and records Torch/CUDA/Triton, device architecture and quantization format. Preloaded or ambiguous binary ownership is explicitly `unknown`; a requested environment-variable path is not proof that its library executed.
+The service records the configuration, replaced sites and tactic-file hashes in its local identity output. Before changing model methods or layouts, an enabled scope checks the selected backend's exact operator APIs, including the FP8 packed-tactic and FP4 weight-packing APIs. Runtime evidence separates original upstream revisions, the owned source-tree fingerprint and loaded-library hashes, and records Torch/CUDA/Triton, device architecture and quantization format. Preloaded or ambiguous binary ownership is explicitly `unknown`; a requested environment-variable path is not proof that its library executed.
 
-Integer precision retains the original loader/API policy, with SM89 separately recorded as the validated architecture. Successfully loading elsewhere does not establish arithmetic or task quality. Thor floating precision retains its existing SM110 restriction; BF16 has no new architecture whitelist. Missing APIs and loader failures propagate rather than silently selecting BF16. A complete comparison must include online activation preparation and checks, use matching fusion/layout/Graph settings for BF16 and low-bit variants, and record checkpoint/input identity. Profiled GPU duration sums, isolated GEMM timing, complete Linear timing and synchronized CPU-observation-to-action latency are different metrics. Installation, compilation, packing, preflight and Graph capture are reported separately.
+The canonical integer backend retains its original arithmetic/API contract, with SM89 separately recorded as historical validated architecture. Additional native Ada candidates are explicitly restricted to SM89. Successfully loading elsewhere does not establish arithmetic or task quality. Thor floating precision retains its existing SM110 restriction; BF16 has no new architecture whitelist. Missing APIs and loader failures propagate rather than silently selecting BF16. A complete comparison must include online activation preparation and checks, use matching fusion/layout/Graph settings for BF16 and low-bit variants, and record checkpoint/input identity. Profiled GPU duration sums, isolated GEMM timing, complete Linear timing and synchronized CPU-observation-to-action latency are different metrics. Installation, compilation, packing, preflight and Graph capture are reported separately.
 
 Shape-tactic files still accept the legacy row list. A versioned integer profile can additionally bind the rows to the actual backend, clean source revision, architecture and quantization format:
 
 ```json
 {
   "schema_version": 1,
-  "backend_id": "robotics_integer",
-  "backend_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+  "backend_id": "pir2_integer",
+  "backend_revision": "sha256:<source_sha256 from runtime backend evidence>",
   "device_arch": "sm_89",
   "quant_format": "w8a8-symmetric-row-v1",
   "rows": [{"bits": 8, "shape": [41, 6144, 1536, true], "tactic": 2}]
 }
 ```
 
-This is a schema example, not a recommended tuning result. Profiles with missing, unknown or mismatched runtime identity are rejected before installation; legacy lists remain explicitly unbound. W4A4 uses `w4a4-symmetric-row-v1`. Thor FP8/FP4 use their distinct floating formats and cannot consume integer profiles. Close and rebuild the optimization scope after changing precision, weights or tactics.
+This is a schema example, not a recommended tuning result; replace the revision placeholder with the recorded owned-source fingerprint from backend evidence. Old bound `robotics_integer` profiles do not automatically match the new owned namespace/source identity. Profiles with missing, unknown or mismatched runtime identity are rejected before installation; legacy lists remain explicitly unbound. W4A4 uses `w4a4-symmetric-row-v1`. Thor FP8/FP4 use their distinct floating formats and cannot consume integer profiles. Close and rebuild the optimization scope after changing precision, weights or tactics.
 
 优化根调用与 reset 共享串行保护，调用开始、结束和异常时清理投影缓存；Graph 异常恢复 eager 后仍保留该边界。该锁只管理 Python 提交，不是 CUDA 跨流同步，也不开放同进程双优化 worker。组件选择、缓存与后端契约的新增测试使用元数据/fake 对象；旧闭环结果不能作为新组合的质量结论。对应 CUDA 回归需显式执行 `tests/gpu/test_streaming_component_cache_gpu.py`，包含 eager/Graph 的 W8/W4 异常重试与 reset。本次结构和契约整理未重跑这些 GPU 测试。
 
@@ -211,7 +356,7 @@ latency; inspect action error against both the previous integer path and BF16.
 ## Experimental Thor FP8 and FP4
 
 The serial floating adapter requires Thor SM110, eval-mode BF16 CUDA weights,
-and the explicitly built [Blackwell dependencies](../docs/environment.md#optional-thor-floating-inference).
+and the repository-owned [Blackwell operators](../docs/environment.md#optional-thor-floating-inference).
 It uses the same reversible `GrootOptimizations` interface:
 
 ```python
@@ -230,7 +375,7 @@ All options default off. Close the scope before changing weights or configuratio
 - FP8 uses E4M3 weights and activations with one FP32 scale per tensor.
   `--fp8-fast-quant` selects a two-pass Triton activation packer: partial absmax,
   followed by scale finalization and conversion. Both passes refresh every call,
-  including Graph replay. The default uses the pinned reference packer.
+  including Graph replay. The default uses the owned native packer with the pinned reference convention.
 - `--fp-shared-inputs` optionally packs the common activation once per known
   QKV/KV or gate/up module invocation. Only fully selected groups participate;
   every member keeps its original quantized weight, scale, GEMM and tactic.
@@ -267,8 +412,10 @@ All options default off. Close the scope before changing weights or configuratio
   Ada integer tactic files, category selection and condition grouping are rejected.
 
 `--fp4-swap-ab` (Python: `OptimizationConfig(precision="fp4", fp4_swap_ab=True)`)
-is an additional opt-in SM110 dispatch. It requires the patched/rebuilt FP4
-backend described in [environment setup](../docs/environment.md). Only
+is an additional opt-in SM110 dispatch. It uses the repository-owned FP4 CUDA
+backend described in [environment setup](../docs/environment.md). The unified
+operator profile can select the same implementation with
+`"floating_gemm": "swap_ab"`; `native` retains the original floating dispatch. Only
 `(M,K,N,has_bias)=(41,256,1536,true)` and `(41,1536,1536,true)` use the new API;
 all other signatures, including biasless and M=1 calls, keep the previous path.
 The selected tile is `(128,64,256)` after swapping W and X, with cluster
