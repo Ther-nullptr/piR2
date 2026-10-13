@@ -495,3 +495,78 @@ def test_failed_admission_publishes_current_failure_instead_of_running(
     status = json.loads((tmp_path / "status.json").read_text())
     assert status["phase"] == "failed"
     assert status["condition"] == "bf16-baseline"
+
+
+def test_selected_debug_tasks_record_real_replay_and_keep_fixture_scope(plan):
+    plan.update(task_ids=[0, 3], record_replay=True, replay_max_frames=721)
+    module().validate_plan(plan)
+    command = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/output")
+    )["evaluate"]
+    assert "--record-replay" in command
+    assert command[command.index("--replay-max-frames") + 1] == "721"
+    assert command[command.index("--task-ids") + 1 :] == ["0", "3"]
+    rows = [
+        {
+            "task_id": task,
+            "episode_id": 0,
+            **{field: "sha" for field in module().FIXTURE_FIELDS},
+        }
+        for task in (0, 3)
+    ]
+    assert module().paired_fixtures(
+        {"bf16": rows, "w8a8": rows}, episodes_per_task=1, task_ids=[0, 3]
+    )["passed"]
+    assert not module().paired_fixtures({"bf16": rows}, episodes_per_task=1)["passed"]
+
+
+@pytest.mark.parametrize("ids", [[], [0, 0], [10], [True], ["0"]])
+def test_invalid_selected_tasks_rejected(plan, ids):
+    plan["task_ids"] = ids
+    with pytest.raises(ValueError, match="task"):
+        module().validate_plan(plan)
+
+
+def test_subset_deployment_report_reads_actual_trace_and_reports_selected_scope(
+    plan, tmp_path
+):
+    import json
+
+    plan.update(task_ids=[0], conditions=plan["conditions"][:1])
+    directory = tmp_path / plan["conditions"][0]["name"] / "deployment"
+    directory.mkdir(parents=True)
+    metadata = {
+        "task_id": 0,
+        "episode_id": 0,
+        "seed": 1000,
+        "success": True,
+        "control_rate_valid": True,
+    }
+    (directory / "episodes.jsonl").write_text(json.dumps(metadata) + "\n")
+    events = [
+        {
+            "kind": "control_start",
+            "t_s": 10,
+            "period_s": 0.05,
+            "feature_sequence": 0,
+            "feature_source_tick": 0,
+            "feature_capture_s": 9.9,
+            "initial_capture_s": 9.9,
+        },
+        {
+            "kind": "control_tick",
+            "t_s": 10.001,
+            "tick": 0,
+            "fallback": False,
+            "executed_slot": {"producer_kind": "bootstrap"},
+        },
+        {"kind": "control_end", "t_s": 10.05, "control_steps": 1},
+    ]
+    (directory / "task0-episode0-trace.jsonl").write_text(
+        "\n".join(map(json.dumps, events))
+    )
+    report = module().deployment_report(plan, tmp_path)
+    assert report["task_ids"] == [0]
+    assert "subset" in report["scope"] and "Full Spatial" not in report["scope"]
+    assert len(report["conditions"][0]["episodes"]) == 1
+    assert (tmp_path / "feature-usage.json").is_file()

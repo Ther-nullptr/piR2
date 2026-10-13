@@ -441,3 +441,13 @@ python -m coexecution.feature_usage \
 The optional raw-root audit verifies published and consumed source identities against the original traces. Counts always use the actual feature sequence, never the nearest publication to an RPC timestamp: a request can hold an older snapshot while a new version arrives during installation. Outputs contain per-feature DiT reads, distinct directly executed producer requests, execution ticks, zero/one/multiple-read distributions and count-weighted valid-episode summaries. Bootstrap and right-censored final features are separate; unknown sources explicitly mark accounting incomplete. Direct execution does not represent all causal contributions through the neural rolling buffer.
 
 Use `queue_report --no-figures` to export replay without Matplotlib. The optional Source Han webfont remains a separately downloaded local asset; generated reports inline it with its license when present.
+
+### Model and robot replay evidence
+
+The [replay package](replay/README.md) builds a framework-free catalog from the
+existing independent model benchmark and actual deployment traces. Optional
+`--replay-assets` exports raw model input images outside timing;
+`--record-replay` records each precision's own bounded robot state and two-camera
+response, with encoding after control. The catalog keeps clean model timing,
+actual instrumented kernel timelines and divergent closed-loop trajectories
+separate. This is debugger evidence, not a replacement for LIBERO quality tests.

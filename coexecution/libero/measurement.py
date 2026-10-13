@@ -190,6 +190,11 @@ def build_parser():
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--profile-rounds", type=int, default=0)
+    parser.add_argument(
+        "--replay-assets",
+        action="store_true",
+        help="Export actual raw observation PNG/state assets before timing",
+    )
     parser.add_argument("--start-step", type=int, default=10)
     parser.add_argument("--step-stride", type=int, default=7)
     parser.add_argument("--video-backend", default="torchcodec")
@@ -617,6 +622,10 @@ def run(args):
         raise ValueError("Expected unchanged Flow4 NFE=4")
     observations, identity = _observations(policy, args)
     _write(args.output / "observations.json", identity)
+    if getattr(args, "replay_assets", False):
+        from coexecution.replay.assets import export_observations
+
+        export_observations(args.output, observations, identity)
     plan = round_plan(args.modes, len(observations), args.rounds, args.seed)
     _write(args.output / "round-plan.json", plan)
     samples, gates, evidence, graph_audits, profiles = [], [], {}, [], {}

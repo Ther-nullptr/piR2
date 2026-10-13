@@ -1105,3 +1105,137 @@ class ControlTiming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplayRecordingContract(unittest.TestCase):
+    def test_recording_is_optional_owned_and_maps_post_step_frame_to_computed_time(
+        self,
+    ):
+        from coexecution.replay.recording import ReplayRecorder
+
+        clock = Clock()
+        actor, vision = Actor(clock, 0.02), Vision(clock)
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+
+        def observation(x):
+            return {
+                "state.x": np.array([x]),
+                "state.y": [0],
+                "state.z": [0],
+                "video.image": image,
+                "video.wrist_image": image,
+            }
+
+        count = 0
+
+        def advance(action):
+            nonlocal count
+            count += 1
+            image[:] = count
+            clock.t += 0.01
+            return observation(count), False, False
+
+        recorder = ReplayRecorder(max_frames=3)
+        stream = io.StringIO()
+        result, frames = run_control_loop(
+            advance,
+            observation(0),
+            clock.now() - 0.1,
+            np.zeros((40, 7)),
+            actor,
+            vision,
+            1,
+            0.05,
+            3,
+            stream,
+            clock=clock,
+            replay_recorder=recorder,
+        )
+        ticks = [
+            json.loads(line)
+            for line in stream.getvalue().splitlines()
+            if json.loads(line)["kind"] == "control_tick"
+        ]
+        self.assertEqual(
+            ticks[0]["robot_response"]["before"]["position_xyz_m"], [0, 0, 0]
+        )
+        self.assertEqual(
+            ticks[0]["robot_response"]["after"]["position_xyz_m"], [1, 0, 0]
+        )
+        self.assertEqual(
+            recorder.mapping[1]["wall_s"], ticks[0]["next_observation_computed_s"]
+        )
+        self.assertEqual(recorder.frames["image"][0].max(), 0)
+        self.assertEqual(result["replay_recording"]["status"], "overflow")
+        self.assertEqual(frames, [])
+
+    def test_bounded_debug_queue_reports_dropped_events(self):
+        from libero_queue_trace import QueueTrace
+
+        trace = QueueTrace(max_records=2)
+        trace.emit("first", t_s=1)
+        trace.emit("second", t_s=2)
+        trace.emit("third", t_s=3)
+        self.assertEqual(len(trace.records()), 2)
+        self.assertEqual(trace.status()["dropped_records"], 1)
+
+
+class ReplayFailureContinuation(unittest.TestCase):
+    def test_second_camera_allocation_failure_does_not_abort_controller(self):
+        from coexecution.replay.recording import ReplayRecorder
+
+        clock = Clock()
+        actor, vision = Actor(clock, 0.02), Vision(clock)
+        images = {
+            "video.image": np.zeros((4, 4, 3), dtype=np.uint8),
+            "video.wrist_image": np.ones((4, 4, 3), dtype=np.uint8),
+        }
+        calls = []
+
+        def advance(action):
+            calls.append(clock.now())
+            clock.t += 0.01
+            return images, False, False
+
+        original_array = np.array
+        allocations = []
+
+        def allocate(value, *args, **kwargs):
+            if (
+                isinstance(value, np.ndarray)
+                and value.ndim == 3
+                and kwargs.get("copy") is True
+            ):
+                allocations.append(value)
+                if len(allocations) == 4:
+                    raise MemoryError("second camera in first control step")
+            return original_array(value, *args, **kwargs)
+
+        recorder = ReplayRecorder(max_frames=4)
+        trace = io.StringIO()
+        with patch.object(np, "array", allocate):
+            result, _ = run_control_loop(
+                advance,
+                images,
+                clock.now(),
+                np.zeros((40, 7)),
+                actor,
+                vision,
+                1,
+                0.05,
+                3,
+                trace,
+                clock=clock,
+                replay_recorder=recorder,
+            )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(result["control_steps"], 3)
+        self.assertEqual(result["replay_recording"]["status"], "failed")
+        self.assertEqual({len(frames) for frames in recorder.frames.values()}, {1})
+        self.assertEqual(len(allocations), 4)
+        self.assertTrue(
+            any(
+                json.loads(row)["kind"] == "control_end"
+                for row in trace.getvalue().splitlines()
+            )
+        )

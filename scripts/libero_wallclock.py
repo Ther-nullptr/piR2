@@ -566,6 +566,7 @@ def run_control_loop(
     clock=None,
     events=None,
     fixed_delay=None,
+    replay_recorder=None,
 ):
     """The actor/vision interfaces are injectable so clock contracts can be tested."""
     clock = clock or RealClock()
@@ -574,12 +575,17 @@ def run_control_loop(
             raise ValueError("Fixed deployment delay must be between 1 and 5 ticks")
         if initial_delay != fixed_delay:
             raise ValueError("Bootstrap and control loop must use the same fixed delay")
-    events = events or QueueTrace(clock=clock.now)
+    events = events or QueueTrace(
+        clock=clock.now,
+        max_records=max_steps * 128 + 4096 if replay_recorder is not None else None,
+    )
     if isinstance(actor, ActionWorker):
         actor.events = events
     if isinstance(vision, VisionWorker):
         vision.queue.events = events
     timeline = CommandTimeline(initial_plan)
+    if replay_recorder is not None:
+        replay_recorder.initial(initial, capture_s=initial_capture_s)
     base = clock.now()
     bootstrap_feature = {
         "sequence": 0,
@@ -718,6 +724,8 @@ def run_control_loop(
             "action_buffer_phase": "after_execute",
             "camera_queue": camera_snapshot,
         }
+        if replay_recorder is not None:
+            row["robot_response"] = replay_recorder.step(current.data, next_data, row)
         ticks.append(row)
         events.emit(t_s=applied, **row)
         if record_video:
@@ -864,6 +872,9 @@ def run_control_loop(
             released >= target for _, released, target in observation_events
         ),
     }
+    if replay_recorder is not None:
+        result["replay_recording"] = replay_recorder.status()
+        result["replay_trace"] = events.status()
     return result, frames
 
 
@@ -1108,7 +1119,15 @@ def deployment_episode(env, observation, client, args, seed, trace):
             "seed": seed,
         },
     )
-    events = QueueTrace()
+    recorder = None
+    if getattr(args, "record_replay", False):
+        from coexecution.replay.recording import ReplayRecorder
+
+        recorder = ReplayRecorder(max_frames=args.replay_max_frames)
+    args.replay_recorder = recorder
+    events = QueueTrace(
+        max_records=args.max_steps * 128 + 4096 if recorder is not None else None
+    )
     actor = ActionWorker(
         args.port,
         events=events,
@@ -1150,6 +1169,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
             args.record_video,
             events=events,
             fixed_delay=fixed_delay,
+            replay_recorder=recorder,
         )
     finally:
         if gc_was_enabled:

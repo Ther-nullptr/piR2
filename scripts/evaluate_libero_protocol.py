@@ -277,6 +277,12 @@ def build_parser():
         "--task-ids", nargs="+", type=int, choices=range(10), default=list(range(10))
     )
     parser.add_argument("--no-video", action="store_true")
+    parser.add_argument(
+        "--record-replay",
+        action="store_true",
+        help="Deployment debug: owned robot states and both cameras; WebM encoding after control",
+    )
+    parser.add_argument("--replay-max-frames", type=int, default=1024)
     parser.add_argument("--slow-warmup-calls", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=720)
     parser.add_argument("--control-hz", type=float, default=20)
@@ -318,6 +324,10 @@ def validate_deployment_controls(args):
     from coexecution.libero.features import validate_feature_options
     from coexecution.libero.scheduling import validate_vision_max_hz
 
+    if getattr(args, "record_replay", False) and args.protocol != "deployment":
+        raise ValueError("Replay recording requires the deployment protocol")
+    if getattr(args, "replay_max_frames", 1024) < 1:
+        raise ValueError("Replay frame bound must be positive")
     validate_service_floor(args.action_min_service_ms)
     validate_service_floor(args.vision_min_service_ms)
     validate_vision_max_hz(args.vision_max_hz)
@@ -437,6 +447,9 @@ def main():
         "scripts/libero_protocol_scheduler.py",
         "scripts/libero_queue_trace.py",
         "scripts/libero_reproducible_env.py",
+        "scripts/libero_observations.py",
+        "coexecution/replay/recording.py",
+        "coexecution/replay/schema.py",
         "scripts/serve_libero_protocol.py",
         "scripts/libero_inference_backend.py",
         "scripts/libero_model_loading.py",
@@ -569,7 +582,9 @@ def main():
                     raw, _, _, _ = env._env.step([0, 0, 0, 0, 0, 0, -1])
                 obs = env._process_observation(raw)
                 initial_fingerprints = env.initial_fingerprints(obs)
-                args.record_video = episode_id == 0 and not args.no_video
+                args.record_video = (
+                    episode_id == 0 and not args.no_video and not args.record_replay
+                )
                 trace_path = (
                     args.output / f"task{task_id}-episode{episode_id}-trace.jsonl"
                 )
@@ -594,6 +609,11 @@ def main():
                     initial_state_sha256=hashlib.sha256(initial.tobytes()).hexdigest(),
                     wall_seconds=time.monotonic() - started,
                 )
+                if args.record_replay:
+                    result["replay_recording"] = args.replay_recorder.finish(
+                        args.output, f"task{task_id}-episode{episode_id}"
+                    )
+                    args.replay_recorder = None
                 if frames:
                     write_video(
                         args.output / f"task{task_id}-episode{episode_id}.mp4", frames

@@ -685,3 +685,32 @@ def test_model_only_artifacts_accumulate_all_precisions_on_success_or_failure(
         result = json.loads((output / "results.json").read_text())
         assert result["validation"] == gates
         assert result["graph_timing_audit"] == audits
+
+    else:
+        # The canonical failure path persisted sidecars and real retained outputs,
+        # but intentionally never emitted a completed results.json.
+        from coexecution.replay.catalog import build_catalog
+
+        assert not (output / "results.json").exists()
+        catalog_root = tmp_path / "failed-catalog"
+        catalog = build_catalog(
+            model_runs=[output],
+            deployments=[],
+            output=catalog_root,
+            clock_cohort="declared",
+        )
+        runs = [
+            json.loads((catalog_root / row["path"]).read_text())
+            for row in catalog["runs"]
+        ]
+        assert len(runs) == 6
+        failed = next(run for run in runs if run["mode"] == "w4a4-compiled")
+        assert failed["status"] == "failed"
+        assert failed["validation"]["status"] == "failed"
+        assert failed["clean_requests"] == []
+        assert failed["configuration"] == {} and failed["device"] is None
+        assert failed["same_input_comparison"] is False
+        retained = failed["retained_outputs"][0]
+        assert retained["output"]["actions"]["action"]["values"] == [2.0]
+        assert retained["wall_ms"] is None and retained["comparison_key"] is None
+        assert any("results.json" in warning for warning in failed["warnings"])

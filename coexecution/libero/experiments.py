@@ -1,4 +1,4 @@
-"""Run declared LIBERO conditions with owned workers and paired full-suite fixtures.
+"""Run declared LIBERO conditions with owned workers and paired task fixtures.
 
 Model workers require CUDA. Import, command planning and fixture checks perform
 no model computation. The runner owns only children it starts; it never adopts
@@ -54,6 +54,23 @@ def validate_plan(plan):
         for key in ("episodes_per_task", "max_steps")
     ):
         raise ValueError("Episode and step counts must be positive integers")
+    tasks = plan.get("task_ids", list(range(10)))
+    if (
+        not isinstance(tasks, list)
+        or not tasks
+        or any(type(task) is not int or task not in range(10) for task in tasks)
+        or len(set(tasks)) != len(tasks)
+    ):
+        raise ValueError("Declare unique task IDs in 0..9")
+    if type(plan.get("record_replay", False)) is not bool:
+        raise ValueError("record_replay must be boolean")
+    if plan.get("record_replay") and set(plan["protocols"]) != {"deployment"}:
+        raise ValueError("Replay recording requires deployment only")
+    if (
+        type(plan.get("replay_max_frames", 1024)) is not int
+        or plan.get("replay_max_frames", 1024) < 1
+    ):
+        raise ValueError("Replay frame bound must be a positive integer")
     if type(plan["seed"]) is not int:
         raise ValueError("Experiment seed must be an integer")
     if set(plan["gpus"]) != {"action", "vlm", "simulation"} or any(
@@ -212,15 +229,24 @@ def build_commands(plan, case, protocol, output):
             and ("feature_rpc" in case or "feature_rpc" in plan)
             else []
         ),
+        *(
+            [
+                "--record-replay",
+                "--replay-max-frames",
+                str(plan.get("replay_max_frames", 1024)),
+            ]
+            if plan.get("record_replay", False)
+            else []
+        ),
         "--task-ids",
-        *(str(i) for i in range(10)),
+        *(str(i) for i in plan.get("task_ids", range(10))),
     ]
     return commands
 
 
-def paired_fixtures(conditions, *, episodes_per_task):
+def paired_fixtures(conditions, *, episodes_per_task, task_ids=range(10)):
     expected = {
-        (task, episode) for task in range(10) for episode in range(episodes_per_task)
+        (task, episode) for task in task_ids for episode in range(episodes_per_task)
     }
     mapped, problems = {}, []
     for name, rows in conditions.items():
@@ -439,7 +465,7 @@ def deployment_report(plan, output, *, report_output=None):
     conditions = []
     expected = {
         (task, episode)
-        for task in range(10)
+        for task in plan.get("task_ids", range(10))
         for episode in range(plan["episodes_per_task"])
     }
     for case in plan["conditions"]:
@@ -472,7 +498,13 @@ def deployment_report(plan, output, *, report_output=None):
         conditions.append(condition)
     report = {
         "schema_version": 2,
-        "scope": "Full Spatial suite, paired declared initial states; actual executed image/state ages",
+        "scope": (
+            "Full Spatial suite"
+            if set(plan.get("task_ids", range(10))) == set(range(10))
+            else "Spatial task subset"
+        )
+        + ", paired declared initial states; actual executed image/state ages",
+        "task_ids": list(plan.get("task_ids", range(10))),
         "conditions": conditions,
     }
     usage = analyze_report(report, raw_root=output)
@@ -581,7 +613,11 @@ def run(plan, output):
             finally:
                 owned.close()
         pairs = {
-            protocol: paired_fixtures(rows, episodes_per_task=plan["episodes_per_task"])
+            protocol: paired_fixtures(
+                rows,
+                episodes_per_task=plan["episodes_per_task"],
+                task_ids=plan.get("task_ids", range(10)),
+            )
             for protocol, rows in records.items()
         }
         _write(output / "paired-initial-conditions.json", pairs)

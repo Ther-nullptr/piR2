@@ -343,7 +343,7 @@ def _category(name, chain, cat):
     return "unknown"
 
 
-def summarize_trace(trace):
+def classify_trace(trace):
     """Classify only leaf Chrome device activities, each into exactly one bucket.
 
     CUDA runtime/driver correlation and CPU parent chains identify the launch
@@ -401,6 +401,7 @@ def summarize_trace(trace):
                     (start, stop)
                 )
             active.append(event)
+    device_events = []
     categories, stages, kernels = (
         defaultdict(lambda: [0, 0.0]),
         defaultdict(lambda: [0, 0.0]),
@@ -422,6 +423,30 @@ def summarize_trace(trace):
             stage, chain = "unattributed", []
         unattributed += int(stage == "unattributed")
         category = _category(event["name"], chain, event["cat"])
+        request_ids = {
+            next(
+                (
+                    name.removeprefix(REQUEST_PREFIX)
+                    for name in reversed(row[1])
+                    if name.startswith(REQUEST_PREFIX)
+                ),
+                None,
+            )
+            for row in candidates
+        }
+        request_id = next(iter(request_ids)) if len(request_ids) == 1 else None
+        device_events.append(
+            {
+                "ts_us": event["ts"],
+                "duration_us": event["dur"],
+                "stage": stage,
+                "category": category,
+                "kernel": event["name"],
+                "request_id": request_id,
+                "stream": args.get("stream"),
+                "device": args.get("device"),
+            }
+        )
         elapsed = event["dur"] / 1000.0
         for bucket, key in (
             (categories, category),
@@ -433,6 +458,17 @@ def summarize_trace(trace):
         intervals.append((event["ts"], event["ts"] + event["dur"]))
     work = sum(row["dur"] for row in device) / 1000.0
     return {
+        "device_events": device_events,
+        "request_scopes": [
+            {
+                "request_id": event["name"].removeprefix(REQUEST_PREFIX),
+                "ts_us": event["ts"],
+                "duration_us": event["dur"],
+            }
+            for event in events
+            if event.get("cat") == "user_annotation"
+            and event["name"].startswith(REQUEST_PREFIX)
+        ],
         "device_event_count": len(device),
         "gpu_work_ms": work,
         "gpu_active_union_ms": _union_duration(intervals) / 1000.0,
@@ -462,3 +498,11 @@ def summarize_trace(trace):
         "kernel_stage_attribution": "CPU launch correlation; never GPU/host range overlap",
         "accounting": "Each leaf device activity appears once. Work sums may overlap across streams. Host stage scopes can be nested; never add host and GPU times to reconstruct wall latency.",
     }
+
+
+def summarize_trace(trace):
+    """Aggregate the shared device classifier without exposing a fake timeline."""
+    result = classify_trace(trace)
+    result.pop("device_events")
+    result.pop("request_scopes")
+    return result
