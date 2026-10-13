@@ -741,3 +741,77 @@ def test_failed_model_sidecars_remain_visible_without_completed_result(
         if failure == "nonfinite":
             assert recorded["output"]["actions"]["action"]["values"] is None
             assert recorded["output"]["actions"]["action"]["nonfinite_count"] == 1
+
+
+def test_legacy_model_derives_only_persisted_identity_and_preserves_raw_metrics(
+    tmp_path,
+):
+    root, result = model_fixture(tmp_path)
+    result["observations"][0].pop("observation_id")
+    result["profiler"] = False
+    result["arguments"].pop("measurement_boundary")
+    result["profiles"] = {
+        "bf16-compiled": {
+            "calls": 3,
+            "gpu_work_ms": 27.5,
+            "categories": {"gemm": 17.0},
+            "scope": "Legacy aggregate profile",
+        }
+    }
+    (root / "results.json").write_text(json.dumps(result))
+    rows = [
+        json.loads(line) for line in (root / "samples.jsonl").read_text().splitlines()
+    ]
+    for row in rows:
+        for field in ("observation_id", "request_id", "precision", "instrumented"):
+            row.pop(field)
+        row["observation"] = 0
+    rows[1].pop("seed")  # A missing historical seed stays unknown.
+    (root / "samples.jsonl").write_text("\n".join(map(json.dumps, rows)))
+    output = tmp_path / "legacy-built"
+    catalog = importlib.import_module("coexecution.replay.catalog").build_catalog(
+        model_runs=[root], deployments=[], output=output, clock_cohort="declared"
+    )
+    runs = [
+        json.loads((output / descriptor["path"]).read_text())
+        for descriptor in catalog["runs"]
+    ]
+    first = runs[0]["clean_requests"][0]
+    assert first["request_id"] == "r0/bf16-compiled/o0/prepared_model"
+    assert first["observation_id"] == "obs-0-" + "a" * 16
+    assert first["wall_ms"] == 12 and first["seed"] == 17
+    assert first["clean_wall"] is False
+    assert first.get("instrumented") is None
+    assert first["timing_status"] == "instrumentation_unknown"
+    assert first["identity_derivation"]["request_id"]
+    assert runs[0]["observations"][0]["identity_derivation"]["observation_id"]
+    assert first["output"]["status"] == "recorded"
+    assert runs[0]["profile_requests"] == []
+    assert runs[0]["profile_summary"]["gpu_work_ms"] == 27.5
+    assert any("request annotations" in warning for warning in runs[0]["warnings"])
+    assert runs[1]["clean_requests"][0].get("seed") is None
+    assert all(
+        row["comparison_key"] is None for run in runs for row in run["clean_requests"]
+    )
+
+
+def test_known_config_missing_instrumentation_never_builds_comparison_keys(tmp_path):
+    root, _ = model_fixture(tmp_path)
+    rows = [
+        json.loads(line) for line in (root / "samples.jsonl").read_text().splitlines()
+    ]
+    for row in rows:
+        row.pop("instrumented")
+    (root / "samples.jsonl").write_text("\n".join(map(json.dumps, rows)))
+    output = tmp_path / "missing-instrumentation"
+    catalog = importlib.import_module("coexecution.replay.catalog").build_catalog(
+        model_runs=[root], deployments=[], output=output, clock_cohort="known-clock"
+    )
+    for descriptor in catalog["runs"]:
+        run = json.loads((output / descriptor["path"]).read_text())
+        assert run["shared_config_sha256"] is not None
+        row = run["clean_requests"][0]
+        assert row["timing_status"] == "instrumentation_unknown"
+        assert row["comparison_key"] is None
+        assert row["difference_from_bf16"] is None
+        assert row["output"]["status"] == "recorded"

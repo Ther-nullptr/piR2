@@ -108,3 +108,102 @@ Browser dependencies are development-only. Playwright 1.51.1 was used with the o
 公共样式优先使用思源黑体（Source Han Sans CN VF / SC），后备为同源的 Noto Sans CJK SC。字体文件是本地资源，位于被忽略的 `simulator/fonts/SourceHanSansCN-VF.ttf.woff2`；来源、固定版本和 SHA-256 见 `sources.lock.json`，许可见 `licenses/SOURCE_HAN_SANS_LICENSE`。使用固定版本仓库内 `Variable/WOFF2/TTF/Subset/SourceHanSansCN-VF.ttf.woff2` 与 `LICENSE.txt`，保持字体原样。
 
 预览从同源地址加载字体；报告导出器将本地 WOFF2 和许可证一并内联，离线打开也可使用。未下载字体时，报告保留本机字体回退。时序与 AoI 的简短图例位于各自图内，详细调度说明折叠显示。
+
+## Quantization and robot debugger
+
+Serve an explicitly built v1 replay catalog with the existing preview server:
+
+```bash
+python simulator/serve.py --port 8765 --replay /path/to/catalog.json
+# A directory containing catalog.json is accepted too.
+```
+
+Open `http://127.0.0.1:8765/` (defaults to the debugger when configured), or
+`/simulator/replay.html` directly. Recorded robot runs open the robot-video view by
+default; `?view=model` explicitly opens fixed-input model replay. The two prominent
+tabs distinguish actual robot video from the static model input images. The existing queue teaching and measured-report
+views remain at `/simulator/`; `--report` and `--replay` can be used together.
+Build recording/catalog inputs with the [replay evidence package](../coexecution/replay/README.md).
+
+The interface follows the compact header, experiment controls, precision cards,
+shared cursor and event inspector of the VLM realtime-caption viewer. It contains
+no external assets or framework dependency. `replay-model.js` interprets evidence;
+`replay-view.js` renders it. `replay-media.js` owns bounded media decoding and
+keeps the last decoded frame visible during forward playback; backwards seeks
+hide any frame newer than the cursor. `replay-lineage.js` uses the existing measured
+queue dependency aliases and only recorded source/publication/consumption IDs. The server imports only standard-library evidence
+helpers, never Torch, NumPy archives, a simulator or a model.
+
+- **Independent model**: select a measurement boundary, real input and seed.
+  `policy` includes raw-input preparation and action decoding;
+  `preparation_transfer` only prepares/transfers inputs and shows no neural
+  dependency arrows; `prepared_model` measures the resident-input model body.
+  Profile preparation+model calls explicitly exclude decoding and are a separate
+  `preparation_model` boundary. Statistics and cross-precision matches never mix
+  scopes. Unknown boundaries remain inspectable without inferred neural stages.
+  An exact record in its own run can be viewed even without a declared clock cohort;
+  it is labelled unpaired and other precisions remain unmatched. Missing seeds,
+  observations or cohorts never authorize a cross-precision match.
+ Clean wall P50/P95 use only
+  uninstrumented samples within the selected boundary; their exact decoded action sequence appears after that
+  request completes. Profile records expose the actual VLM/action GPU events,
+  stage, category, stream and full kernel name. Profile calls have their own seeds
+  and outputs; unavailable outputs remain unavailable. GPU work, device span and
+  host wall are different, nonadditive boundaries. Filtering a module/category
+  never fabricates a timeline for Clean samples.
+- **Robot closed loop**: each precision plays its own main/wrist video and actual
+  state/command history. The shared cursor is elapsed control wall time. Frame
+  timestamps map to explicit encoded-media timestamps; playback does not assume
+  wall time equals frame index / nominal control rate. Initial frames may predate
+  control start. States become available at their recorded computation time;
+  commands become available at actual execution. Ended episodes hold their last
+  available frame with an ended label. Missing videos, failed episodes, invalid
+  control timing and unmatched runs stay visible.
+- The XY projection uses measured end-effector position in metres. State rotation
+  is an axis-angle **rotation vector**, not Euler angles; gripper state has two
+  joints. Normalized controller commands are separate selectable channels.
+  Selecting a command exposes its request, source frame/feature and cache/image/
+  state AoI through the existing measured-queue helper. Diverged robot trajectories
+  are never presented as the same-input numerical comparison.
+- The always-visible dependency diagram connects observation → S2/VLM → published
+  feature/cache → S1/DiT → action buffer → executed control tick. Each precision
+  follows its own actual consumed feature, rather than whichever cache is newest.
+  Click a request, action or diagram node to pin its lineage; “跟随时间游标” restores
+  the currently executed action. Unknown/bootstrap links remain marked unknown.
+  In model view, dashed arrows identify the recorded full-model invocation path;
+  they do not invent unmeasured component times.
+- Incomplete/unavailable controller traces keep their task identity, status and
+  reason. They cannot play a normal control episode even if metadata contains a
+  success flag. All secondary controls are disabled while a new run set loads.
+- Use playback speed, scrub, previous/next event, window and precision controls to
+  inspect a run. Model time is milliseconds (default slow playback); robot time is
+  seconds. Configuration changes commit all cards/plots together and discard stale
+  HTTP/media responses. Export downloads only the current evidence selection;
+  “运行来源” and catalog/run JSON preserve source hashes and validation status.
+
+The preview exposes only the selected catalog and its explicitly listed run/media
+files through `/api/replay/catalog`, `/api/replay/run/<id>` and
+`/api/replay/media/<id>`. Media supports bounded byte-range reads and HEAD. IDs,
+paths and MIME types are validated; absolute paths, traversal, symlinks and
+unlisted files are rejected. Directory listings are disabled. APIs and HTML/JS/CSS use no-store (static conditional requests return fresh
+content); media can be privately cached for one hour. Keep configured artifacts unchanged
+while viewing them. The preview binds to loopback; it is not a public artifact
+hosting service.
+
+```bash
+node --test simulator/replay-model.test.cjs
+python -m pytest -q simulator/test_serve.py
+# Explicit browser integration with real prebuilt evidence; never launches inference:
+node simulator/replay-browser-check.cjs --catalog=/path/to/catalog.json
+# Or against an existing preview:
+node simulator/replay-browser-check.cjs --url=http://127.0.0.1:8765/simulator/replay.html
+```
+
+The optional browser check expects a three-precision model/robot debug catalog
+with main/wrist videos and a retained failed, timing-invalid example. It verifies
+actual WebM pixel changes during several seconds of PLAY, visible decoded frames,
+pause/resume, backwards seek, delayed media, dependency selection, mode/camera
+changes, stale requests, secondary controls during loading, incomplete records
+and desktop layout. It does not run mobile-browser checks. Screenshots go to ignored `artifacts/simulator/`; append
+`--no-screenshots` to skip images. These are interface checks, not inference or
+LIBERO task-quality validation.

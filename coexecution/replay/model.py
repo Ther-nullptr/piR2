@@ -128,6 +128,15 @@ def _profiles(root, label, metadata, observations, run_id):
     if not metadata:
         return [], [], [], []
     path = root / "profiles" / f"{label}.trace.json"
+    if not metadata.get("requests"):
+        return (
+            [],
+            [],
+            [source(path)] if path.is_file() else [],
+            [
+                "Profile aggregate has no per-request annotations; module timeline is unavailable. Aggregate measurements remain in profile_summary."
+            ],
+        )
     if not path.is_file():
         return (
             [],
@@ -293,10 +302,70 @@ def _retained_requests(arrays):
     return requests
 
 
+def _normalize_legacy_identity(result, rows):
+    """Derive labels only from stored hashes/indexes and canonical sample fields."""
+    identities, normalized, derived = [], [], False
+    for index, original in enumerate(result.get("observations", [])):
+        identity = dict(original)
+        if "observation_id" not in identity:
+            sha = identity.get("sha256")
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+                raise ValueError(
+                    "Legacy observation identity requires its persisted SHA-256"
+                )
+            identity["observation_id"] = f"obs-{index}-{sha[:16]}"
+            identity["identity_derivation"] = {
+                "observation_id": "Persisted observations list index and SHA-256"
+            }
+            derived = True
+        identities.append(identity)
+    for original in rows:
+        row, basis = dict(original), {}
+        label, index = row.get("mode", ""), row.get("observation")
+        if "observation_id" not in row:
+            if type(index) is not int or not 0 <= index < len(identities):
+                raise ValueError(
+                    "Legacy sample requires a valid persisted observation index"
+                )
+            row["observation_id"] = identities[index]["observation_id"]
+            basis["observation_id"] = "Persisted sample observation index"
+        if "request_id" not in row:
+            number, scope = row.get("round"), row.get("scope")
+            if (
+                type(index) is not int
+                or index < 0
+                or type(number) is not int
+                or number < 0
+                or not isinstance(scope, str)
+                or not re.fullmatch(r"[a-z_]+", scope)
+            ):
+                raise ValueError(
+                    "Legacy request identity requires round/observation/scope"
+                )
+            row["request_id"] = f"r{number}/{label}/o{index}/{scope}"
+            basis["request_id"] = (
+                "Persisted round/mode/observation/scope; canonical archive key"
+            )
+        if "precision" not in row:
+            row["precision"] = label.split("-", 1)[0]
+            basis["precision"] = "Persisted mode label prefix"
+        if "instrumented" not in row:
+            row["timing_status"] = "instrumentation_unknown"
+        if basis:
+            row["identity_derivation"] = basis
+            derived = True
+        normalized.append(row)
+    return identities, normalized, derived
+
+
 def model_runs(root, media, *, clock_cohort=None):
     root = Path(root).resolve()
     result, rows, completed, provenance, warnings = _load_evidence(root)
-    identities = result.get("observations", [])
+    identities, rows, derived = _normalize_legacy_identity(result, rows)
+    if derived:
+        warnings.append(
+            "Legacy labels were derived from persisted observation hashes/indexes and sample fields; each derivation is marked. Missing seeds, timing, input assets and execution settings remain unknown."
+        )
     observations = {row["observation_id"]: row for row in identities}
     if len(observations) != len(identities):
         raise ValueError("Duplicate observation identity")
@@ -380,7 +449,7 @@ def model_runs(root, media, *, clock_cohort=None):
             identity = observations[row["observation_id"]]
             pair_config = (
                 digest([config_sha, row.get("scope"), row.get("instrumented")])
-                if config_sha is not None
+                if config_sha is not None and type(row.get("instrumented")) is bool
                 else None
             )
             clean.append(

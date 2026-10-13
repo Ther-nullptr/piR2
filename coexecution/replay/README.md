@@ -107,3 +107,16 @@ with null wall time/seed/comparison key. Saved nonfinite arrays keep their shape
 and nonfinite count with unavailable values, never fabricated finite outputs.
 Deployment task IDs are integers in 0–9 and episode IDs are nonnegative integers;
 trace paths and external symlinks must remain under the declared input root.
+
+
+Legacy local measurement packages may lack the newer observation/request IDs.
+The importer derives labels only from persisted observation SHA-256 plus list
+index, and the stored round/mode/observation/scope fields used in action-archive
+keys. Each derivation is marked in `identity_derivation`. It preserves original
+wall times, action arrays and any recorded seed; missing seeds, settings and raw
+camera assets remain unknown. A missing `instrumented` flag remains unknown even
+when `results.profiler` is false (CUDA-event measurement is a separate concern),
+so these historical rows are excluded from Clean P50/P95. Their own raw request
+wall/output remains viewable. Historical profile aggregates without request
+annotations stay in `profile_summary`; the importer never converts them into a
+per-request kernel timeline.
