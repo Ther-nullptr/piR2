@@ -223,6 +223,14 @@ def preflight_backend(config, device):
     }
     if precision != "bf16":
         spec = BACKENDS[precision]
+        if precision == "fp4" and getattr(config, "fp4_swap_ab", False):
+            spec = dict(
+                spec,
+                operators=(
+                    *spec["operators"],
+                    "linear_forward_packed_gemm_bf16_swap_ab",
+                ),
+            )
         before = _loaded_libraries(torch)
         missing_before = _missing_operators(torch, spec)
         backend = importlib.import_module(spec["module"])

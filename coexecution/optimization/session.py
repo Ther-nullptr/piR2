@@ -110,6 +110,7 @@ class GrootOptimizations:
                 expanded=expanded,
                 precision=self.config.precision,
                 fast_fp8=self.config.fp8_fast_quant,
+                fp4_swap_ab=self.config.fp4_swap_ab,
                 shared_inputs=self.config.fp_shared_inputs,
                 grouped=self.config.fp_grouped,
                 swiglu=self.config.fp_swiglu,

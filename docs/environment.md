@@ -100,6 +100,14 @@ export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
 export TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"
 ```
 
+`prepare_sources.py` applies the pinned Thor Swap-AB patch before this build.
+Rebuild the FP4 library after applying the patch; an older library still supports
+the default path, but enabling `--fp4-swap-ab` requires the new registered API
+and fails before model mutation if it is missing. The flag is off by default.
+It selects only two measured M/K/N/bias signatures on SM110; see the floating
+adapter documentation below for scope and rollback. No system configuration or
+shared environment changes are required by the patch.
+
 Triton 3.6 selects a separate Blackwell assembler; on the tested installation its
 bundled binary did not recognize `sm_110a`. The second assembler variable is needed
 for the optional fast FP8 packer and uses the already installed compatible

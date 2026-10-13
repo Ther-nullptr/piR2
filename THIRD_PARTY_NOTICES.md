@@ -50,7 +50,16 @@ identifies source revision `1c6f8b8ac31c49e401ee267647b3f967725cd26e` of
 That directory retains its MIT license, copyright 2025 MIT HAN Lab, in the
 separately obtained checkout. The pinned source's pending-hardware-validation
 notice is distinct from this adapter's own Thor tests. No backend source or
-binary is copied into this repository and no upstream source patch is applied.
+binary or complete backend tree is copied into this repository. The local
+`patches/robotics-thor-fp4-swap-ab.patch` is recorded in `sources.lock.json`.
+It adapts `blackwell/csrc/fp4_mx_cutlass_linear.cu::mx_swap_gemm` from the same
+pinned revision into two Thor W4A4 configurations in `fp4_cutlass_linear.cu`:
+NVFP4 on both operands, unchanged block-16 scale layout, column-major output
+and per-row bias after swapping the operands. Existing operators are unchanged.
+The original MIT license, copyright 2025 MIT HAN Lab, is preserved in
+[licenses/ROBOTICS_BLACKWELL_LICENSE](licenses/ROBOTICS_BLACKWELL_LICENSE).
+This attribution applies to the adapted backend code, not the entire reference
+project or this repository.
 `coexecution/floating_packing.py` is a local Triton implementation of the
 reference's per-tensor E4M3 quantization convention, checked against its packed
 bytes and scale; it does not replace the external CUTLASS GEMM.
@@ -63,4 +72,5 @@ modulation and residual sequencing follows the same checkout's
 packed buffers. Native BF16 SiLU lookup follows `common/fused.py`, preserving
 the original activation rounding rather than adopting the Blackwell wrapper's
 different SwiGLU rounding. `coexecution/floating_connections.py` adapts this
-repository's existing DiT connection; external CUDA sources remain unmodified.
+repository's existing DiT connection; they do not require changes to external
+CUDA sources. The independent optional Swap-AB patch is described above.

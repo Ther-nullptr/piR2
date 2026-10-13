@@ -15,8 +15,11 @@ The optional `robotics-kernels` component pins
 to `239b4a3ef2268048571c9f508ad5700f98398c2f`. Fetch it with
 `python tools/prepare_sources.py --component robotics-kernels`; the existing
 preparation tool verifies the revision and leaves a mismatched checkout untouched.
-It has no local patches and remains in ignored
-`third_party/robotics-the-speedup-paradox/`.
+It remains in ignored `third_party/robotics-the-speedup-paradox/`.
+The recorded `patches/robotics-thor-fp4-swap-ab.patch` adds two opt-in SM110
+W4A4 configurations to the FP4 backend without changing its existing operators.
+It adapts the pinned Blackwell MX Swap-AB layout to NVFP4 on both operands;
+the original Blackwell MIT notice is retained in `licenses/ROBOTICS_BLACKWELL_LICENSE`.
 
 GR00T-specific bindings, reversible installation and the local integer CUDA
 dispatch wrapper live in this repository. INT4/INT8 GEMM, integer
@@ -30,7 +33,7 @@ activation packing and BF16 SwiGLU, normalization, modulation and residual
 boundaries that emit FP8/FP4 inputs. `coexecution/floating_connections.py` binds
 the normalization and residual producers to DiT. These producers follow the
 pinned floating encodings and scale layouts; they do not use integer packed
-buffers or replace the external floating GEMM. The dependency remains unmodified.
+buffers. The only dependency change is the recorded optional Swap-AB API above.
 
 The bundled CUTLASS snapshot stays inside the dependency with its original
 license and hash manifest. Attribution for the integer and floating paths is

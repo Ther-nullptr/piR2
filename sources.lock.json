@@ -21,7 +21,9 @@
       "url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox.git",
       "revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "path": "third_party/robotics-the-speedup-paradox",
-      "patches": []
+      "patches": [
+        "patches/robotics-thor-fp4-swap-ab.patch"
+      ]
     },
     "source_han_sans": {
       "url": "https://github.com/adobe-fonts/source-han-sans",
