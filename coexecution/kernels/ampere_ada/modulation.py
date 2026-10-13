@@ -1,7 +1,8 @@
 """BF16 AdaLN modulation directly into symmetric integer activation buffers."""
 
-from dataclasses import dataclass, replace
 import math
+from dataclasses import dataclass, replace
+
 import torch
 import triton
 import triton.language as tl

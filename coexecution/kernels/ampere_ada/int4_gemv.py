@@ -20,7 +20,6 @@ from coexecution.kernels.ampere_ada._candidate_support import (
     require_pre_capture_build,
 )
 
-
 _FAILED_BUILDS = set()
 
 

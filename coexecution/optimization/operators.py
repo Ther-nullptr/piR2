@@ -340,7 +340,7 @@ def _parameters(family, implementation, values):
     elif family == "integer_gemm" and implementation == "split_k":
         allowed = {"slices": (2, 4, 8), "tile": range(3)}
     if not isinstance(values, Mapping):
-        raise ValueError(f"Parameters for {family} must be an object")
+        raise TypeError(f"Parameters for {family} must be an object")
     for name, value in values.items():
         if name not in allowed or type(value) is not int or value not in allowed[name]:
             raise ValueError(
@@ -361,7 +361,7 @@ class OperatorProfile:
         if not isinstance(self.implementations, Mapping) or not isinstance(
             self.parameters, Mapping
         ):
-            raise ValueError("Operator implementations/parameters must be objects")
+            raise TypeError("Operator implementations/parameters must be objects")
         for family, implementation in self.implementations.items():
             _choice(family, implementation, self.architecture, self.precision)
         if self.parameters.keys() - self.implementations.keys():
@@ -396,7 +396,7 @@ class OperatorProfile:
 def _document(path, required, optional=()):
     value = json.loads(Path(path).read_text())
     if not isinstance(value, dict):
-        raise ValueError("Expected a JSON object")
+        raise TypeError("Expected a JSON object")
     if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
         raise ValueError("schema_version must be 1")
     keys = value.keys() - {"schema_version"}
@@ -494,7 +494,7 @@ class CandidateMeasurement:
         for name in ("candidate_id", "source_revision", "artifact"):
             _identity(name, getattr(self, name))
         if not isinstance(self.context, MeasurementContext):
-            raise ValueError("context must be MeasurementContext")
+            raise TypeError("context must be MeasurementContext")
         _choice(
             self.family,
             self.implementation,
@@ -536,11 +536,11 @@ def read_measurements(path):
     """Read normalized retained evidence; does not infer missing run metadata."""
     rows = _document(path, ("candidates",))["candidates"]
     if not isinstance(rows, list):
-        raise ValueError("candidates must be a JSON list")
+        raise TypeError("candidates must be a JSON list")
     result = []
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("context"), dict):
-            raise ValueError("Each candidate requires an explicit context object")
+            raise TypeError("Each candidate requires an explicit context object")
         try:
             result.append(
                 CandidateMeasurement(

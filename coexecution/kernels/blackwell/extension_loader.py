@@ -28,9 +28,9 @@ def resolve_decode_policy(backend):
         raise ValueError(f"{name} must be one of {', '.join(('auto', *policies))}")
     low_name = prefix + "_LOW_CLOCK_THRESHOLD_HZ"
     low = int(
-        os.environ.get(low_name, 954_000_000 if backend == "fp8" else 540_000_000)
+        os.environ.get(low_name, "954000000" if backend == "fp8" else "540000000")
     )
-    mid = int(os.environ.get(prefix + "_MID_CLOCK_THRESHOLD_HZ", 1_152_000_000))
+    mid = int(os.environ.get(prefix + "_MID_CLOCK_THRESHOLD_HZ", "1152000000"))
     if low <= 0 or (backend == "fp4" and mid <= low):
         raise ValueError("Decode clock thresholds must be positive and increasing")
     devfreq = Path(

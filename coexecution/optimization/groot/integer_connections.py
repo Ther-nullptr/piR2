@@ -5,13 +5,13 @@ Reuses robotics-the-speedup-paradox revision
 """
 
 import torch
+
 from coexecution.kernels.ampere_ada.modulation import (
     PackedActivations,
     prepare_modulation,
     prepare_norm_modulation,
     prepare_residual_norm_modulation,
 )
-
 from coexecution.optimization.backends.integer.linear import PreparedLinear
 from coexecution.optimization.execution.graph import DitGraphs
 

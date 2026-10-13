@@ -5,14 +5,14 @@ import math
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
+
+from coexecution.fused_ops import _launch
 from coexecution.kernels.ampere_ada.integer import PackedActivation
 from coexecution.kernels.ampere_ada.modulation import (
     PackedActivations,
     prepare_modulation,
 )
-from triton.language.extra.cuda import libdevice
-
-from coexecution.fused_ops import _launch
 from coexecution.kernels.ampere_ada.rms_statistics import mean_square
 
 
