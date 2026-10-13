@@ -97,6 +97,28 @@ with GrootOptimizations(policy, config) as optimized:
 # Original module forwards/processors are restored, including on failure.
 ```
 
+For a focused BF16 operator experiment, `NonGemmAdapters` supports `baseline`,
+`vision_rope`, `text_rope`, `rope` (both RoPE paths), `rmsnorm`, `rope_rms`, and
+`all` (RoPE/RMSNorm plus AdaLN modulation). These select existing kernels;
+`baseline` restores the original forwards. The low-level adapter does not install
+DiT condition/mask preparation, Graphs or quantization. Use one adapter per
+private eval-mode model, change modes only after its work has completed, and
+restore it with `close()` in `finally`. These modes do not add service CLI options
+or relax the paired-worker guard. Test component selection, instance isolation
+and restoration explicitly with `tests/gpu/test_groot_fusion_modes_gpu.py`;
+measure performance on the target GPU with matched inputs and invocation counts.
+
+```python
+from coexecution.groot_fusion import NonGemmAdapters
+
+adapter = NonGemmAdapters(policy)
+try:
+    adapter.set("vision_rope")
+    # Run the existing inference path on this privately owned model.
+finally:
+    adapter.close()
+```
+
 An optional RTX 6000 Ada preset for the pinned `GR00T-N1.7-LIBERO/libero_10` model is provided as [coverage](../configs/quantization/groot-libero10-ada/coverage.json), [single-projection tactics](../configs/quantization/groot-libero10-ada/tactics.json) and [group tactics](../configs/quantization/groot-libero10-ada/group-tactics.json). These are executable configuration inputs, not timing reports. Add the following options to the standard Flow invocation above, selecting `w4a4` instead for INT4:
 
 ```bash
