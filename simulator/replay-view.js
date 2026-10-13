@@ -25,6 +25,7 @@
     descriptors: [],
     runs: [],
     kind: "model",
+    executionClock: "paced",
     type: "clean",
     scope: "prepared_model",
     precision: "all",
@@ -63,6 +64,10 @@
     if (rows.some(([v]) => String(v) === String(value))) el.value = value;
   };
   const color = (p) => colors[p] ?? "#78669d";
+  const cadenceLabels = {
+    paced: "固定 20 Hz 墙钟节拍",
+    ready: "就绪即接纳（StreamingVLA式调度，GR00T）",
+  };
   const notice = (value, bad = false) => {
     $("data-status").textContent = value;
     $("data-status").dataset.state = bad ? "error" : "ready";
@@ -85,6 +90,7 @@
   }
   const secondaryControls = [
     "record-type",
+    "execution-clock",
     "scope",
     "sample",
     "precision",
@@ -127,7 +133,11 @@
     $("data-status").textContent = "加载记录…";
     $("data-status").dataset.state = "loading";
     const kind = state.kind;
-    const descriptors = state.descriptors.filter((d) => d.kind === kind),
+    const descriptors = R.replayDescriptors(
+        state.descriptors,
+        kind,
+        state.executionClock,
+      ),
       precisions = [...new Set(descriptors.map((d) => d.precision))].sort(
         (a, b) =>
           ["bf16", "w8a8", "w4a4"].indexOf(a) -
@@ -257,6 +267,7 @@
     }
     $("record-label").hidden = state.kind !== "model";
     $("scope-label").hidden = state.kind !== "model";
+    $("execution-clock-label").hidden = state.kind !== "deployment";
     $("sample-label").textContent =
       state.kind === "model" ? "输入 / 随机种子" : "任务 / 回合";
     const modelChannels = [
@@ -332,7 +343,11 @@
         (r) => r.episode && R.pairedEpisode(state.rows[0].episode, r.episode),
       );
       $("evidence-note").textContent =
-        `真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。当前为单个调试示例，不是套件成功率；记录相机拷贝会带来开销。`;
+        `${cadenceLabels[state.executionClock]} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
+        (state.executionClock === "ready"
+          ? " 每次 env.step 仍推进 0.05 s 仿真时间；上一步结束即接纳已完成计划，不额外等待 50 ms。实际墙钟执行率与实时倍率分别显示。沿用 GR00T Flow4 / H40 / 解码16，无 StreamingVLA AFM/AEO 权重；视频按原始帧时间映射，不加速伪装。"
+          : " 控制目标为每 50 ms 执行一步，实际时序单独验证。") +
+        " 当前为调试示例，不是套件成功率；记录相机拷贝会带来开销。";
     }
     const canPlay =
       state.kind === "model"
@@ -429,7 +444,11 @@
           ({ run }, i) =>
             `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2><select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置">${state.descriptors
               .filter(
-                (d) => d.kind === state.kind && d.precision === run.precision,
+                (d) =>
+                  d.kind === state.kind &&
+                  d.precision === run.precision &&
+                  (state.kind !== "deployment" ||
+                    R.deploymentCadence(d) === state.executionClock),
               )
               .map(
                 (d) =>
@@ -578,7 +597,7 @@
               : "结果未知";
         status.textContent = !episode
           ? "该任务没有回合记录"
-          : `${at.ended ? "已结束" : "正在回放"} · 回合最终结果：${verdict} · ${meta.control_rate_valid === false ? "时序无效" : meta.control_rate_valid === true ? "控制时序有效" : "控制时序未知"} · ${meta.termination_reason ?? "原因未知"}${episode.robot?.error ? " · " + episode.robot.error : ""}`;
+          : `${at.ended ? "已结束" : "正在回放"} · 回合最终结果：${verdict} · ${R.deploymentCadence(run) === "ready" ? "固定频率有效性不适用" : meta.control_rate_valid === false ? "时序无效" : meta.control_rate_valid === true ? "控制时序有效" : "控制时序未知"} · ${meta.termination_reason ?? "原因未知"}${episode.robot?.error ? " · " + episode.robot.error : ""}`;
         status.dataset.status =
           meta.success === false || meta.control_rate_valid === false
             ? "bad"
@@ -602,14 +621,31 @@
         metrics.innerHTML = metricsHTML([
           ["S1 RPC P50", meta.action_rpc_seconds?.p50 * 1000, "ms"],
           ["S1 RPC P95", meta.action_rpc_seconds?.p95 * 1000, "ms"],
-          ["实际控制率", meta.actual_control_hz, "Hz"],
+          ["实际墙钟执行率", meta.actual_control_hz, "Hz"],
+          ["S1 请求率", meta.action_request_hz, "Hz"],
+          ["有效计划更新率", meta.effective_plan_update_hz, "Hz"],
+          [
+            "就绪 → 首次执行 P50",
+            R.finite(meta.action_ready_to_first_apply_seconds?.p50)
+              ? meta.action_ready_to_first_apply_seconds.p50 * 1000
+              : null,
+            "ms",
+          ],
+          [
+            "物理仿真步长",
+            R.finite(meta.physics_step_seconds)
+              ? meta.physics_step_seconds * 1000
+              : null,
+            "ms/step",
+          ],
+          ["仿真时间 / 墙钟", meta.real_time_factor, "×"],
           ["当前动作的图像年龄", queue?.imageAgeMs, "ms"],
           ["当前动作的状态年龄", queue?.stateAgeMs, "ms"],
           ["控制动作", at.tick ? String(at.tick.tick) : "—", "tick"],
         ]);
         metrics.title =
           "当前动作的信息年龄 = 当前控制墙钟游标 − 该已执行命令实际来源的采集时刻；不是执行瞬间的汇总 AoI。回合结束后固定在终止时刻，不虚构后续执行。";
-        details.textContent = `位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · d ${queue?.delay ?? "未知"} · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
+        details.textContent = `位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · ${R.deploymentCadence(run) === "ready" ? "承诺步数" : "d"} ${queue?.delay ?? "未知"} · 仿真 ${fmt(meta.simulated_elapsed_seconds)} s / 墙钟 ${fmt(meta.controlled_wall_seconds)} s · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
         action.textContent = at.tick
           ? `检查动作 ${at.tick.tick} · ${at.tick.action?.map((v) => fmt(v, 3)).join(", ")}`
           : "游标前没有已执行命令";
@@ -1120,6 +1156,12 @@
       state.scope = $("scope").value;
       configureSamples();
     });
+    $("execution-clock").addEventListener("change", () => {
+      state.executionClock = $("execution-clock").value;
+      state.clock = 0;
+      state.sample = null;
+      loadRuns();
+    });
     $("record-type").addEventListener("change", () => {
       state.type = $("record-type").value;
       configureSamples();
@@ -1157,6 +1199,8 @@
       const data = {
         catalog_created_at: state.catalog?.created_at,
         kind: state.kind,
+        execution_clock:
+          state.kind === "deployment" ? state.executionClock : null,
         record_type: state.type,
         cursor: state.clock,
         cursor_unit: state.kind === "model" ? "ms" : "control_wall_s",
@@ -1205,7 +1249,23 @@
         throw new Error("不支持的 replay catalog 版本");
       state.catalog = catalog;
       state.descriptors = catalog.runs ?? [];
-      const requestedView = new URLSearchParams(location.search).get("view");
+      const query = new URLSearchParams(location.search),
+        requestedView = query.get("view");
+      const cadences = [
+        ...new Set(
+          state.descriptors
+            .filter((run) => run.kind === "deployment")
+            .map(R.deploymentCadence),
+        ),
+      ];
+      options(
+        $("execution-clock"),
+        cadences.map((mode) => [mode, cadenceLabels[mode] ?? mode]),
+        query.get("execution_clock") ??
+          catalog.default_execution_clock ??
+          "paced",
+      );
+      state.executionClock = $("execution-clock").value || "paced";
       state.kind =
         requestedView === "model"
           ? "model"

@@ -14,6 +14,11 @@ def main():
     build.add_argument("--deployment", action="append", type=Path, default=[])
     build.add_argument("--output", type=Path, required=True)
     build.add_argument(
+        "--default-execution-clock",
+        choices=("paced", "ready"),
+        help="Explicit robot playback default; must exist in recorded evidence",
+    )
+    build.add_argument(
         "--clock-cohort",
         help="Operator-declared audited common device/clock cohort; omitted disables paired comparison claims",
     )
@@ -25,6 +30,7 @@ def main():
         deployments=args.deployment,
         output=args.output,
         clock_cohort=args.clock_cohort,
+        default_execution_clock=args.default_execution_clock,
     )
     print(f"Built {len(catalog['runs'])} replay runs at {args.output / 'catalog.json'}")
 

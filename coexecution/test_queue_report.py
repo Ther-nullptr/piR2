@@ -9,6 +9,45 @@ def event(kind, t_s, **fields):
     return {"kind": kind, "t_s": t_s, **fields}
 
 
+def test_ready_report_preserves_null_deadlines_and_simulation_wall_separation():
+    rows = [
+        event("control_start", 10, period_s=0.05, execution_clock="ready"),
+        event("action_submitted", 10, request_tick=0, deadline_s=None),
+        event(
+            "action_completed",
+            10.01,
+            request_tick=0,
+            request_elapsed_s=0.01,
+            valid_start_tick=1,
+            valid_end_tick=16,
+        ),
+        event("action_adopted", 10.03, request_tick=0, ready_to_adopt_seconds=0.02),
+        event(
+            "control_tick",
+            10.03,
+            tick=1,
+            applied_s=10.03,
+            scheduled_s=None,
+            lateness_s=None,
+            ready_to_apply_seconds=0.02,
+            executed_slot={"producer_kind": "request", "producer_request_tick": 0},
+        ),
+        event("control_end", 10.06, control_steps=2),
+    ]
+    out = summarize_episode(
+        rows, {"execution_clock": "ready", "control_rate_valid": None}
+    )
+    assert out["execution_clock"] == "ready"
+    assert out["requests"][0]["deadline_s"] is None
+    assert out["requests"][0]["ready_to_adopt_seconds"] == pytest.approx(0.02)
+    assert out["ticks"][0]["lateness_ms"] is None
+    assert out["metrics"]["deadline_misses"] is None
+    assert out["metrics"]["fixed_rate_timing_applicable"] is False
+    assert out["metrics"]["simulated_elapsed_seconds"] == pytest.approx(0.1)
+    assert out["metrics"]["real_time_factor"] == pytest.approx(0.1 / 0.06)
+    assert out["metadata"]["control_rate_valid"] is None
+
+
 def test_requests_crossing_control_end_are_censored_not_complete_samples():
     rows = [
         event("control_start", 10, period_s=0.05),

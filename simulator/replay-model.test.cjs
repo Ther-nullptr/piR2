@@ -17,6 +17,39 @@ const clean = {
   instrumented: false,
   output: { status: "recorded" },
 };
+test("execution cadence selects an explicit matched set and treats legacy runs as paced", () => {
+  assert.equal(typeof R.deploymentCadence, "function");
+  assert.equal(typeof R.replayDescriptors, "function");
+  const descriptors = [
+    { id: "old", kind: "deployment", precision: "bf16" },
+    {
+      id: "ready-bf",
+      kind: "deployment",
+      precision: "bf16",
+      execution_clock: "ready",
+    },
+    {
+      id: "ready-w8",
+      kind: "deployment",
+      precision: "w8a8",
+      execution_clock: "ready",
+    },
+    { id: "model", kind: "model", precision: "bf16" },
+  ];
+  assert.equal(R.deploymentCadence(descriptors[0]), "paced");
+  assert.deepEqual(
+    R.replayDescriptors(descriptors, "deployment", "ready").map((r) => r.id),
+    ["ready-bf", "ready-w8"],
+  );
+  assert.deepEqual(
+    R.replayDescriptors(descriptors, "deployment", "paced").map((r) => r.id),
+    ["old"],
+  );
+  assert.deepEqual(
+    R.replayDescriptors(descriptors, "model", "ready").map((r) => r.id),
+    ["model"],
+  );
+});
 test("aligns only known identical input, seed, and record type; keeps missing slots", () => {
   assert.equal(typeof R.alignModel, "function");
   const runs = [

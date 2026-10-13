@@ -6,7 +6,9 @@ from pathlib import Path
 from .schema import VERSION, write_json
 
 
-def build_catalog(*, model_runs, deployments, output, clock_cohort=None):
+def build_catalog(
+    *, model_runs, deployments, output, clock_cohort=None, default_execution_clock=None
+):
     from .deployment import deployment_directories, deployment_run
     from .media import MediaRegistry
     from .model import compare_outputs
@@ -29,6 +31,17 @@ def build_catalog(*, model_runs, deployments, output, clock_cohort=None):
         raise ValueError("At least one measured model or deployment run is required")
     if len({run["id"] for run in runs}) != len(runs):
         raise ValueError("Duplicate replay run input")
+    if default_execution_clock is not None and (
+        default_execution_clock not in ("paced", "ready")
+        or not any(
+            run.get("execution_clock") == default_execution_clock
+            for run in runs
+            if run["kind"] == "deployment"
+        )
+    ):
+        raise ValueError(
+            "Requested default execution clock is not present in deployment evidence"
+        )
     compare_outputs(runs)
     index = []
     for run in runs:
@@ -42,6 +55,11 @@ def build_catalog(*, model_runs, deployments, output, clock_cohort=None):
                 "profile_requests": len(run.get("profile_requests", [])),
                 "episodes": len(run.get("episodes", [])),
                 "warnings": run["warnings"],
+                **(
+                    {"execution_clock": run["execution_clock"]}
+                    if run["kind"] == "deployment"
+                    else {}
+                ),
             }
         )
     write_json(
@@ -59,6 +77,7 @@ def build_catalog(*, model_runs, deployments, output, clock_cohort=None):
         "runs": index,
         "media_manifest": "media.json",
         "clock_cohort": clock_cohort,
+        "default_execution_clock": default_execution_clock,
         "notes": [
             "Independent model replay and closed-loop robot trajectories have separate measurement boundaries",
             "Missing evidence remains null or unavailable, never a fabricated zero",

@@ -59,6 +59,56 @@ if (!catalog && !external)
       "deployment",
       "real robot view should be the visible default",
     );
+    const configuredCatalog = await page.evaluate(async () =>
+      (await fetch("/api/replay/catalog")).json(),
+    );
+    const defaultClock = configuredCatalog.default_execution_clock ?? "paced";
+    assert.equal(
+      await page.locator("#execution-clock").inputValue(),
+      defaultClock,
+    );
+    const cadenceChoices = await page
+      .locator("#execution-clock option")
+      .evaluateAll((xs) => xs.map((x) => x.value));
+    for (const cadence of cadenceChoices) {
+      await page.selectOption("#execution-clock", cadence);
+      await page.waitForFunction(
+        () => document.querySelector("#data-status").dataset.state === "ready",
+      );
+      const selected = await page
+        .locator(".run-select")
+        .evaluateAll((xs) => xs.map((x) => x.value));
+      assert.equal(selected.length, 3);
+      assert.ok(
+        selected.every(
+          (id) =>
+            (configuredCatalog.runs.find((run) => run.id === id)
+              .execution_clock ?? "paced") === cadence,
+        ),
+      );
+      assert.match(
+        await page.locator("#evidence-note").innerText(),
+        cadence === "ready" ? /StreamingVLA式调度，GR00T.*0.05/s : /固定 20 Hz/,
+      );
+      if (cadence === "ready") {
+        assert.match(
+          await page.locator("#precision-cards").innerText(),
+          /固定频率有效性不适用/,
+        );
+        assert.match(
+          await page.locator("#precision-cards").innerText(),
+          /实际墙钟执行率/,
+        );
+        assert.match(
+          await page.locator("#precision-cards").innerText(),
+          /仿真时间 \/ 墙钟/,
+        );
+      }
+    }
+    await page.selectOption("#execution-clock", defaultClock);
+    await page.waitForFunction(
+      () => document.querySelector("#data-status").dataset.state === "ready",
+    );
     await page.selectOption("#evidence-mode", "model");
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
@@ -267,11 +317,13 @@ if (!catalog && !external)
     });
     assert.match(
       await page.locator("#precision-cards").innerText(),
-      /失败|failed/,
+      /回合最终结果：(成功|失败|结果未知)/,
     );
     assert.match(
       await page.locator("#precision-cards").innerText(),
-      /时序无效|invalid/,
+      defaultClock === "ready"
+        ? /固定频率有效性不适用/
+        : /时序无效|控制时序有效|控制时序未知/,
     );
     if (!process.argv.includes("--no-screenshots"))
       await page.screenshot({

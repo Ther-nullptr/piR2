@@ -102,11 +102,16 @@ def deployment_run(root, media):
     config = read_json(root / "config.json")
     if config.get("protocol") != "deployment":
         raise ValueError("Robot replay requires actual deployment traces")
+    execution_clock = config.get("execution_clock", "paced")
+    if execution_clock not in ("paced", "ready"):
+        raise ValueError("Unknown deployment execution clock")
     metadata = read_jsonl(root / "episodes.jsonl")
     run_id = "deployment-" + digest(str(root))[:20]
     episodes, identities = [], set()
     provenance = [source(root / "config.json"), source(root / "episodes.jsonl")]
     for episode in metadata:
+        if episode.get("execution_clock", execution_clock) != execution_clock:
+            raise ValueError("Episode and configuration execution clocks disagree")
         task, number = episode.get("task_id"), episode.get("episode_id")
         if type(task) is not int or task not in range(10):
             raise ValueError("Deployment task_id must be an integer in 0..9")
@@ -178,6 +183,10 @@ def deployment_run(root, media):
             )
             previous_applied = applied
         queue = summarize_episode(events, episode)
+        if queue["execution_clock"] != execution_clock:
+            raise ValueError(
+                "Controller trace and configuration execution clocks disagree"
+            )
         for request in queue["requests"]:
             sequence = (
                 request.get("request_tick")
@@ -235,6 +244,7 @@ def deployment_run(root, media):
         "version": VERSION,
         "id": run_id,
         "kind": "deployment",
+        "execution_clock": execution_clock,
         "label": root.parent.name,
         "precision": _precision(config),
         "mode": root.parent.name,

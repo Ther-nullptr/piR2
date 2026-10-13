@@ -111,6 +111,16 @@ Browser dependencies are development-only. Playwright 1.51.1 was used with the o
 
 ## Quantization and robot debugger
 
+机器人闭环视图可切换 `paced` 固定 20 Hz 墙钟节拍与 `ready`
+“就绪即接纳（StreamingVLA式调度，GR00T）”。后者使用真实重新录制的
+GR00T 轨迹，在原子仿真步结束后接纳完成结果；物理步长仍为 0.05 s。
+实际墙钟执行率、S1 请求率、计划更新率、就绪至首次执行等待与仿真/墙钟倍率
+分别显示。Ready 没有固定频率有效性，不会用零代替未知或不适用的值。
+依赖链与视频继续按本精度实际来源和采集时间回放；没有 AFM/AEO 权重适配，
+也不将旧视频加速当作新执行结果。Catalog 可用
+`--default-execution-clock ready` 显式设置默认组，URL 的
+`?execution_clock=paced|ready` 可切换；旧 catalog 保持 paced。
+
 Serve an explicitly built v1 replay catalog with the existing preview server:
 
 ```bash

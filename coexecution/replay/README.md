@@ -37,6 +37,14 @@ encoded 20 fps index; wall-clock seeking must use the frame mapping. Recording
 adds array-copy overhead and marks the run instrumented. Physical control,
 real cameras, real VLM and the 20 Hz environment remain unchanged.
 
+`--execution-clock ready` (or plan/case `"execution_clock": "ready"`) records
+GR00T Flow execution without an imposed wall grid. The physics step remains
+0.05 s; actual wall execution Hz and simulated-time/wall-time ratio are separate
+metadata. Completed plans are adopted only between atomic environment steps,
+with a one-step committed prefix. Ready deadline/lateness/validity fields are
+null, and its records cannot seed the fixed-rate teaching simulator. This is
+StreamingVLA-inspired scheduling with GR00T, not its AFM/AEO algorithm.
+
 ```bash
 python -m coexecution.replay build \
   --model-run /path/to/model_only \
@@ -52,6 +60,13 @@ catalogs, media and profiles stay outside Git. The optional clock cohort is an
 explicit operator declaration based on hardware/telemetry review, not a measured
 clock inferred by the builder. Omit it if unknown; same-input comparison keys
 will then be unavailable.
+
+For catalogs containing both cadences, add `--default-execution-clock ready`
+to choose the new recordings explicitly. The builder rejects a requested clock
+that is absent from the evidence. The frontend's execution-clock selector
+switches all precisions together; `?execution_clock=paced` or `ready` overrides
+the catalog default. Legacy catalogs remain paced. Each video keeps its own
+frame-to-wall mapping; the selector never retimes an old trajectory.
 
 ## Version 1 contract
 

@@ -17,7 +17,10 @@ import time
 from pathlib import Path
 
 from coexecution.libero.features import validate_feature_options
-from coexecution.libero.scheduling import validate_vision_max_hz
+from coexecution.libero.scheduling import (
+    validate_execution_clock,
+    validate_vision_max_hz,
+)
 
 FIXTURE_FIELDS = (
     "initial_state_sha256",
@@ -112,6 +115,15 @@ def validate_plan(plan):
     parser = argparse.ArgumentParser(add_help=False)
     add_optimization_arguments(parser)
     for case in plan["conditions"]:
+        for protocol in plan["protocols"]:
+            validate_execution_clock(
+                case.get("execution_clock", plan.get("execution_clock", "paced")),
+                protocol=protocol,
+                variant=case["variant"],
+                fixed_delay=case.get(
+                    "deployment_fixed_delay", plan.get("deployment_fixed_delay")
+                ),
+            )
         if case["variant"] not in ("flow", "pir2") or not case["checkpoint"]:
             raise ValueError("Declare each condition checkpoint and variant")
         if not isinstance(case["flags"], list) or any(
@@ -158,6 +170,18 @@ def build_commands(plan, case, protocol, output):
     ):
         rate = case.get("vision_max_hz", plan.get("vision_max_hz", 0))
         deployment_controls = ["--vision-max-hz", str(rate)]
+    if protocol == "deployment":
+        deployment_controls.extend(
+            [
+                "--execution-clock",
+                case.get("execution_clock", plan.get("execution_clock", "paced")),
+            ]
+        )
+        fixed_delay = case.get(
+            "deployment_fixed_delay", plan.get("deployment_fixed_delay")
+        )
+        if fixed_delay is not None:
+            deployment_controls.extend(["--deployment-fixed-delay", str(fixed_delay)])
     for role in ("action", "vlm"):
         commands[role] = [
             str(plan["model_python"]),

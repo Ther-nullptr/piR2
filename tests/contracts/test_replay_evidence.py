@@ -1,6 +1,7 @@
 """Replay evidence contracts: host metadata only, never CPU neural inference."""
 
 import importlib
+import inspect
 import json
 import subprocess
 import sys
@@ -418,6 +419,65 @@ def deployment_fixture(tmp_path):
     ]
     (root / "task0-episode0-trace.jsonl").write_text("\n".join(map(json.dumps, events)))
     return root, metadata
+
+
+def test_ready_catalog_keeps_nullable_timing_and_explicit_default(tmp_path):
+    root, metadata = deployment_fixture(tmp_path)
+    config = json.loads((root / "config.json").read_text())
+    config["execution_clock"] = "ready"
+    (root / "config.json").write_text(json.dumps(config))
+    metadata.update(
+        execution_clock="ready",
+        control_rate_valid=None,
+        physics_step_seconds=0.05,
+        nominal_physics_hz=20,
+        simulated_elapsed_seconds=0.05,
+        controlled_wall_seconds=0.03,
+        actual_control_hz=None,
+        real_time_factor=0.05 / 0.03,
+    )
+    (root / "episodes.jsonl").write_text(json.dumps(metadata) + "\n")
+    events = [
+        json.loads(row)
+        for row in (root / "task0-episode0-trace.jsonl").read_text().splitlines()
+    ]
+    events[0]["execution_clock"] = "ready"
+    events[1].update(scheduled_s=None, lateness_s=None)
+    events[-1]["t_s"] = 10.03
+    (root / "task0-episode0-trace.jsonl").write_text("\n".join(map(json.dumps, events)))
+    module = importlib.import_module("coexecution.replay.catalog")
+    assert (
+        "default_execution_clock" in inspect.signature(module.build_catalog).parameters
+    )
+    output = tmp_path / "catalog"
+    catalog = module.build_catalog(
+        model_runs=[],
+        deployments=[root],
+        output=output,
+        default_execution_clock="ready",
+    )
+    assert catalog["default_execution_clock"] == "ready"
+    assert catalog["runs"][0]["execution_clock"] == "ready"
+    run = json.loads((output / catalog["runs"][0]["path"]).read_text())
+    assert run["execution_clock"] == "ready"
+    assert run["episodes"][0]["metadata"]["control_rate_valid"] is None
+    assert run["episodes"][0]["queue"]["metrics"]["deadline_misses"] is None
+    assert run["episodes"][0]["queue"]["execution_clock"] == "ready"
+
+
+def test_catalog_cannot_default_to_a_missing_execution_clock(tmp_path):
+    root, _ = deployment_fixture(tmp_path)
+    module = importlib.import_module("coexecution.replay.catalog")
+    assert (
+        "default_execution_clock" in inspect.signature(module.build_catalog).parameters
+    )
+    with pytest.raises(ValueError, match="default.*execution|execution.*default"):
+        module.build_catalog(
+            model_runs=[],
+            deployments=[root],
+            output=tmp_path / "catalog",
+            default_execution_clock="ready",
+        )
 
 
 def test_deployment_is_divergent_closed_loop_with_own_frame_timestamps(tmp_path):

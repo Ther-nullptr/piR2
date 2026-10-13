@@ -1107,6 +1107,182 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ReadyExecution(unittest.TestCase):
+    def run_ready(self, *, latency=0.01, steps=4, success_at=None):
+        from libero_queue_trace import QueueTrace
+
+        clock = Clock()
+        actor = Actor(clock, latency)
+        submitted, captures, calls = [], [], []
+        original = actor.submit
+
+        def submit(obs, r, d, prefix, visual, deadline, at):
+            submitted.append((r, d, deadline, at, prefix.copy()))
+            captures.append(obs.capture_s)
+            future = original(obs, r, d, prefix, visual, deadline, at)
+            get = future.result
+
+            def result():
+                value = get()
+                value["actions"] = np.full((16 - d, 7), 0.1)
+                value["audit"]["valid_end_tick"] = r + 16
+                return value
+
+            future.result = result
+            return future
+
+        actor.submit = submit
+
+        def step(action):
+            calls.append((clock.now(), action.copy()))
+            clock.t += 0.03
+            return {"state.x": [len(calls)]}, len(calls) == success_at, False
+
+        trace = io.StringIO()
+        result, _ = run_control_loop(
+            step,
+            {"state.x": [0]},
+            9.99,
+            np.zeros((40, 7)),
+            actor,
+            Vision(clock),
+            1,
+            0.05,
+            steps,
+            trace,
+            clock=clock,
+            events=QueueTrace(clock=clock.now),
+            execution_clock="ready",
+        )
+        rows = [json.loads(line) for line in trace.getvalue().splitlines()]
+        return result, rows, calls, submitted, captures
+
+    def test_ready_adopts_at_first_atomic_step_boundary_without_grid_or_padding(self):
+        self.assertIn("execution_clock", inspect.signature(run_control_loop).parameters)
+        result, rows, calls, submitted, captures = self.run_ready()
+        np.testing.assert_allclose([row[0] for row in calls], [10, 10.03, 10.06, 10.09])
+        self.assertTrue(np.all(calls[0][1] == 0))
+        self.assertTrue(np.all(calls[1][1][:6] == np.float32(0.1)))
+        self.assertAlmostEqual(result["controlled_wall_seconds"], 0.12)
+        self.assertAlmostEqual(result["simulated_elapsed_seconds"], 0.2)
+        self.assertAlmostEqual(result["real_time_factor"], 0.2 / 0.12)
+        self.assertAlmostEqual(result["actual_control_hz"], 1 / 0.03)
+        self.assertEqual(result["execution_clock"], "ready")
+        self.assertEqual(result["physics_step_seconds"], 0.05)
+        self.assertEqual(result["nominal_physics_hz"], 20)
+        self.assertTrue(
+            all(d == 1 and deadline is None for _, d, deadline, _, _ in submitted)
+        )
+        np.testing.assert_allclose(captures, [9.99, 10.03, 10.06, 10.09])
+        adopted = [r for r in rows if r["kind"] == "action_adopted"]
+        self.assertEqual(adopted[0]["adopted_at_tick"], 1)
+        self.assertAlmostEqual(adopted[0]["t_s"], 10.03)
+        self.assertAlmostEqual(adopted[0]["ready_to_adopt_seconds"], 0.02)
+        ticks = [r for r in rows if r["kind"] == "control_tick"]
+        self.assertAlmostEqual(ticks[1]["ready_to_apply_seconds"], 0.02)
+        self.assertEqual(ticks[1]["executed_slot"]["producer_request_tick"], 0)
+        self.assertTrue(result["sensor_release_contract_verified"])
+
+    def test_ready_long_inference_expires_consumed_slots_without_phantom_lateness(self):
+        self.assertIn("execution_clock", inspect.signature(run_control_loop).parameters)
+        result, rows, _, submitted, _ = self.run_ready(latency=0.075, steps=5)
+        adopted = [r for r in rows if r["kind"] == "action_adopted"]
+        self.assertEqual(adopted[0]["adopted_at_tick"], 3)
+        self.assertEqual(adopted[0]["expired_slots"], 2)
+        self.assertEqual(result["final_action_delay_ticks"], 1)
+        self.assertEqual(result["action_delay_policy"], "one_step_committed")
+        self.assertEqual([r[0] for r in submitted], [0, 3])
+        for key in (
+            "target_control_hz",
+            "control_rate_valid",
+            "mean_control_rate_valid",
+            "control_deadline_valid",
+            "control_period_valid",
+            "control_lateness_seconds",
+            "control_deadline_misses_over5ms",
+            "action_request_deadline_misses",
+            "over_training_budget_events",
+            "rpc_over_training_budget_count",
+        ):
+            self.assertIsNone(result[key], key)
+        for row in rows:
+            if row["kind"] == "control_tick":
+                self.assertIsNone(row["scheduled_s"])
+                self.assertIsNone(row["lateness_s"])
+                self.assertIsNone(row["next_observation_release_not_before_s"])
+            if row["kind"] in (
+                "action_submitted",
+                "request_completed",
+                "action_adopted",
+            ):
+                self.assertIsNone(row.get("deadline_s"))
+                self.assertIsNone(row.get("deadline_miss"))
+
+    def test_ready_success_has_no_final_period_padding(self):
+        self.assertIn("execution_clock", inspect.signature(run_control_loop).parameters)
+        result, _, calls, _, _ = self.run_ready(success_at=1)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result["success"])
+        self.assertAlmostEqual(result["controlled_wall_seconds"], 0.03)
+
+    def test_ready_cli_rejects_unsupported_algorithms_and_fixed_delay(self):
+        from evaluate_libero_protocol import build_parser, validate_deployment_controls
+
+        parser = build_parser()
+        self.assertIn("--execution-clock", parser.format_help())
+        base = ["--protocol", "deployment", "--variant", "flow", "--output", "unused"]
+        self.assertEqual(parser.parse_args(base).execution_clock, "paced")
+        ready = parser.parse_args(base + ["--execution-clock", "ready"])
+        validate_deployment_controls(ready)
+        for key, value in (
+            ("variant", "pir2"),
+            ("protocol", "algorithm"),
+            ("deployment_fixed_delay", 1),
+        ):
+            args = SimpleNamespace(**vars(ready))
+            setattr(args, key, value)
+            with self.assertRaisesRegex(ValueError, "ready|Ready"):
+                validate_deployment_controls(args)
+
+    def test_ready_summary_does_not_mark_trials_invalid_for_an_absent_wall_target(self):
+        from evaluate_libero_protocol import save_summary
+
+        self.assertIn("execution_clock", inspect.signature(run_control_loop).parameters)
+        result, _, _, _, _ = self.run_ready()
+        result.update(task_id=0, episode_id=0, task="task0")
+        with TemporaryDirectory() as directory:
+            save_summary(
+                Path(directory),
+                [result],
+                {
+                    "protocol": "deployment",
+                    "execution_clock": "ready",
+                    "task_ids": [0],
+                    "episodes_per_task": 1,
+                },
+            )
+            summary = json.loads((Path(directory) / "summary.json").read_text())
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["timing"]["execution_clock"], "ready")
+        self.assertIsNone(summary["timing"]["strict_valid_episodes"])
+        self.assertIsNone(summary["timing"]["control_deadline_misses"])
+        self.assertIsNone(summary["timing"]["action_request_deadline_misses"])
+
+    def test_ready_keeps_fallback_and_source_unknown_when_inference_cannot_catch_up(
+        self,
+    ):
+        self.assertIn("execution_clock", inspect.signature(run_control_loop).parameters)
+        result, rows, _, _, _ = self.run_ready(latency=2.0, steps=42)
+        ticks = [r for r in rows if r["kind"] == "control_tick"]
+        self.assertEqual(result["fallback_ticks"], 2)
+        self.assertTrue(
+            all(t["executed_slot"]["producer_kind"] == "fallback" for t in ticks[-2:])
+        )
+        self.assertTrue(all(t["command_ready_s"] is None for t in ticks[-2:]))
+        self.assertTrue(all(t["ready_to_apply_seconds"] is None for t in ticks[-2:]))
+        self.assertEqual(result["action_ready_to_adopt_seconds"], None)
+
+
 class ReplayRecordingContract(unittest.TestCase):
     def test_recording_is_optional_owned_and_maps_post_step_frame_to_computed_time(
         self,

@@ -162,6 +162,16 @@
       seed: episode.seed ?? metadata.seed,
     };
   }
+  function deploymentCadence(run) {
+    return run.execution_clock ?? run.configuration?.execution_clock ?? "paced";
+  }
+  function replayDescriptors(descriptors, kind, cadence) {
+    return descriptors.filter(
+      (run) =>
+        run.kind === kind &&
+        (kind !== "deployment" || deploymentCadence(run) === cadence),
+    );
+  }
   function playableEpisode(episode) {
     return Boolean(
       episode &&
@@ -260,6 +270,8 @@
     scopeInfo,
     scopedRecords,
     normalizeEpisode,
+    deploymentCadence,
+    replayDescriptors,
     playableEpisode,
     finite,
     lastAt,

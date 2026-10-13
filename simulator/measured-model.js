@@ -143,6 +143,7 @@
     return out;
   }
   function calibrationMessage(condition, episode) {
+    if ((episode.execution_clock ?? "paced") !== "paced") return null;
     const s = condition.summary,
       h = condition.hardware;
     return {

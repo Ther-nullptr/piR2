@@ -65,6 +65,33 @@ def test_commands_use_declared_ports_full_suite_and_separate_workers(plan):
     assert evaluate[evaluate.index("--task-ids") + 1 :] == [str(i) for i in range(10)]
 
 
+def test_execution_clock_plan_default_and_case_override(plan):
+    plan["execution_clock"] = "ready"
+    plan["conditions"][1]["execution_clock"] = "paced"
+    module().validate_plan(plan)
+    for case, expected in zip(plan["conditions"], ("ready", "paced"), strict=True):
+        command = module().build_commands(plan, case, "deployment", Path("/out"))[
+            "evaluate"
+        ]
+        assert "--execution-clock" in command
+        assert command[command.index("--execution-clock") + 1] == expected
+
+
+@pytest.mark.parametrize("change", ["variant", "protocol", "fixed", "unknown"])
+def test_ready_plan_rejects_incompatible_settings_before_launch(plan, change):
+    plan["execution_clock"] = "ready"
+    if change == "variant":
+        plan["conditions"][0]["variant"] = "pir2"
+    elif change == "protocol":
+        plan["protocols"] = ["algorithm", "deployment"]
+    elif change == "fixed":
+        plan["conditions"][0]["deployment_fixed_delay"] = 1
+    else:
+        plan["conditions"][0]["execution_clock"] = "unpaced"
+    with pytest.raises(ValueError, match="Ready|ready"):
+        module().validate_plan(plan)
+
+
 @pytest.mark.parametrize("transport", ["numpy_bf16", "cuda_local"])
 def test_paired_layout_has_one_owned_process_and_two_explicit_endpoints(
     plan, transport
