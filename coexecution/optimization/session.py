@@ -356,9 +356,12 @@ class GrootOptimizations:
             if (
                 self.action_graph is None
                 or self.action_graph.guard_backend is not self.guard_backend
+                or self.action_graph.kv_reuse != self.config.action_kv_reuse
             ):
                 self.action_graph = ActionGraph(
-                    self.policy, guard_backend=self.guard_backend
+                    self.policy,
+                    guard_backend=self.guard_backend,
+                    kv_reuse=self.config.action_kv_reuse,
                 )
             self.runtime_stack.callback(self.action_graph.close)
             self.action_graph.__enter__()
@@ -386,6 +389,7 @@ class GrootOptimizations:
         vlm_graph=None,
         image_array_preparation=None,
         compiled_host_guards=None,
+        action_kv_reuse=None,
     ):
         """Switch common runtime scopes; retain fixed precision, layouts and DiT graphs."""
         if not self._active:
@@ -399,6 +403,7 @@ class GrootOptimizations:
             ("vlm_graph", vlm_graph),
             ("image_array_preparation", image_array_preparation),
             ("compiled_host_guards", compiled_host_guards),
+            ("action_kv_reuse", action_kv_reuse),
         ):
             if value is not None and type(value) is not bool:
                 raise ValueError(f"Runtime {name} must be a bool or None")
@@ -413,6 +418,7 @@ class GrootOptimizations:
                     ("vlm_graph", vlm_graph),
                     ("image_array_preparation", image_array_preparation),
                     ("compiled_host_guards", compiled_host_guards),
+                    ("action_kv_reuse", action_kv_reuse),
                 )
                 if value is not None
             },
