@@ -146,6 +146,16 @@ test("calibration message uses solo means and exports only concise hardware fiel
   assert.equal(m.hardware.command, undefined);
 });
 
+test("ready traces cannot silently seed the fixed-rate teaching simulator", () => {
+  assert.equal(
+    M.calibrationMessage(
+      { summary: {}, hardware: {} },
+      { ...episode, execution_clock: "ready" },
+    ),
+    null,
+  );
+});
+
 test("unknown bootstrap image capture never inherits the state timestamp", () => {
   const missing = structuredClone(episode);
   missing.initial_feature.feature_capture_s = null;

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>πR² · Quantization Replay</title>
+    <link rel="stylesheet" href="replay.css" />
+    <script defer src="measured-model.js"></script>
+    <script defer src="replay-model.js"></script>
+    <script defer src="replay-lineage.js"></script>
+    <script defer src="replay-media.js"></script>
+    <script defer src="replay-view.js"></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="replay.html"
+        ><span class="brand-mark">π</span
+        ><span
+          ><strong>QUANTIZATION REPLAY</strong
+          ><small>GR00T · 模型组件与机器人响应</small></span
+        ></a
+      >
+      <nav>
+        <a href="index.html">队列实验台 ↗</a
+        ><span id="data-status" role="status" data-state="loading"
+          >连接本地记录…</span
+        >
+      </nav>
+    </header>
+    <main>
+      <nav class="evidence-tabs" aria-label="回放内容">
+        <button id="mode-deployment" aria-pressed="false">
+          机器人响应 · 实际视频</button
+        ><button id="mode-model" aria-pressed="false">
+          模型组件 · 固定输入</button
+        ><span>视频播放与模型组件时间线使用不同证据</span>
+      </nav>
+      <section class="control-band" aria-label="实验选择">
+        <label
+          >证据视图<select id="evidence-mode">
+            <option value="model">独立模型回放</option>
+            <option value="deployment">机器人闭环对照</option>
+          </select></label
+        >
+        <label id="record-label"
+          >记录类型<select id="record-type">
+            <option value="clean">Clean · 耗时与动作</option>
+            <option value="profile">Profile · 真实 GPU 内核</option>
+          </select></label
+        >
+        <label id="scope-label">测量边界<select id="scope"></select></label>
+        <label id="execution-clock-label"
+          >执行时钟<select id="execution-clock"></select
+        ></label>
+        <label
+          ><span id="sample-label">输入 / 随机种子</span
+          ><select id="sample"></select
+        ></label>
+        <label
+          >相机<select id="camera">
+            <option value="image">主相机</option>
+            <option value="wrist_image">腕部相机</option>
+          </select></label
+        >
+        <label
+          >精度<select id="precision">
+            <option value="all">同步比较</option>
+          </select></label
+        >
+        <button id="download" class="secondary">导出当前证据</button>
+      </section>
+      <p id="evidence-note" class="evidence-note">
+        加载显式配置的本地实验记录。
+      </p>
+      <div id="error-banner" class="error-banner" hidden></div>
+      <section
+        id="precision-cards"
+        class="precision-grid"
+        aria-label="不同精度观测与结果"
+      ></section>
+      <section class="transport" aria-label="回放控制">
+        <button id="previous" title="上一事件" aria-label="上一事件">◀|</button
+        ><button id="play" class="primary">播放</button
+        ><button id="next" title="下一事件" aria-label="下一事件">|▶</button
+        ><input
+          id="seek"
+          type="range"
+          min="0"
+          max="1"
+          step="any"
+          value="0"
+          aria-label="共享时间游标"
+        /><output id="clock">0 ms</output
+        ><label
+          >速度<select id="speed">
+            <option value="0.001">0.001×</option>
+            <option value="0.01" selected>0.01×</option>
+            <option value="0.1">0.1×</option>
+            <option value="1">1×</option>
+            <option value="2">2×</option>
+          </select></label
+        ><label
+          >窗口<select id="window">
+            <option value="all">全部</option>
+            <option value="0.1">10%</option>
+            <option value="0.25">25%</option>
+            <option value="0.5">50%</option>
+          </select></label
+        >
+      </section>
+      <section class="lineage-section" aria-label="真实观测与动作依赖">
+        <div class="section-heading">
+          <div>
+            <h2 id="lineage-title">观测 → VLM → 缓存 → DiT → 动作 → 机器人</h2>
+            <p id="lineage-note">按记录中的来源 ID 连接，缺失链路留空。</p>
+          </div>
+          <button id="lineage-follow" class="secondary">跟随时间游标</button>
+        </div>
+        <div id="lineage"></div>
+      </section>
+      <section class="timeline-section">
+        <div class="section-heading">
+          <div>
+            <h2>共享时间线</h2>
+            <p id="timeline-note">每条轨道保留自己的执行记录</p>
+          </div>
+          <div class="inline-controls">
+            <label
+              >模块<select id="stage">
+                <option value="all">全部模块</option>
+                <option value="vlm">VLM / S2</option>
+                <option value="action">Action / S1</option>
+              </select></label
+            ><label
+              >类别<select id="category">
+                <option value="all">全部类别</option>
+              </select></label
+            >
+          </div>
+        </div>
+        <div id="legend" class="legend"></div>
+        <div id="timeline" class="timeline" aria-label="组件时间线"></div>
+      </section>
+      <section class="plots">
+        <article>
+          <div class="section-heading">
+            <h2 id="curve-title">动作输出 · 预测步</h2>
+            <label>通道<select id="channel"></select></label>
+          </div>
+          <div id="curve" class="chart"></div>
+          <p id="curve-note" class="small-note"></p>
+        </article>
+        <article>
+          <div class="section-heading">
+            <h2 id="projection-title">输入与验证</h2>
+          </div>
+          <div id="projection" class="chart"></div>
+        </article>
+      </section>
+      <section class="event-section">
+        <article>
+          <div class="section-heading">
+            <h2>事件记录</h2>
+            <span id="event-count"></span>
+          </div>
+          <div id="event-list" class="event-list"></div>
+        </article>
+        <article>
+          <div class="section-heading">
+            <h2>事件检查器</h2>
+            <button id="inspect-run" class="secondary">运行来源</button>
+          </div>
+          <pre id="inspector" tabindex="0">
+点击内核、请求或控制动作，查看来源与实际时间戳。</pre
+          >
+        </article>
+      </section>
+      <footer>
+        <span id="catalog-meta"></span
+        ><a href="/api/replay/catalog" target="_blank" rel="noopener"
+          >Catalog JSON ↗</a
+        ><span>记录回放 · 不在浏览器内执行模型</span>
+      </footer>
+    </main>
+  </body>
+</html>

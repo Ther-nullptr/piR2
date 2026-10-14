@@ -15,9 +15,13 @@ def batch_observation(observation):
     }
 
 
-def write_video(path, frames):
+def write_video(path, frames, *, codec="libx264", fps=20):
+    if not frames:
+        raise ValueError("Video needs at least one actual frame")
+    if codec not in ("libx264", "libvpx-vp9") or type(fps) is not int or fps < 1:
+        raise ValueError("Unsupported video codec or frame rate")
     with av.open(str(path), "w") as container:
-        stream = container.add_stream("libx264", rate=20)
+        stream = container.add_stream(codec, rate=fps)
         stream.width, stream.height = frames[0].shape[1], frames[0].shape[0]
         stream.pix_fmt = "yuv420p"
         for frame in frames:

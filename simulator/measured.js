@@ -411,8 +411,12 @@
       {
         top: 423,
         max: Math.max(6, ...ticks.map((r) => r.lateness_ms)),
-        label: "控制迟到",
-        unit: "ms；×请求超时",
+        label:
+          episode.execution_clock === "ready" ? "控制迟到不适用" : "控制迟到",
+        unit:
+          episode.execution_clock === "ready"
+            ? "无固定墙钟截止期"
+            : "ms；×请求超时",
         series: [[ticks.map((r) => [r.t, r.lateness_ms]), "#596c84"]],
       },
     ];
@@ -740,7 +744,7 @@
     selectedRequest = null;
     const m = episode.metadata;
     $("exposure").textContent =
-      `${episode.id} · ${episode.metrics.ticks} 控制 tick / ${fmt(episode.duration_s, 3)} 秒 · 终止 ${episode.metrics.termination_reason ?? "未知"} · 严格控制时序有效 ${m.control_rate_valid ?? "未知"} · seed ${m.seed ?? "未知"}。仅选定回合的闭环记录，不能外推完整套件成功率。`;
+      `${episode.id} · ${episode.metrics.ticks} 控制 tick / ${fmt(episode.duration_s, 3)} 秒 · 终止 ${episode.metrics.termination_reason ?? "未知"} · ${episode.execution_clock === "ready" ? "就绪即接纳，固定频率有效性不适用" : "严格控制时序有效 " + (m.control_rate_valid ?? "未知")} · seed ${m.seed ?? "未知"}。仅选定回合的闭环记录，不能外推完整套件成功率。`;
     renderDelay();
     setTime(0);
   }
@@ -770,6 +774,11 @@
   }
   function exportCalibration() {
     const message = M.calibrationMessage(condition, episode);
+    if (message === null) {
+      $("calibration-status").textContent =
+        " 就绪驱动记录没有固定墙钟周期，不能导入固定频率机制仿真。";
+      return;
+    }
     if (!(message.solo.actionMs > 0 && message.solo.vlmMs > 0)) {
       $("calibration-status").textContent = " 缺少完整独占校准，无法建立情景。";
       return;

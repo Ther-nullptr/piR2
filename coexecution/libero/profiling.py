@@ -10,14 +10,30 @@ import re
 from collections import defaultdict
 
 STAGE_PREFIX = "GR00T_BENCH/stage/"
+REQUEST_PREFIX = "GR00T_BENCH/request/"
 
 
 def collect_model_profile(
-    policy, observations, session, output, *, rounds, seed, device
+    policy,
+    observations,
+    session,
+    output,
+    *,
+    rounds,
+    seed,
+    device,
+    model_only=False,
+    observation_ids=None,
+    max_prepared_observations=16,
 ):
     """Separate instrumented model probe after priming; never a clean wall sample."""
     import torch
 
+    from coexecution.libero.inference import (
+        PreparedInferenceEngine,
+        PreparedInputs,
+        prepare_observations,
+    )
     from coexecution.libero.measurement import (
         _prepare,
         _seed_reset,
@@ -25,30 +41,69 @@ def collect_model_profile(
         graph_snapshot,
     )
 
+    if type(rounds) is not int or rounds < 1:
+        raise ValueError("Profile rounds must be positive")
+    if observation_ids is None:
+        observation_ids = [f"obs-{index}" for index in range(len(observations))]
+    if len(observations) != len(observation_ids) or len(set(observation_ids)) != len(
+        observation_ids
+    ):
+        raise ValueError("One unique profile identity is required per observation")
+    prepared = None
+    engine = PreparedInferenceEngine(policy.model)
+    if model_only:
+        prepared = prepare_observations(
+            policy, observations, observation_ids, limit=max_prepared_observations
+        )
     for index, observation in enumerate(observations):
         _seed_reset(policy, seed + index, device)
-        policy.get_action(observation)
+        if model_only:
+            engine.full(prepared[index])
+        else:
+            policy.get_action(observation)
+    torch.cuda.synchronize(device)
+    engine = PreparedInferenceEngine(
+        policy.model,
+        stage=lambda name: torch.profiler.record_function(STAGE_PREFIX + name),
+    )
     before = graph_snapshot(session)
     output.parent.mkdir(parents=True, exist_ok=True)
+    requests = []
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ]
     ) as profiler:
-        for _ in range(rounds):
+        for round_index in range(rounds):
             for index, observation in enumerate(observations):
                 _seed_reset(policy, seed + index, device)
-                with torch.profiler.record_function(
-                    STAGE_PREFIX + "preparation_transfer"
-                ):
-                    backbone, action, _states = _prepare(policy, observation)
+                request_id = f"profile-r{round_index}-o{index}"
+                annotation = REQUEST_PREFIX + request_id
+                requests.append(
+                    {
+                        "request_id": request_id,
+                        "annotation": annotation,
+                        "round": round_index,
+                        "observation": index,
+                        "observation_id": observation_ids[index],
+                        "seed": seed + index,
+                    }
+                )
+                with torch.profiler.record_function(annotation):
+                    if model_only:
+                        inputs = prepared[index]
+                    else:
+                        with torch.profiler.record_function(
+                            STAGE_PREFIX + "preparation_transfer"
+                        ):
+                            backbone, action, states = _prepare(policy, observation)
+                            torch.cuda.synchronize(device)
+                        inputs = PreparedInputs(
+                            backbone, action, states, observation_ids[index]
+                        )
+                    engine.full(inputs)
                     torch.cuda.synchronize(device)
-                with torch.profiler.record_function(STAGE_PREFIX + "vlm"):
-                    features = policy.model.backbone(backbone)
-                with torch.profiler.record_function(STAGE_PREFIX + "action"):
-                    policy.model.action_head.get_action(features, action, None)
-                torch.cuda.synchronize(device)
     profiler.export_chrome_trace(str(output))
     after = graph_snapshot(session)
     calls = rounds * len(observations)
@@ -76,7 +131,15 @@ def collect_model_profile(
         calls=calls,
         trace=str(output),
         graph_audit=audit,
-        scope="Instrumented preparation + full VLM and Flow4; output decoding excluded; separate from unprofiled wall/event spans",
+        scope=(
+            "Instrumented prepared full VLM and Flow4"
+            if model_only
+            else "Instrumented preparation + full VLM and Flow4"
+        )
+        + "; output decoding excluded; separate from clean wall/event spans",
+        instrumented=True,
+        input_preparation_included=not model_only,
+        requests=requests,
     )
     return result
 
@@ -280,7 +343,7 @@ def _category(name, chain, cat):
     return "unknown"
 
 
-def summarize_trace(trace):
+def classify_trace(trace):
     """Classify only leaf Chrome device activities, each into exactly one bucket.
 
     CUDA runtime/driver correlation and CPU parent chains identify the launch
@@ -338,6 +401,7 @@ def summarize_trace(trace):
                     (start, stop)
                 )
             active.append(event)
+    device_events = []
     categories, stages, kernels = (
         defaultdict(lambda: [0, 0.0]),
         defaultdict(lambda: [0, 0.0]),
@@ -359,6 +423,30 @@ def summarize_trace(trace):
             stage, chain = "unattributed", []
         unattributed += int(stage == "unattributed")
         category = _category(event["name"], chain, event["cat"])
+        request_ids = {
+            next(
+                (
+                    name.removeprefix(REQUEST_PREFIX)
+                    for name in reversed(row[1])
+                    if name.startswith(REQUEST_PREFIX)
+                ),
+                None,
+            )
+            for row in candidates
+        }
+        request_id = next(iter(request_ids)) if len(request_ids) == 1 else None
+        device_events.append(
+            {
+                "ts_us": event["ts"],
+                "duration_us": event["dur"],
+                "stage": stage,
+                "category": category,
+                "kernel": event["name"],
+                "request_id": request_id,
+                "stream": args.get("stream"),
+                "device": args.get("device"),
+            }
+        )
         elapsed = event["dur"] / 1000.0
         for bucket, key in (
             (categories, category),
@@ -370,6 +458,17 @@ def summarize_trace(trace):
         intervals.append((event["ts"], event["ts"] + event["dur"]))
     work = sum(row["dur"] for row in device) / 1000.0
     return {
+        "device_events": device_events,
+        "request_scopes": [
+            {
+                "request_id": event["name"].removeprefix(REQUEST_PREFIX),
+                "ts_us": event["ts"],
+                "duration_us": event["dur"],
+            }
+            for event in events
+            if event.get("cat") == "user_annotation"
+            and event["name"].startswith(REQUEST_PREFIX)
+        ],
         "device_event_count": len(device),
         "gpu_work_ms": work,
         "gpu_active_union_ms": _union_duration(intervals) / 1000.0,
@@ -399,3 +498,11 @@ def summarize_trace(trace):
         "kernel_stage_attribution": "CPU launch correlation; never GPU/host range overlap",
         "accounting": "Each leaf device activity appears once. Work sums may overlap across streams. Host stage scopes can be nested; never add host and GPU times to reconstruct wall latency.",
     }
+
+
+def summarize_trace(trace):
+    """Aggregate the shared device classifier without exposing a fake timeline."""
+    result = classify_trace(trace)
+    result.pop("device_events")
+    result.pop("request_scopes")
+    return result

@@ -110,6 +110,41 @@ Artifacts are generated below `artifacts/libero-protocols/<label>/`: per-conditi
 
 ## Controlled completion-release experiments
 
+### Ready-driven GR00T execution
+
+`--execution-clock ready` is an opt-in deployment Flow mode. The default
+`paced` mode retains its 20 Hz wall target and timing tests. Experiment plans
+accept `execution_clock` globally or per condition. Ready rejects πR² and
+`--deployment-fixed-delay` rather than silently changing their timing semantics.
+
+Ready keeps the existing real VLM worker and GR00T clean action chunks. At each
+boundary after an atomic `env.step`, the controller publishes any completed
+result into legal, uncommitted future slots, takes a fresh state observation,
+and executes the next command immediately. There is no additional 50 ms wall
+wait or final period padding. An in-flight environment step cannot be replaced;
+one logical action step is committed for each request. Results arriving after
+their original target steps retain expired/protected counts, and missing legal
+actions remain explicit zero-delta/gripper-hold fallback commands.
+
+Each `env.step` still advances **0.05 simulated seconds**. `actual_control_hz`
+measures wall execution rate; `physics_step_seconds`, `nominal_physics_hz`,
+`simulated_elapsed_seconds`, `controlled_wall_seconds` and `real_time_factor`
+keep physics units distinct. Request and effective adoption rates are separate.
+`action_ready_to_adopt_seconds` and `action_ready_to_first_apply_seconds` use
+the producing request's recorded `completed_s`, never temporal matching.
+As documented below, that completion precedes Future bookkeeping; the measured
+gap includes that bookkeeping and waiting for the next legal actuator boundary.
+
+Ready has no wall-grid deadline, target frequency, lateness or fixed-rate
+validity; those values are **null / not applicable**, not zero, pass or failure.
+Solo RPC calibration is retained as evidence, while effective alignment stays
+one step with `action_delay_policy=one_step_committed`; it is not derived by
+dividing wall latency by the nominal physics period. The frontend labels this
+“就绪即接纳（StreamingVLA式调度，GR00T）”. It is a scheduling comparison using
+GR00T weights, not StreamingVLA AFM/AEO, paper weights or intermediate noisy actions.
+
+### Client-visible release floors
+
 Deployment can run the real model first and then delay worker release using `--action-min-service-ms` and `--vision-min-service-ms` (both default to zero). `--deployment-fixed-delay` optionally fixes both bootstrap and runtime d in 1..5; omitted preserves adaptive scheduling. These controls are rejected for the algorithm protocol and are part of resume identity.
 
 ```bash

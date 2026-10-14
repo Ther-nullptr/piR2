@@ -223,14 +223,18 @@ def save_summary(output, records, config):
         "per_task": [],
     }
     if config["protocol"] == "deployment" and records:
+
+        def timing_count(key):
+            values = [row.get(key) for row in records]
+            return sum(values) if all(value is not None for value in values) else None
+
         summary["timing"] = {
-            "strict_valid_episodes": sum(x["control_rate_valid"] for x in records),
-            "mean_rate_valid_episodes": sum(
-                x["mean_control_rate_valid"] for x in records
-            ),
-            "deadline_valid_episodes": sum(
-                x["control_deadline_valid"] for x in records
-            ),
+            "execution_clock": config.get("execution_clock", "paced"),
+            "fixed_rate_timing_applicable": config.get("execution_clock", "paced")
+            == "paced",
+            "strict_valid_episodes": timing_count("control_rate_valid"),
+            "mean_rate_valid_episodes": timing_count("mean_control_rate_valid"),
+            "deadline_valid_episodes": timing_count("control_deadline_valid"),
             "actual_hz": metric_summary(
                 [
                     x["actual_control_hz"]
@@ -238,13 +242,18 @@ def save_summary(output, records, config):
                     if x["actual_control_hz"] is not None
                 ]
             ),
-            "control_deadline_misses": sum(
-                x["control_deadline_misses_over5ms"] for x in records
+            "control_deadline_misses": timing_count("control_deadline_misses_over5ms"),
+            "action_request_deadline_misses": timing_count(
+                "action_request_deadline_misses"
             ),
-            "action_request_deadline_misses": sum(
-                x["action_request_deadline_misses"] for x in records
+            "real_time_factor": metric_summary(
+                [
+                    row["real_time_factor"]
+                    for row in records
+                    if row.get("real_time_factor") is not None
+                ]
             ),
-            "note": "Main success rate includes all trials; timing-invalid trials are never silently dropped.",
+            "note": "All trials remain included. Ready execution has no fixed wall-rate deadline; its null validity is not a timing pass or failure.",
         }
     for task_id in task_ids:
         rows = [x for x in records if x["task_id"] == task_id]
@@ -277,9 +286,21 @@ def build_parser():
         "--task-ids", nargs="+", type=int, choices=range(10), default=list(range(10))
     )
     parser.add_argument("--no-video", action="store_true")
+    parser.add_argument(
+        "--record-replay",
+        action="store_true",
+        help="Deployment debug: owned robot states and both cameras; WebM encoding after control",
+    )
+    parser.add_argument("--replay-max-frames", type=int, default=1024)
     parser.add_argument("--slow-warmup-calls", type=int, default=12)
     parser.add_argument("--max-steps", type=int, default=720)
     parser.add_argument("--control-hz", type=float, default=20)
+    parser.add_argument(
+        "--execution-clock",
+        choices=("paced", "ready"),
+        default="paced",
+        help="Deployment Flow: ready accepts plans between atomic physics steps without wall pacing",
+    )
     parser.add_argument("--visual-delay", type=int, default=3)
     parser.add_argument("--action-delay", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1000)
@@ -316,8 +337,22 @@ def validate_deployment_controls(args):
     from libero_wallclock import validate_service_floor
 
     from coexecution.libero.features import validate_feature_options
-    from coexecution.libero.scheduling import validate_vision_max_hz
+    from coexecution.libero.scheduling import (
+        validate_execution_clock,
+        validate_vision_max_hz,
+    )
 
+    validate_execution_clock(
+        getattr(args, "execution_clock", "paced"),
+        protocol=args.protocol,
+        variant=args.variant,
+        fixed_delay=args.deployment_fixed_delay,
+    )
+
+    if getattr(args, "record_replay", False) and args.protocol != "deployment":
+        raise ValueError("Replay recording requires the deployment protocol")
+    if getattr(args, "replay_max_frames", 1024) < 1:
+        raise ValueError("Replay frame bound must be positive")
     validate_service_floor(args.action_min_service_ms)
     validate_service_floor(args.vision_min_service_ms)
     validate_vision_max_hz(args.vision_max_hz)
@@ -413,7 +448,7 @@ def main():
     config["checkpoint"] = identity
     config["suite"] = "libero_spatial"
     config["initial_state_indices"] = list(range(args.episodes_per_task))
-    config["version"] = 8
+    config["version"] = 9
     config["measurement_mode"] = "success_terminated_closed_loop"
     config["input_dependencies"] = {
         "camera": "physical observation released at each control tick; latest waiting frame replaces older waiting frames",
@@ -437,6 +472,9 @@ def main():
         "scripts/libero_protocol_scheduler.py",
         "scripts/libero_queue_trace.py",
         "scripts/libero_reproducible_env.py",
+        "scripts/libero_observations.py",
+        "coexecution/replay/recording.py",
+        "coexecution/replay/schema.py",
         "scripts/serve_libero_protocol.py",
         "scripts/libero_inference_backend.py",
         "scripts/libero_model_loading.py",
@@ -484,6 +522,10 @@ def main():
             raise ValueError("The slow endpoint must be a VLM worker")
         del slow
         config["deployment_contract"] = {
+            "execution_clock": args.execution_clock,
+            "physics_step_seconds": 0.05,
+            "nominal_physics_hz": 20,
+            "target_wall_hz": 20 if args.execution_clock == "paced" else None,
             "control_deadline_slack_s": 0.005,
             "rate_mean_tolerance_fraction": 0.02,
             "no_future_observation_release": True,
@@ -535,6 +577,21 @@ def main():
                 "representation": "numpy_bf16 preserves BF16 bits; cuda_local uses bounded same-process leases, producer completion, consumer event wait and stream ownership; independent of model precision",
             },
         }
+        if args.execution_clock == "ready":
+            config["input_dependencies"]["camera"] = (
+                "actual post-step observation captured when the atomic env.step completes; released at the next controller boundary with no wall grid"
+            )
+            config["deployment_contract"].update(
+                control_deadline_slack_s=None,
+                rate_mean_tolerance_fraction=None,
+                strict_timing_validity=None,
+                execution_rule="accept completed GR00T plans at the first controller boundary after an atomic env.step; execute the next legal command immediately without wall pacing or final padding",
+                action_delay_budget="one-step committed logical prefix; RPC calibration retained as evidence only; no wall-lateness adaptation",
+                model_semantics="unchanged GR00T Flow clean action chunk; no StreamingVLA AFM, AEO or partially denoised action execution",
+            )
+            config["deployment_contract"]["vision_admission_contract"]["camera"] = (
+                "one fresh observation offered after each atomic 0.05-s physics step; wall rate follows actual execution, waiting frames remain replaceable"
+            )
     config = save_run_configuration(args.output, config)
     records_path = args.output / "episodes.jsonl"
     records = (
@@ -569,7 +626,9 @@ def main():
                     raw, _, _, _ = env._env.step([0, 0, 0, 0, 0, 0, -1])
                 obs = env._process_observation(raw)
                 initial_fingerprints = env.initial_fingerprints(obs)
-                args.record_video = episode_id == 0 and not args.no_video
+                args.record_video = (
+                    episode_id == 0 and not args.no_video and not args.record_replay
+                )
                 trace_path = (
                     args.output / f"task{task_id}-episode{episode_id}-trace.jsonl"
                 )
@@ -594,6 +653,11 @@ def main():
                     initial_state_sha256=hashlib.sha256(initial.tobytes()).hexdigest(),
                     wall_seconds=time.monotonic() - started,
                 )
+                if args.record_replay:
+                    result["replay_recording"] = args.replay_recorder.finish(
+                        args.output, f"task{task_id}-episode{episode_id}"
+                    )
+                    args.replay_recorder = None
                 if frames:
                     write_video(
                         args.output / f"task{task_id}-episode{episode_id}.mp4", frames

@@ -9,13 +9,21 @@ import time
 class QueueTrace:
     """Serialize metadata from controller and worker threads; defer all file I/O."""
 
-    def __init__(self, clock=None):
+    def __init__(self, clock=None, max_records=None):
+        if max_records is not None and (
+            type(max_records) is not int or max_records < 1
+        ):
+            raise ValueError("Trace bound must be a positive integer")
+        self.max_records, self.dropped_records = max_records, 0
         self.clock = clock or time.monotonic
         self._lock = threading.Lock()
         self._records = []
 
     def emit(self, kind, t_s=None, **fields):
         with self._lock:
+            if self.max_records is not None and len(self._records) >= self.max_records:
+                self.dropped_records += 1
+                return None
             record = {
                 "schema_version": 1,
                 "seq": len(self._records),
@@ -25,6 +33,15 @@ class QueueTrace:
             }
             self._records.append(record)
             return record["seq"]
+
+    def status(self):
+        with self._lock:
+            return {
+                "max_records": self.max_records,
+                "recorded_records": len(self._records),
+                "dropped_records": self.dropped_records,
+                "complete": self.dropped_records == 0,
+            }
 
     def records(self):
         with self._lock:

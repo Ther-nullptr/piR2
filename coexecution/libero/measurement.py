@@ -43,8 +43,11 @@ def runtime_settings(mode):
 
 def forward_prepared(model, backbone_inputs, action_inputs, options=None):
     """The pinned GR00T get_action body after prepare_input, unchanged."""
-    features = model.backbone(backbone_inputs)
-    return model.action_head.get_action(features, action_inputs, options)
+    from coexecution.libero.inference import PreparedInferenceEngine, PreparedInputs
+
+    return PreparedInferenceEngine(model).full(
+        PreparedInputs(backbone_inputs, action_inputs, None, "compatibility"), options
+    )
 
 
 def round_plan(modes, observations, rounds, seed):
@@ -170,11 +173,28 @@ def build_parser():
         default=["bf16", "w8a8", "w4a4"],
     )
     parser.add_argument("--modes", choices=MODES, nargs="+", default=list(MODES[:5]))
+    parser.add_argument(
+        "--measurement-boundary",
+        choices=("comparison", "model-only"),
+        default="comparison",
+        help="model-only prepares a fixed CUDA cohort before independent replay",
+    )
+    parser.add_argument("--max-prepared-observations", type=int, default=16)
+    parser.add_argument(
+        "--cuda-events",
+        action="store_true",
+        help="Explicitly add CUDA span instrumentation to model wall measurements",
+    )
     parser.add_argument("--observations", type=int, default=3)
     parser.add_argument("--episodes", type=int, nargs="+")
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--profile-rounds", type=int, default=0)
+    parser.add_argument(
+        "--replay-assets",
+        action="store_true",
+        help="Export actual raw observation PNG/state assets before timing",
+    )
     parser.add_argument("--start-step", type=int, default=10)
     parser.add_argument("--step-stride", type=int, default=7)
     parser.add_argument("--video-backend", default="torchcodec")
@@ -268,6 +288,7 @@ def _observations(policy, args):
         observations.append(observation)
         identity.append(
             {
+                "observation_id": f"obs-{index}-{digest.hexdigest()[:16]}",
                 "episode": episode,
                 "step": step,
                 "sha256": digest.hexdigest(),
@@ -326,27 +347,249 @@ def _timed(function, device):
     return output, (time.perf_counter_ns() - start) / 1e6
 
 
-def timed_model(function, device):
+def timed_model(function, device, *, cuda_events=False):
     """CUDA span includes submission gaps; host return is elapsed, not CPU work."""
     import torch
 
-    begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    if cuda_events:
+        begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     torch.cuda.synchronize(device)
-    begin.record()
+    if cuda_events:
+        begin.record()
     start = time.perf_counter_ns()
     output = function()
     host_return = (time.perf_counter_ns() - start) / 1e6
-    end.record()
+    if cuda_events:
+        end.record()
     torch.cuda.synchronize(device)
     wall = (time.perf_counter_ns() - start) / 1e6
     return (
         output,
         wall,
         {
-            "cuda_span_ms": begin.elapsed_time(end),
             "host_return_ms": host_return,
+            **({"cuda_span_ms": begin.elapsed_time(end)} if cuda_events else {}),
         },
     )
+
+
+def _rng_state(device):
+    import torch
+
+    return torch.get_rng_state(), torch.cuda.get_rng_state(device)
+
+
+def _rng_equal(first, second):
+    import torch
+
+    return all(torch.equal(left, right) for left, right in zip(first, second))
+
+
+def _model_only_evidence(previous, gates, audits, retained):
+    previous = {} if previous is None else previous
+    return {
+        "gates": [*previous.get("gates", []), *gates],
+        "graph_audits": [*previous.get("graph_audits", []), *audits],
+        "retained": {**previous.get("retained", {}), **retained},
+    }
+
+
+def _persist_model_only_evidence(output, evidence):
+    """Save cumulative evidence outside clean execution, including failed gates."""
+    import numpy as np
+
+    _write(output / "validation.json", evidence["gates"])
+    _write(output / "graph-timing-audit.json", evidence["graph_audits"])
+    np.savez_compressed(output / "actions.npz", **evidence["retained"])
+
+
+def _model_only_mode(
+    policy,
+    session,
+    args,
+    observations,
+    observation_ids,
+    plan,
+    label,
+    stream,
+    *,
+    previous=None,
+):
+    """One resident cohort; all raw references precede warmup and clean replay.
+
+    No neural intermediate is reused. Complete VLM and Flow4 execute on every
+    call. Decoding, validation, RNG snapshots and optional artifact
+    writes happen after the timer; no raw/preparation probe is interleaved.
+    """
+    from coexecution.libero.inference import (
+        PreparedInferenceEngine,
+        decode_prediction,
+        prepare_observations,
+    )
+
+    prepared = prepare_observations(
+        policy, observations, observation_ids, limit=args.max_prepared_observations
+    )
+    engine = PreparedInferenceEngine(policy.model)
+    references = {}
+    for round_row in plan:
+        for index in round_row["observations"]:
+            seed = round_row["seeds"][index]
+            _seed_reset(policy, seed, args.device)
+            actions, _ = policy.get_action(observations[index])
+            references[round_row["round"], index] = (
+                {key: value.copy() for key, value in actions.items()},
+                _rng_state(args.device),
+            )
+    for _ in range(args.warmup):
+        for index, inputs in enumerate(prepared):
+            _seed_reset(policy, plan[0]["seeds"][index], args.device)
+            engine.full(inputs)
+
+    samples, gates, audits, outputs, retained = [], [], [], {}, {}
+    for round_row in plan:
+        for index in round_row["observations"]:
+            seed, inputs = round_row["seeds"][index], prepared[index]
+            _seed_reset(policy, seed, args.device)
+            before = graph_snapshot(session)
+            prediction, wall, detail = timed_model(
+                lambda inputs=inputs: engine.full(inputs),
+                args.device,
+                cuda_events=args.cuda_events,
+            )
+            after = graph_snapshot(session)
+            rng = _rng_state(args.device)
+            audit = {
+                "round": round_row["round"],
+                "mode": label,
+                "observation": index,
+                "prepared_model": complete_graph_interval(before, after),
+            }
+            audits.append(audit)
+            if not audit["prepared_model"]["passes"]:
+                _persist_model_only_evidence(
+                    args.output, _model_only_evidence(previous, gates, audits, retained)
+                )
+                raise RuntimeError(
+                    f"Timed model-only call was not steady replay: {audit}"
+                )
+            actions = decode_prediction(policy, prediction, inputs)
+            reference, reference_rng = references[round_row["round"], index]
+            gate = action_difference(reference, actions)
+            rng_equal = _rng_equal(reference_rng, rng)
+            gates.append(
+                {
+                    "round": round_row["round"],
+                    "mode": label,
+                    "observation": index,
+                    "prepared_model": gate,
+                    "rng_equal": rng_equal,
+                }
+            )
+            request_id = f"r{round_row['round']}/{label}/o{index}/prepared_model"
+            for key, value in actions.items():
+                retained[f"{request_id}/{key}"] = value.copy()
+            if not gate["passes"] or not rng_equal:
+                for key, value in reference.items():
+                    retained[f"r{round_row['round']}/{label}/o{index}/policy/{key}"] = (
+                        value.copy()
+                    )
+                _persist_model_only_evidence(
+                    args.output, _model_only_evidence(previous, gates, audits, retained)
+                )
+                raise RuntimeError(
+                    f"Model-only output/RNG differs: {label}/{index}: {gates[-1]}"
+                )
+            outputs[round_row["round"], index] = {
+                key: value.copy() for key, value in actions.items()
+            }
+            row = {
+                "round": round_row["round"],
+                "mode": label,
+                "precision": label.split("-", 1)[0],
+                "scope": "prepared_model",
+                "measurement_boundary": "model-only",
+                "observation": index,
+                "observation_id": inputs.observation_id,
+                "request_id": request_id,
+                "seed": seed,
+                "wall_ms": wall,
+                "instrumented": args.cuda_events,
+                **detail,
+            }
+            samples.append(row)
+            stream.write(json.dumps(row, allow_nan=False) + "\n")
+    return {
+        "samples": samples,
+        "gates": gates,
+        "graph_audits": audits,
+        "outputs": outputs,
+        "retained": retained,
+    }
+
+
+def _model_only_precision(
+    policy,
+    optimized,
+    args,
+    precision,
+    observations,
+    identity,
+    plan,
+    stream,
+    *,
+    previous=None,
+):
+    samples, gates, audits, evidence, retained = [], [], [], {}, {}
+    reference_name = reference_mode(args.modes)
+    ordered_modes = [
+        reference_name,
+        *[mode for mode in args.modes if mode != reference_name],
+    ]
+    reference = None
+    for mode in ordered_modes:
+        label = f"{precision}-{mode}"
+        optimized.set_runtime(**runtime_settings(mode))
+        result = _model_only_mode(
+            policy,
+            optimized,
+            args,
+            observations,
+            [row["observation_id"] for row in identity],
+            plan,
+            label,
+            stream,
+            previous=_model_only_evidence(previous, gates, audits, retained),
+        )
+        samples.extend(result["samples"])
+        gates.extend(result["gates"])
+        audits.extend(result["graph_audits"])
+        retained.update(result["retained"])
+        if reference is None:
+            reference = result["outputs"]
+        for (round_index, index), actions in result["outputs"].items():
+            gate = action_difference(reference[round_index, index], actions)
+            gates.append(
+                {
+                    "round": round_index,
+                    "mode": label,
+                    "reference_mode": f"{precision}-{reference_name}",
+                    "observation": index,
+                    "same_precision": gate,
+                }
+            )
+            if not gate["passes"]:
+                _persist_model_only_evidence(
+                    args.output, _model_only_evidence(previous, gates, audits, retained)
+                )
+                raise RuntimeError(f"Model-only runtime output differs: {gates[-1]}")
+        evidence[label] = optimized.evidence()
+        stream.flush()
+        _persist_model_only_evidence(
+            args.output, _model_only_evidence(previous, gates, audits, retained)
+        )
+        print(f"{label}: independent model replay complete", flush=True)
+    return samples, gates, audits, evidence, retained
 
 
 def run(args):
@@ -379,6 +622,10 @@ def run(args):
         raise ValueError("Expected unchanged Flow4 NFE=4")
     observations, identity = _observations(policy, args)
     _write(args.output / "observations.json", identity)
+    if getattr(args, "replay_assets", False):
+        from coexecution.replay.assets import export_observations
+
+        export_observations(args.output, observations, identity)
     plan = round_plan(args.modes, len(observations), args.rounds, args.seed)
     _write(args.output / "round-plan.json", plan)
     samples, gates, evidence, graph_audits, profiles = [], [], {}, [], {}
@@ -402,149 +649,192 @@ def run(args):
                     raise TypeError(
                         "Resident paired measurement requires GrootOptimizations.set_runtime"
                     )
-                for round_row in plan:
-                    outputs = {}
-                    for mode in round_row["modes"]:
-                        label = f"{precision}-{mode}"
-                        setter(**runtime_settings(mode))
-                        for _ in range(args.warmup):
-                            for index, observation in enumerate(observations):
-                                _seed_reset(
-                                    policy, round_row["seeds"][index], args.device
+                if args.measurement_boundary == "model-only":
+                    block = _model_only_precision(
+                        policy,
+                        optimized,
+                        args,
+                        precision,
+                        observations,
+                        identity,
+                        plan,
+                        stream,
+                        previous={
+                            "gates": gates,
+                            "graph_audits": graph_audits,
+                            "retained": retained,
+                        },
+                    )
+                    samples.extend(block[0])
+                    gates.extend(block[1])
+                    graph_audits.extend(block[2])
+                    evidence.update(block[3])
+                    retained.update(block[4])
+                else:
+                    for round_row in plan:
+                        outputs = {}
+                        for mode in round_row["modes"]:
+                            label = f"{precision}-{mode}"
+                            setter(**runtime_settings(mode))
+                            for _ in range(args.warmup):
+                                for index, observation in enumerate(observations):
+                                    _seed_reset(
+                                        policy, round_row["seeds"][index], args.device
+                                    )
+                                    policy.get_action(observation)
+                            outputs[mode] = {}
+                            for index in round_row["observations"]:
+                                observation, seed = (
+                                    observations[index],
+                                    round_row["seeds"][index],
                                 )
-                                policy.get_action(observation)
-                        outputs[mode] = {}
-                        for index in round_row["observations"]:
-                            observation, seed = (
-                                observations[index],
-                                round_row["seeds"][index],
-                            )
-                            _seed_reset(policy, seed, args.device)
-                            before = graph_snapshot(optimized)
-                            (actions, _), wall = _timed(
-                                lambda obs=observation: policy.get_action(obs),
-                                args.device,
-                            )
-                            after_policy = graph_snapshot(optimized)
-                            outputs[mode][index] = actions
-                            retain(
-                                f"r{round_row['round']}/{label}/o{index}/policy",
-                                actions,
-                            )
-                            row = {
-                                "round": round_row["round"],
-                                "mode": label,
-                                "scope": "policy",
-                                "observation": index,
-                                "seed": seed,
-                                "wall_ms": wall,
-                            }
-                            samples.append(row)
-                            stream.write(json.dumps(row, allow_nan=False) + "\n")
-                            # Independent probes: preparation executes once outside
-                            # the prepared-model boundary. The neural model still
-                            # recomputes the full VLM and every Flow step.
-                            _seed_reset(policy, seed, args.device)
-                            prepared, prep_wall = _timed(
-                                lambda obs=observation: _prepare(policy, obs),
-                                args.device,
-                            )
-                            backbone, action, states = prepared
-                            prediction, model_wall, model_detail = timed_model(
-                                lambda bb=backbone, act=action: forward_prepared(
-                                    policy.model, bb, act
-                                ),
-                                args.device,
-                            )
-                            after_model = graph_snapshot(optimized)
-                            audit = {
-                                "round": round_row["round"],
-                                "mode": label,
-                                "observation": index,
-                                "policy": complete_graph_interval(before, after_policy),
-                                "prepared_model": complete_graph_interval(
-                                    after_policy, after_model
-                                ),
-                            }
-                            graph_audits.append(audit)
-                            if not all(
-                                audit[scope]["passes"]
-                                for scope in ("policy", "prepared_model")
-                            ):
-                                _write(
-                                    args.output / "graph-timing-audit.json",
-                                    graph_audits,
+                                _seed_reset(policy, seed, args.device)
+                                before = graph_snapshot(optimized)
+                                (actions, _), wall = _timed(
+                                    lambda obs=observation: policy.get_action(obs),
+                                    args.device,
                                 )
-                                raise RuntimeError(
-                                    f"Timed call was not steady Graph replay: {audit}"
+                                after_policy = graph_snapshot(optimized)
+                                outputs[mode][index] = actions
+                                retain(
+                                    f"r{round_row['round']}/{label}/o{index}/policy",
+                                    actions,
                                 )
-                            prepared_actions = policy._decode_action(prediction, states)
-                            gate = action_difference(actions, prepared_actions)
-                            gates.append(
-                                {
-                                    "round": round_row["round"],
-                                    "mode": label,
-                                    "observation": index,
-                                    "prepared_model": gate,
-                                }
-                            )
-                            if not gate["passes"]:
-                                _write(args.output / "validation.json", gates)
-                                np.savez_compressed(
-                                    args.output / "actions.npz", **retained
-                                )
-                                raise RuntimeError(
-                                    f"Prepared model output differs: {label}/{index}: {gate}"
-                                )
-                            retain(
-                                f"r{round_row['round']}/{label}/o{index}/prepared_model",
-                                prepared_actions,
-                            )
-                            for scope, elapsed in (
-                                ("preparation_transfer", prep_wall),
-                                ("prepared_model", model_wall),
-                            ):
                                 row = {
                                     "round": round_row["round"],
                                     "mode": label,
-                                    "scope": scope,
+                                    "precision": precision,
+                                    "scope": "policy",
+                                    "measurement_boundary": "comparison",
                                     "observation": index,
+                                    "observation_id": identity[index]["observation_id"],
+                                    "request_id": f"r{round_row['round']}/{label}/o{index}/policy",
                                     "seed": seed,
-                                    "wall_ms": elapsed,
+                                    "wall_ms": wall,
+                                    "instrumented": False,
                                 }
-                                if scope == "prepared_model":
-                                    row.update(model_detail)
                                 samples.append(row)
                                 stream.write(json.dumps(row, allow_nan=False) + "\n")
-                        evidence[label] = optimized.evidence()
-                    reference = outputs[reference_name]
-                    for mode, candidates in outputs.items():
-                        for index, actions in candidates.items():
-                            gate = action_difference(reference[index], actions)
-                            gates.append(
-                                {
+                                # Independent probes: preparation executes once outside
+                                # the prepared-model boundary. The neural model still
+                                # recomputes the full VLM and every Flow step.
+                                _seed_reset(policy, seed, args.device)
+                                prepared, prep_wall = _timed(
+                                    lambda obs=observation: _prepare(policy, obs),
+                                    args.device,
+                                )
+                                backbone, action, states = prepared
+                                prediction, model_wall, model_detail = timed_model(
+                                    lambda bb=backbone, act=action: forward_prepared(
+                                        policy.model, bb, act
+                                    ),
+                                    args.device,
+                                    cuda_events=args.cuda_events,
+                                )
+                                after_model = graph_snapshot(optimized)
+                                audit = {
                                     "round": round_row["round"],
-                                    "mode": f"{precision}-{mode}",
-                                    "reference_mode": reference_label,
+                                    "mode": label,
                                     "observation": index,
-                                    "same_precision": gate,
+                                    "policy": complete_graph_interval(
+                                        before, after_policy
+                                    ),
+                                    "prepared_model": complete_graph_interval(
+                                        after_policy, after_model
+                                    ),
                                 }
-                            )
-                            if not gate["passes"]:
-                                _write(args.output / "validation.json", gates)
-                                np.savez_compressed(
-                                    args.output / "actions.npz", **retained
+                                graph_audits.append(audit)
+                                if not all(
+                                    audit[scope]["passes"]
+                                    for scope in ("policy", "prepared_model")
+                                ):
+                                    _write(
+                                        args.output / "graph-timing-audit.json",
+                                        graph_audits,
+                                    )
+                                    raise RuntimeError(
+                                        f"Timed call was not steady Graph replay: {audit}"
+                                    )
+                                prepared_actions = policy._decode_action(
+                                    prediction, states
                                 )
-                                raise RuntimeError(
-                                    f"Runtime output differs from {reference_label}: {precision}/{mode}: {gate}"
+                                gate = action_difference(actions, prepared_actions)
+                                gates.append(
+                                    {
+                                        "round": round_row["round"],
+                                        "mode": label,
+                                        "observation": index,
+                                        "prepared_model": gate,
+                                    }
                                 )
-                    stream.flush()
-                    _write(args.output / "validation.json", gates)
-                    _write(args.output / "graph-timing-audit.json", graph_audits)
-                    print(
-                        f"{precision}: round {round_row['round'] + 1}/{args.rounds} complete",
-                        flush=True,
-                    )
+                                if not gate["passes"]:
+                                    _write(args.output / "validation.json", gates)
+                                    np.savez_compressed(
+                                        args.output / "actions.npz", **retained
+                                    )
+                                    raise RuntimeError(
+                                        f"Prepared model output differs: {label}/{index}: {gate}"
+                                    )
+                                retain(
+                                    f"r{round_row['round']}/{label}/o{index}/prepared_model",
+                                    prepared_actions,
+                                )
+                                for scope, elapsed in (
+                                    ("preparation_transfer", prep_wall),
+                                    ("prepared_model", model_wall),
+                                ):
+                                    row = {
+                                        "round": round_row["round"],
+                                        "mode": label,
+                                        "precision": precision,
+                                        "scope": scope,
+                                        "measurement_boundary": "comparison",
+                                        "observation": index,
+                                        "observation_id": identity[index][
+                                            "observation_id"
+                                        ],
+                                        "request_id": f"r{round_row['round']}/{label}/o{index}/{scope}",
+                                        "seed": seed,
+                                        "wall_ms": elapsed,
+                                        "instrumented": args.cuda_events
+                                        if scope == "prepared_model"
+                                        else False,
+                                    }
+                                    if scope == "prepared_model":
+                                        row.update(model_detail)
+                                    samples.append(row)
+                                    stream.write(
+                                        json.dumps(row, allow_nan=False) + "\n"
+                                    )
+                            evidence[label] = optimized.evidence()
+                        reference = outputs[reference_name]
+                        for mode, candidates in outputs.items():
+                            for index, actions in candidates.items():
+                                gate = action_difference(reference[index], actions)
+                                gates.append(
+                                    {
+                                        "round": round_row["round"],
+                                        "mode": f"{precision}-{mode}",
+                                        "reference_mode": reference_label,
+                                        "observation": index,
+                                        "same_precision": gate,
+                                    }
+                                )
+                                if not gate["passes"]:
+                                    _write(args.output / "validation.json", gates)
+                                    np.savez_compressed(
+                                        args.output / "actions.npz", **retained
+                                    )
+                                    raise RuntimeError(
+                                        f"Runtime output differs from {reference_label}: {precision}/{mode}: {gate}"
+                                    )
+                        stream.flush()
+                        _write(args.output / "validation.json", gates)
+                        _write(args.output / "graph-timing-audit.json", graph_audits)
+                        print(
+                            f"{precision}: round {round_row['round'] + 1}/{args.rounds} complete",
+                            flush=True,
+                        )
                 if args.profile_rounds:
                     from coexecution.libero.profiling import collect_model_profile
 
@@ -559,6 +849,9 @@ def run(args):
                             rounds=args.profile_rounds,
                             seed=args.seed,
                             device=args.device,
+                            model_only=args.measurement_boundary == "model-only",
+                            observation_ids=[row["observation_id"] for row in identity],
+                            max_prepared_observations=args.max_prepared_observations,
                         )
                         _write(args.output / "profiles.json", profiles)
     for name, sha in sources.items():
@@ -567,10 +860,22 @@ def run(args):
     result = {
         "scope": "Official Spatial local policy replay; RPC/simulator/AoI are separate deployment measurements",
         "boundaries": {
-            "policy": "Raw CPU RGB/state/language -> decoded CPU action, CUDA complete",
-            "preparation_transfer": "Raw observation -> collated CUDA input trees, CUDA complete",
+            **(
+                {
+                    "policy": "Raw CPU RGB/state/language -> decoded CPU action, CUDA complete",
+                    "preparation_transfer": "Raw observation -> collated CUDA input trees, CUDA complete",
+                }
+                if args.measurement_boundary == "comparison"
+                else {}
+            ),
             "prepared_model": "Prepared resident inputs -> full VLM + Flow4 CUDA action, CUDA complete",
         },
+        "measurement_boundary": args.measurement_boundary,
+        "execution_order": "mode blocks"
+        if args.measurement_boundary == "model-only"
+        else "randomized mode rounds",
+        "cuda_event_instrumentation": args.cuda_events,
+        "model_options": None,
         "nonadditive": True,
         "timing_notes": (
             "Prepared-model CUDA span includes device idle/submission gaps; "
@@ -612,7 +917,14 @@ def main():
         parser.error(str(error))
     if any(
         getattr(args, name) < 1
-        for name in ("observations", "rounds", "warmup", "step_stride", "torch_threads")
+        for name in (
+            "observations",
+            "rounds",
+            "warmup",
+            "step_stride",
+            "torch_threads",
+            "max_prepared_observations",
+        )
     ):
         parser.error("Observation/round/warmup/stride/thread counts must be positive")
     if (
@@ -621,6 +933,11 @@ def main():
         or len(set(args.precisions)) != len(args.precisions)
     ):
         parser.error("Nonnegative start step and unique precisions are required")
+    if (
+        args.measurement_boundary == "model-only"
+        and args.observations > args.max_prepared_observations
+    ):
+        parser.error("Model-only observations exceed --max-prepared-observations")
     run(args)
 
 

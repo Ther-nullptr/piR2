@@ -111,6 +111,47 @@ The default mode list remains `baseline` through `graph`; explicitly select
 Same-precision action checks use `baseline` when requested, otherwise the first
 requested mode (`graph` in this example); results record that reference explicitly.
 
+For independent quantization debugging, select `--measurement-boundary model-only`.
+This prepares and owns the selected real observation input trees once per
+precision/runtime block (bounded by `--max-prepared-observations`, default 16),
+collects raw-policy action/RNG references, then warms and replays those resident
+inputs. Each recorded call recomputes the complete VLM and all four Flow steps;
+no neural output is cached. Observation selection, image conversion, collation,
+input copies, RPC, simulation, action decoding, numerical checks and file writes
+are outside the model timer. Raw/prepared comparisons remain available with the
+default `--measurement-boundary comparison`; their separate wall probes are not
+an additive decomposition. Model-only groups runtime modes into blocks rather
+than interleaving preparation and raw calls with recorded model calls.
+
+`coexecution.libero.inference.PreparedInferenceEngine` exposes `vlm`, `action`
+and `full` on caller-owned resident inputs. Preparation and decoding are separate
+adapters, and decoder state is opaque to the engine. The engine returns the
+upstream output directly and retains no outputs: snapshot retained results
+outside timing according to the component's lifetime contract. Callers establish
+CUDA, inference mode, stream readiness and serial ownership; CUDA completion is
+measured at the runner boundary. Imports and CLI help do not load a model.
+Preparation copies mutable inputs before upstream preparation registers static
+metadata. Registered metadata identities stay intact and retain their mutation
+guards; keep the corresponding optimization scope and bindings alive throughout
+the prepared replay. No input copy or metadata registration occurs in the engine.
+
+Clean latency runs do not allocate timing events or profiler scopes. Explicit
+`--cuda-events` adds CUDA span and host-return detail; `--profile-rounds N` runs
+a separate instrumented pass with actual request/VLM/action annotations. In
+model-only profiles, the fixed input cohort is prepared before profiling starts.
+Samples retain precision, observation identity, request identity and seed; trace
+requests retain the corresponding annotation and input identity. Instrumented
+GPU work, CUDA span and complete host wall latency remain different metrics.
+The runner checks exact same-precision decoded actions and CPU/CUDA RNG against
+raw policy calls before accepting model-only results. These are execution gates,
+not LIBERO success or quantization-quality claims.
+
+Run `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_prepared_inference_gpu.py`
+in the pinned CUDA environment for actual fresh-input ownership, original model
+output/RNG equality and output-lifetime gates, including static VLM and VLM graph
+composition with input separation. Host CI uses interface objects,
+never CPU neural inference.
+
 Run `PIR2_NATIVE_TESTS=1 python -m pytest tests/native/test_compiled_host_guards.py`
 for native predicate/mutation gates, and
 `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_image_preparation_gpu.py` in the
@@ -598,3 +639,13 @@ python -m coexecution.feature_usage \
 The optional raw-root audit verifies published and consumed source identities against the original traces. Counts always use the actual feature sequence, never the nearest publication to an RPC timestamp: a request can hold an older snapshot while a new version arrives during installation. Outputs contain per-feature DiT reads, distinct directly executed producer requests, execution ticks, zero/one/multiple-read distributions and count-weighted valid-episode summaries. Bootstrap and right-censored final features are separate; unknown sources explicitly mark accounting incomplete. Direct execution does not represent all causal contributions through the neural rolling buffer.
 
 Use `queue_report --no-figures` to export replay without Matplotlib. The optional Source Han webfont remains a separately downloaded local asset; generated reports inline it with its license when present.
+
+### Model and robot replay evidence
+
+The [replay package](replay/README.md) builds a framework-free catalog from the
+existing independent model benchmark and actual deployment traces. Optional
+`--replay-assets` exports raw model input images outside timing;
+`--record-replay` records each precision's own bounded robot state and two-camera
+response, with encoding after control. The catalog keeps clean model timing,
+actual instrumented kernel timelines and divergent closed-loop trajectories
+separate. This is debugger evidence, not a replacement for LIBERO quality tests.

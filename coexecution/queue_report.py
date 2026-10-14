@@ -171,6 +171,10 @@ def summarize_episode(events, metadata):
     if begin is None or end is None:
         raise ValueError("A completed control_start/control_end window is required")
     start, stop = begin["t_s"], end["t_s"]
+    execution_clock = begin.get(
+        "execution_clock", metadata.get("execution_clock", "paced")
+    )
+    paced = execution_clock == "paced"
     inside = [r for r in events if start <= r["t_s"] <= stop]
     ticks = [r for r in inside if r["kind"] == "control_tick"]
     by_kind = defaultdict(list)
@@ -238,9 +242,10 @@ def summarize_episode(events, metadata):
                 "completed_s": finish - start if finish is not None else None,
                 "censored": censored,
                 "adopted_s": adoption[k]["t_s"] - start if k in adoption else None,
-                "deadline_s": row["deadline_s"] - start
-                if "deadline_s" in row
-                else None,
+                "deadline_s": relative(row.get("deadline_s")),
+                "ready_to_adopt_seconds": adoption.get(k, {}).get(
+                    "ready_to_adopt_seconds"
+                ),
                 "feature_source_tick": actual.get("feature_source_tick"),
                 "feature_sequence": actual.get("feature_sequence"),
                 "feature_capture_s": relative(actual.get("feature_capture_s")),
@@ -354,7 +359,10 @@ def summarize_episode(events, metadata):
                     not s.get("committed") and not s.get("fallback") for s in slots
                 ),
                 "fallback": row.get("fallback", False),
-                "lateness_ms": row.get("lateness_s", 0) * 1000,
+                "lateness_ms": row["lateness_s"] * 1000
+                if row.get("lateness_s") is not None
+                else None,
+                "ready_to_apply_seconds": row.get("ready_to_apply_seconds"),
                 "command_age_ticks": row.get("command_age_ticks"),
                 "action_buffer": row.get("action_buffer", {}),
                 "executed_slot": row.get("executed_slot"),
@@ -412,6 +420,13 @@ def summarize_episode(events, metadata):
         )
         delay = after
     metrics = {
+        "execution_clock": execution_clock,
+        "fixed_rate_timing_applicable": paced,
+        "physics_step_seconds": begin.get(
+            "physics_step_seconds", begin.get("period_s", 0.05)
+        ),
+        "simulated_elapsed_seconds": steps * begin.get("period_s", 0.05),
+        "real_time_factor": fraction(steps * begin.get("period_s", 0.05), stop - start),
         "controlled_seconds": stop - start,
         "ticks": len(ticks),
         "success": metadata.get("success"),
@@ -432,7 +447,7 @@ def summarize_episode(events, metadata):
         "due_generated_slots": due,
         "expired_slot_fraction": fraction(expired, due),
         "censored_future_slots": censored_future,
-        "deadline_misses": len(misses),
+        "deadline_misses": len(misses) if paced else None,
         "action_censored_requests": sum(
             r["censored"] for r in requests if r["role"] == "S1"
         ),
@@ -452,6 +467,11 @@ def summarize_episode(events, metadata):
         if "camera_queue" in r
     ]
     provenance_fields = [
+        "execution_clock",
+        "actual_control_hz",
+        "action_request_hz",
+        "effective_plan_update_hz",
+        "real_time_factor",
         "task_id",
         "episode_id",
         "seed",
@@ -464,6 +484,7 @@ def summarize_episode(events, metadata):
         "first_success_tick",
     ]
     return {
+        "execution_clock": execution_clock,
         "start_s": start,
         "end_s": stop,
         "duration_s": stop - start,
@@ -527,6 +548,7 @@ def condition_report(directory):
     metrics = [e["metrics"] for e in episodes]
     duration = sum(m["controlled_seconds"] for m in metrics)
     flat = {
+        "execution_clock": episodes[0]["execution_clock"],
         "layout": hardware.get("layout", directory.parent.name),
         "condition": hardware.get("condition", directory.name),
         "episodes": len(episodes),
@@ -553,7 +575,9 @@ def condition_report(directory):
         ],
         "control_rate_valid_episodes": sum(
             e["metadata"].get("control_rate_valid") is True for e in episodes
-        ),
+        )
+        if all(e["execution_clock"] == "paced" for e in episodes)
+        else None,
     }
     role_gpus = hardware.get("role_gpus") or {
         "S1": gpu_ids[0] if gpu_ids else None,
@@ -613,7 +637,11 @@ def condition_report(directory):
         "camera_replaced",
         "deadline_misses",
     ]:
-        flat[key] = sum(m[key] for m in metrics)
+        flat[key] = (
+            sum(m[key] for m in metrics)
+            if all(m[key] is not None for m in metrics)
+            else None
+        )
     for key, num, den in [
         ("fallback_fraction", "fallback_ticks", "ticks"),
         ("expired_slot_fraction", "expired_slots", "due_generated_slots"),
@@ -676,6 +704,11 @@ def model_comparisons(conditions, model_path):
     inputs = []
     for condition in conditions:
         s = condition["summary"]
+        if any(
+            episode.get("execution_clock", "paced") != "paced"
+            for episode in condition["episodes"]
+        ):
+            continue
         if not s["s1_solo_mean_ms"] or not s["s2_solo_mean_ms"]:
             continue
         for mode in ["independent", "shared", "serial"]:
@@ -1064,7 +1097,7 @@ def export_report(input_path, output, include_diagnostics=False, no_figures=Fals
             "执行年龄": "执行动作按 executed_slot.producer_request_tick 追溯生产请求，不能用最新缓存代替。启动动作使用真实初始采集时刻；fallback 或来源缺失保持未知。汇总按执行 tick 采样。",
             "依赖关系": "S1 只采用 action_completed / client_timing 的 feature_sequence；S2 按 source_tick、capture_s、rpc_completed_s 精确对应缓存发布，禁止按时间接近猜测。",
             "时间戳": "请求、初始采集和 feature_updates 使用相对控制起点的秒数；camera_queue 保留原始绝对采集时刻，但状态快照只选择不晚于游标的事件。",
-            "延迟规则": "仅消费超时请求时 d=max(d,min(5,ceil((完整 RPC 秒数+0.005)/period)))；只增不减。微小越界可锁定更高 d，不能独立证明硬件吞吐跃迁。",
+            "延迟规则": "paced 模式仅消费超时请求时上调 d；ready 模式固定一个逻辑承诺步、不设置墙钟截止期、不按 50ms 换算 RPC 预算。旧 paced 记录仍保留原校准与有效性；ready 不导入固定频率机制对照。",
             "槽统计": "非 fallback 槽包含启动槽；S1 生产槽只计 request 来源。过期比例的分母为回合结束前应执行的生成槽，结束后的未来槽截尾而非过期。",
             "板卡能耗": "在每个控制窗口边界线性插值并单独积分；排除预热、重置和排空。NVML 板卡能耗包含同 GPU 渲染；报告覆盖率与能量计数器独立估计。",
             "配对比较": "成功终止使暴露时长不同；统计汇总真实请求和 tick，不能视为相同暴露或全套件成功率估计。比较前检查初始状态哈希和各角色实际频率。",
