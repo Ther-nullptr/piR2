@@ -267,7 +267,7 @@
     },
     "build.py": {
       "origin": "pir2-project",
-      "sha256": "e249ca8ca13d102b5ce0a630389610e4d054b4c9e807f499323348a544f1b096"
+      "sha256": "35794191cf09acfc783b6b1fb177cadb5c8784a05cc8b15c04fe0c5666aeb24b"
     },
     "common/__init__.py": {
       "origin": "pir2-project",
@@ -315,8 +315,8 @@
       "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "origin_path": "src/robotics_kernels/common/graph.py",
       "origin_sha256": "10fa00dec9e55510bf0528a0318757406a3606ea08c98a1eb2c203355f3f7d6c",
-      "sha256": "10fa00dec9e55510bf0528a0318757406a3606ea08c98a1eb2c203355f3f7d6c",
-      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+      "sha256": "6687e90dd919606c82361aafcbf141722f66e275e7b92587c39bbf4ab141f707",
+      "adaptation": "Owned graph lifetime handling, opt-in tuple outputs, caller capture keys, retained constants on warmup/replay streams."
     },
     "common/source_identity.cpp": {
       "origin": "pir2-project",
@@ -325,6 +325,14 @@
     "sources.py": {
       "origin": "pir2-project",
       "sha256": "8865b394b260db4576933787d6f7365eea1ed7038b2b0b94b19237d0087839b2"
+    },
+    "ampere_ada/balanced.py": {
+      "origin": "pir2-project",
+      "sha256": "9311736c7d41caf0e780ed4e8ca4a0f804e1337755902ef1b599b6d782a88b98"
+    },
+    "ampere_ada/csrc/int4_balanced_prepare.cu": {
+      "origin": "pir2-project",
+      "sha256": "de2ec140c1711529127fe33a3c6f287e36b0178d579259ffacae94def0f04012"
     }
   },
   "runtime_dependencies": [
