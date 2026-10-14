@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "architecture": "sm_89",
+  "precision": "w8a8",
+  "implementations": {
+    "integer_gemm": "split_k",
+    "integer_residual": "native",
+    "group_writeback": "native",
+    "layernorm_pack": "native",
+    "rmsnorm": "native",
+    "rmsnorm_pack": "native",
+    "context_pack": "shared"
+  },
+  "parameters": {
+    "integer_gemm": {
+      "slices": 8,
+      "tile": 0
+    }
+  }
+}

@@ -45,6 +45,17 @@ def test_action_graph_is_opt_in_and_flow_bf16_w8_w4_only():
             OptimizationConfig(precision=precision, action_graph=True)
 
 
+def test_action_kv_flag_is_explicit_and_keeps_other_runtime_flags():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    assert "--action-kv-reuse" in parser.format_help()
+    config = optimization_config(
+        parser.parse_args(["--action-cuda-graph", "--action-kv-reuse"])
+    )
+    assert config.action_graph and config.action_kv_reuse
+    assert not config.dit_graph and not config.fusion
+
+
 def head_metadata(**changes):
     config = SimpleNamespace(
         streaming=False,
@@ -203,6 +214,51 @@ def test_measurement_audits_one_action_graph_replay_as_four_logical_evaluations(
     assert audit["passes"] and audit["action"]["replay_delta"] == 1
     after["action"]["logical_nfe_count"] = 11
     assert not complete_graph_interval(before, after)["passes"]
+
+
+def test_kv_work_audit_requires_exact_projection_savings_and_capture_proof():
+    from coexecution.libero.measurement import graph_interval
+
+    kv = {
+        "enabled": True,
+        "projections_per_body": 4,
+        "verified_body_count": 4,
+        "last_body_proof": [
+            {"block": index, "projection": role, "calls": 4, "computes": 1, "reuses": 3}
+            for index in (0, 2)
+            for role in ("to_k", "to_v")
+        ],
+        "expected_projection_count": 16,
+        "executed_projection_count": 4,
+        "avoided_projection_count": 12,
+    }
+    before = {
+        "capture_count": 1,
+        "replay_count": 1,
+        "failure_count": 0,
+        "logical_nfe_count": 4,
+        "kv_reuse": kv,
+    }
+    after = {
+        **before,
+        "replay_count": 2,
+        "logical_nfe_count": 8,
+        "kv_reuse": {
+            **kv,
+            "expected_projection_count": 32,
+            "executed_projection_count": 8,
+            "avoided_projection_count": 24,
+        },
+    }
+    audit = graph_interval(before, after, expected_replays=1)
+    assert audit["passes"]
+    assert audit["kv_reuse"]["executed_projection_delta"] == 4
+    assert audit["kv_reuse"]["avoided_projection_delta"] == 12
+    after["kv_reuse"]["executed_projection_count"] = 7
+    assert not graph_interval(before, after, expected_replays=1)["passes"]
+    after["kv_reuse"]["executed_projection_count"] = 8
+    after["kv_reuse"]["last_body_proof"] = []
+    assert not graph_interval(before, after, expected_replays=1)["passes"]
 
 
 def test_tuple_graph_refreshes_owned_buffers_preserves_stride_and_stream(monkeypatch):

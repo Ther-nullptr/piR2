@@ -42,6 +42,7 @@ def main():
         "tests/contracts/test_vision_admission_configuration.py",
         "tests/contracts/test_dit_graph_buckets.py",
         "tests/contracts/test_action_graph.py",
+        "tests/contracts/test_action_kv_reuse.py",
         "tests/contracts/test_optimization_imports.py",
         "tests/contracts/test_backend_capabilities.py",
         "tests/contracts/test_streaming_components.py",

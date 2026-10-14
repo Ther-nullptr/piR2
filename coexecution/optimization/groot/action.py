@@ -6,7 +6,7 @@ and policy decoding remain outside. Importing admission helpers is GPU-free.
 
 import threading
 from collections import Counter, OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import MethodType
 
 from coexecution.optimization.execution.guards import HostGuardPlan
@@ -150,13 +150,17 @@ class ActionGraph:
     Explicit close restores the original methods and hooks transactionally.
     """
 
-    def __init__(self, policy, *, max_entries=8, guard_backend=None):
+    def __init__(self, policy, *, max_entries=8, guard_backend=None, kv_reuse=False):
         if type(max_entries) is not int or max_entries < 1:
             raise ValueError("Action graph max_entries must be a positive integer")
         self.policy, self.model = policy, policy.model
         self.head = self.model.action_head
         self.max_entries = max_entries
         self.guard_backend = guard_backend
+        if type(kv_reuse) is not bool:
+            raise ValueError("Action K/V reuse must be a bool")
+        self.kv_reuse = kv_reuse
+        self._kv_scope = None
         self.graphs, self.counts = OrderedDict(), Counter()
         self.lock = threading.Lock()
         self._entered = False
@@ -210,6 +214,16 @@ class ActionGraph:
 
         observe.__pir2_execution_observer__ = True
         try:
+            if self.kv_reuse:
+                from gr00t.model.modules.dit import AlternateVLDiT
+
+                from coexecution.optimization.groot.kv_reuse import FlowKVReuse
+
+                if type(head.model) is not AlternateVLDiT:
+                    raise ValueError("K/V reuse requires the pinned AlternateVLDiT")
+                if self._kv_scope is None:
+                    self._kv_scope = FlowKVReuse(head.model)
+                self._kv_scope.__enter__()
             self._proof_hook = head.model.register_forward_hook(observe)
             head.get_action = self._call
             self._entered = True
@@ -302,6 +316,10 @@ class ActionGraph:
             self.head.modules(),
             processor_types=(AttnProcessor2_0, PreparedAttention),
         )
+        if self._kv_scope is not None:
+            self._kv_scope.freeze(self._execution_guard)
+        self._execution_guard.attribute(self, "kv_reuse")
+        self._execution_guard.attribute(self, "_kv_scope")
         self._constants = captured_tensors(self.head)
 
     def _execution_settings(self):
@@ -410,7 +428,12 @@ class ActionGraph:
                 action = self.BatchFeature(data=dict(zip(ACTION_KEYS, unpacked[3:])))
                 encoded = self.head._encode_features(backbone, action)
                 before = self.counts["python_dit_forward_count"]
-                with self.noise.bind(noise):
+                with (
+                    self.noise.bind(noise),
+                    self._kv_scope.body()
+                    if self._kv_scope is not None
+                    else nullcontext(),
+                ):
                     output = self.flow(
                         encoded.backbone_features,
                         encoded.state_features,
@@ -474,6 +497,8 @@ class ActionGraph:
     def close(self):
         with self.close_guard():
             self.graphs.clear()
+            if self._kv_scope is not None:
+                self._kv_scope.close()
             if self._original is not None:
                 if self._had_original:
                     self.head.get_action = self._original
@@ -512,4 +537,9 @@ class ActionGraph:
             "scope": "conditioning plus unchanged Flow4; explicit noise; owned outputs",
             "logical_nfe_per_replay": 4,
             "python_hooks": "warmup/capture only; graph replay bypasses Python hooks",
+            "kv_reuse": (
+                {"enabled": False}
+                if self._kv_scope is None
+                else self._kv_scope.evidence(replays=self.counts["replay_count"])
+            ),
         }

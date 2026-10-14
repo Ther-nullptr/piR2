@@ -59,6 +59,7 @@ dist/
 !/docs/libero.md
 !/docs/timing-protocols.md
 !/docs/coexecution.md
+!/docs/platform-handoff.md
 /appendix.md
 /proposal*.txt
 /*计划*.md

@@ -16,7 +16,16 @@ from dataclasses import fields, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MODES = ("baseline", "prepared", "tokenized", "static", "graph", "images", "compiled")
+MODES = (
+    "baseline",
+    "prepared",
+    "tokenized",
+    "static",
+    "graph",
+    "images",
+    "compiled",
+    "kv_reuse",
+)
 RUNTIME_FIELDS = (
     "input_preparation",
     "tokenizer_cache",
@@ -24,6 +33,7 @@ RUNTIME_FIELDS = (
     "vlm_graph",
     "image_array_preparation",
     "compiled_host_guards",
+    "action_kv_reuse",
 )
 
 
@@ -132,7 +142,54 @@ def graph_interval(before, after, *, expected_replays):
         logical = after.get("logical_nfe_count", 0) - before.get("logical_nfe_count", 0)
         result["logical_nfe_delta"] = logical
         result["passes"] = result["passes"] and logical == 4 * expected_replays
+    kv_before, kv_after = before.get("kv_reuse", {}), after.get("kv_reuse", {})
+    if kv_before.get("enabled") or kv_after.get("enabled"):
+        kv_audit = kv_reuse_interval(kv_before, kv_after, expected_replays)
+        result["kv_reuse"] = kv_audit
+        result["passes"] = result["passes"] and kv_audit["passes"]
     return result
+
+
+def kv_reuse_interval(before, after, replays):
+    """Check captured projection work independently of physical Python hooks."""
+    names = ("expected_projection", "executed_projection", "avoided_projection")
+    deltas = {
+        name + "_delta": after.get(name + "_count", 0) - before.get(name + "_count", 0)
+        for name in names
+    }
+    projections = after.get("projections_per_body", 0)
+    proof = after.get("last_body_proof", [])
+    valid_proof = (
+        projections > 0
+        and after.get("verified_body_count", 0) > 0
+        and len(proof) == projections
+        and len({(row.get("block"), row.get("projection")) for row in proof})
+        == projections
+        and all(
+            row.get("calls") == 4
+            and row.get("computes") == 1
+            and row.get("reuses") == 3
+            for row in proof
+        )
+    )
+    return {
+        "passes": bool(
+            before.get("enabled")
+            and after.get("enabled")
+            and before.get("projections_per_body") == projections
+            and valid_proof
+            and deltas
+            == dict(
+                zip(
+                    (name + "_delta" for name in names),
+                    (replays * projections * factor for factor in (4, 1, 3)),
+                )
+            )
+        ),
+        "unit": "logical K/V projection evaluations, not GEMM/kernel launches",
+        "captured_body_proof": valid_proof,
+        **deltas,
+    }
 
 
 def graph_snapshot(session):
@@ -302,6 +359,10 @@ def _observations(policy, args):
 def _config(args, precision, mode):
     from coexecution.optimization.config import optimization_config
 
+    if args.action_kv_reuse:
+        raise ValueError(
+            "Select the kv_reuse measurement mode instead of --action-kv-reuse"
+        )
     values = dict(vars(args), inference_precision=precision)
     if precision == "bf16":
         for key in (
@@ -913,6 +974,9 @@ def main():
     args = parser.parse_args()
     try:
         reference_mode(args.modes)
+        for precision in args.precisions:
+            for mode in args.modes:
+                _config(args, precision, mode)
     except ValueError as error:
         parser.error(str(error))
     if any(

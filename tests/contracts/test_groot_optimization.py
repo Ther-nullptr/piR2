@@ -258,6 +258,10 @@ def runtime_interface(monkeypatch):
     class Action(Adapter):
         label = "action"
 
+        def __init__(self, actual_policy, *, kv_reuse=False, **kwargs):
+            super().__init__(actual_policy, **kwargs)
+            self.kv_reuse = kv_reuse
+
     class Boundary:
         def __init__(self, *args, **kwargs):
             self.closed = False
@@ -443,6 +447,32 @@ def test_live_action_call_prevents_runtime_switch_and_session_close(runtime_inte
             assert runtime_interface.events == previous
             assert not session.boundary.closed
         session.action_graph.active_call = False
+
+
+def test_kv_runtime_switch_recreates_only_runtime_and_rolls_back(runtime_interface):
+    with GrootOptimizations(
+        runtime_interface.policy, OptimizationConfig(action_graph=True)
+    ) as session:
+        old = session.action_graph
+        session.set_runtime(action_kv_reuse=True)
+        assert session.config.action_kv_reuse and session.action_graph.kv_reuse
+        assert old.closed and session.action_graph is not old
+        session.set_runtime(action_kv_reuse=False)
+        assert not session.action_graph.kv_reuse
+        runtime_interface.failures.append("action")
+        with pytest.raises(RuntimeError, match="action installation failed"):
+            session.set_runtime(action_kv_reuse=True)
+        assert not session.config.action_kv_reuse
+        assert not session.action_graph.closed and not session.boundary.closed
+        with pytest.raises(ValueError, match="bool"):
+            session.set_runtime(action_kv_reuse=1)
+
+
+def test_kv_runtime_switch_cannot_silently_enable_action_graph(runtime_interface):
+    with GrootOptimizations(runtime_interface.policy) as session:
+        with pytest.raises(ValueError, match="action.*graph"):
+            session.set_runtime(action_kv_reuse=True)
+        assert runtime_interface.events == []
 
 
 def test_action_install_failure_restores_runtime_transaction(runtime_interface):

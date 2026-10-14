@@ -40,6 +40,51 @@ def test_new_runtime_measurement_modes_require_explicit_selection():
     assert "images" not in action.default and "compiled" not in action.default
 
 
+def test_kv_measurement_mode_is_explicit_and_changes_only_reuse():
+    module = measurement()
+    parser = module.build_parser()
+    action = next(action for action in parser._actions if action.dest == "modes")
+    assert "kv_reuse" in action.choices and "kv_reuse" not in action.default
+    required = [
+        "--checkpoint",
+        "unused",
+        "--dataset",
+        "unused",
+        "--output",
+        "unused",
+        "--modes",
+        "compiled",
+        "kv_reuse",
+    ]
+    args = parser.parse_args(required + ["--action-cuda-graph"])
+    for precision in ("bf16", "w8a8", "w4a4"):
+        before, after = [module._config(args, precision, mode) for mode in args.modes]
+        from dataclasses import replace
+
+        assert not before.action_kv_reuse and after.action_kv_reuse
+        assert replace(before, action_kv_reuse=True) == after
+    with pytest.raises(ValueError, match="action.*graph"):
+        module._config(parser.parse_args(required), "bf16", "kv_reuse")
+
+
+def test_kv_measurement_rejects_ambiguous_global_enable():
+    module = measurement()
+    args = module.build_parser().parse_args(
+        [
+            "--checkpoint",
+            "unused",
+            "--dataset",
+            "unused",
+            "--output",
+            "unused",
+            "--action-cuda-graph",
+            "--action-kv-reuse",
+        ]
+    )
+    with pytest.raises(ValueError, match="mode"):
+        module._config(args, "bf16", "compiled")
+
+
 @pytest.mark.parametrize(
     "modes, expected",
     [
@@ -131,6 +176,7 @@ def test_runtime_settings_are_precision_independent_and_layered():
             "vlm_graph",
             "image_array_preparation",
             "compiled_host_guards",
+            "action_kv_reuse",
         ),
         False,
     )
@@ -151,7 +197,14 @@ def test_runtime_settings_are_precision_independent_and_layered():
         **module.runtime_settings("graph"),
         "image_array_preparation": True,
     }
-    assert all(module.runtime_settings("compiled").values())
+    assert module.runtime_settings("compiled") == {
+        **module.runtime_settings("images"),
+        "compiled_host_guards": True,
+    }
+    assert module.runtime_settings("kv_reuse") == {
+        **module.runtime_settings("compiled"),
+        "action_kv_reuse": True,
+    }
     with pytest.raises(ValueError):
         module.runtime_settings("unknown")
 

@@ -188,6 +188,50 @@ replay and four logical evaluations per timed call. Select the same graph flag
 for BF16 and quantized comparisons; these execution checks establish neither
 quantization quality nor closed-loop success.
 
+`--action-kv-reuse` additionally reuses each cross-attention layer's K/V outputs
+within that unchanged Flow4 body. It requires `--action-cuda-graph`, non-streaming
+H40/NFE4, the pinned interleaved AlternateVLDiT, frozen eval execution and an
+admitted SDPA processor. BF16, W8A8 and W4A4 support both standard
+`AttnProcessor2_0` and `PreparedAttention`; operator fusion is independent. Q,
+self-attention, masks, state/noise and the four denoising evaluations stay fresh.
+Installed integer grouping, tactics and producer packs remain in effect.
+
+The scope starts empty for every warmup/captured body. Each layer's first K/V
+computation is captured, so every replay recomputes it from the newly copied
+observation. The remaining three evaluations use those outputs. All Python
+K/V references are released on body exit, including exceptions, independently
+of per-DiT projection-cache resets. There is no reuse across observations or
+reliance on feature pointers as freshness evidence. Closing restores projection
+forwards; changing the flag through `set_runtime(action_kv_reuse=...)` closes and
+recaptures action graphs while keeping precision and weights resident.
+
+For paired timing, explicitly select `--modes compiled kv_reuse` with
+`--action-cuda-graph` and the same precision/fusion/tactic flags for both modes.
+Only K/V reuse differs between those two modes. The measurement command owns
+the switch, so it rejects a global `--action-kv-reuse`; the standalone runtime
+and service commands accept that flag. Existing default measurement modes are
+unchanged. For example:
+
+```bash
+python -m coexecution.libero.measurement \
+  --checkpoint /path/to/libero_spatial --dataset /path/to/groot-libero-spatial \
+  --output .local/kv-paired --precisions bf16 w8a8 w4a4 \
+  --modes compiled kv_reuse --action-cuda-graph --operator-fusion \
+  --observations 3 --rounds 20 --warmup 2
+```
+
+The comparison boundary randomizes mode order per round using identical inputs
+and seeds. `--measurement-boundary model-only` retains its resident mode blocks;
+record or reverse block order separately when evaluating timing drift. Warm
+every shape/stream signature before timing. `action_graph.kv_reuse` records
+per-layer captured-body proofs and expected/executed/avoided projection counts
+from explicit replay counts. These count K/V projection evaluations, not GEMM
+or kernel launches: an installed K/V group can execute one GEMM for two
+projections. Python projection counters describe successful warmup/capture
+bodies only; replay bypasses those counters and hooks. Timing audits require
+the proof and exact work deltas. No speedup or task-quality claim follows from
+these execution counts alone.
+
 Run `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_action_graph_gpu.py` in the
 pinned CUDA environment for full-action/RNG, freshness, stride/stream, output
 lifetime, failure, frozen-execution and restoration gates.

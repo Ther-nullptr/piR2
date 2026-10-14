@@ -10,6 +10,7 @@ class OptimizationConfig:
     fusion: bool = False
     dit_graph: bool = False
     action_graph: bool = False
+    action_kv_reuse: bool = False
     scope: str = "transformer"
     category_id: int | None = None
     coverage: Path | None = None
@@ -36,6 +37,10 @@ class OptimizationConfig:
     operator_profile: Path | None = None
 
     def __post_init__(self):
+        if type(self.action_kv_reuse) is not bool:
+            raise ValueError("Action K/V reuse must be a bool")
+        if self.action_kv_reuse and not self.action_graph:
+            raise ValueError("Action K/V reuse requires --action-cuda-graph")
         if self.action_graph and self.precision not in ("bf16", "w8a8", "w4a4"):
             raise ValueError("Action graph requires BF16, W8A8 or W4A4")
         if self.vlm_graph and not self.static_vlm:
@@ -146,6 +151,7 @@ def add_optimization_arguments(parser):
     parser.add_argument("--operator-profile", type=Path)
     parser.add_argument("--dit-cuda-graph", action="store_true")
     parser.add_argument("--action-cuda-graph", action="store_true")
+    parser.add_argument("--action-kv-reuse", action="store_true")
     parser.add_argument(
         "--quantization-scope", choices=["transformer", "all"], default="transformer"
     )
@@ -182,6 +188,7 @@ def optimization_config(args):
         operator_profile=args.operator_profile,
         dit_graph=args.dit_cuda_graph,
         action_graph=args.action_cuda_graph,
+        action_kv_reuse=args.action_kv_reuse,
         scope=args.quantization_scope,
         component=args.quantization_component,
         category_id=args.quantization_category_id,

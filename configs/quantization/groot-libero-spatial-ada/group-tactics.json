@@ -1,0 +1,362 @@
+[
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.1.attn1.to_q",
+      "action_head.model.transformer_blocks.1.attn1.to_k",
+      "action_head.model.transformer_blocks.1.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.3.attn1.to_q",
+      "action_head.model.transformer_blocks.3.attn1.to_k",
+      "action_head.model.transformer_blocks.3.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.5.attn1.to_q",
+      "action_head.model.transformer_blocks.5.attn1.to_k",
+      "action_head.model.transformer_blocks.5.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.7.attn1.to_q",
+      "action_head.model.transformer_blocks.7.attn1.to_k",
+      "action_head.model.transformer_blocks.7.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.9.attn1.to_q",
+      "action_head.model.transformer_blocks.9.attn1.to_k",
+      "action_head.model.transformer_blocks.9.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.11.attn1.to_q",
+      "action_head.model.transformer_blocks.11.attn1.to_k",
+      "action_head.model.transformer_blocks.11.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.13.attn1.to_q",
+      "action_head.model.transformer_blocks.13.attn1.to_k",
+      "action_head.model.transformer_blocks.13.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.15.attn1.to_q",
+      "action_head.model.transformer_blocks.15.attn1.to_k",
+      "action_head.model.transformer_blocks.15.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.17.attn1.to_q",
+      "action_head.model.transformer_blocks.17.attn1.to_k",
+      "action_head.model.transformer_blocks.17.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.19.attn1.to_q",
+      "action_head.model.transformer_blocks.19.attn1.to_k",
+      "action_head.model.transformer_blocks.19.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.21.attn1.to_q",
+      "action_head.model.transformer_blocks.21.attn1.to_k",
+      "action_head.model.transformer_blocks.21.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.23.attn1.to_q",
+      "action_head.model.transformer_blocks.23.attn1.to_k",
+      "action_head.model.transformer_blocks.23.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.25.attn1.to_q",
+      "action_head.model.transformer_blocks.25.attn1.to_k",
+      "action_head.model.transformer_blocks.25.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.27.attn1.to_q",
+      "action_head.model.transformer_blocks.27.attn1.to_k",
+      "action_head.model.transformer_blocks.27.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.29.attn1.to_q",
+      "action_head.model.transformer_blocks.29.attn1.to_k",
+      "action_head.model.transformer_blocks.29.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.model.transformer_blocks.31.attn1.to_q",
+      "action_head.model.transformer_blocks.31.attn1.to_k",
+      "action_head.model.transformer_blocks.31.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.0.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.0.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.0.attn1.to_v"
+    ],
+    "tactic": 7
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.1.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.1.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.1.attn1.to_v"
+    ],
+    "tactic": 7
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.2.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.2.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.2.attn1.to_v"
+    ],
+    "tactic": 7
+  },
+  {
+    "bits": 8,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.3.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.3.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.3.attn1.to_v"
+    ],
+    "tactic": 7
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.1.attn1.to_q",
+      "action_head.model.transformer_blocks.1.attn1.to_k",
+      "action_head.model.transformer_blocks.1.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.3.attn1.to_q",
+      "action_head.model.transformer_blocks.3.attn1.to_k",
+      "action_head.model.transformer_blocks.3.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.5.attn1.to_q",
+      "action_head.model.transformer_blocks.5.attn1.to_k",
+      "action_head.model.transformer_blocks.5.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.7.attn1.to_q",
+      "action_head.model.transformer_blocks.7.attn1.to_k",
+      "action_head.model.transformer_blocks.7.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.9.attn1.to_q",
+      "action_head.model.transformer_blocks.9.attn1.to_k",
+      "action_head.model.transformer_blocks.9.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.11.attn1.to_q",
+      "action_head.model.transformer_blocks.11.attn1.to_k",
+      "action_head.model.transformer_blocks.11.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.13.attn1.to_q",
+      "action_head.model.transformer_blocks.13.attn1.to_k",
+      "action_head.model.transformer_blocks.13.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.15.attn1.to_q",
+      "action_head.model.transformer_blocks.15.attn1.to_k",
+      "action_head.model.transformer_blocks.15.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.17.attn1.to_q",
+      "action_head.model.transformer_blocks.17.attn1.to_k",
+      "action_head.model.transformer_blocks.17.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.19.attn1.to_q",
+      "action_head.model.transformer_blocks.19.attn1.to_k",
+      "action_head.model.transformer_blocks.19.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.21.attn1.to_q",
+      "action_head.model.transformer_blocks.21.attn1.to_k",
+      "action_head.model.transformer_blocks.21.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.23.attn1.to_q",
+      "action_head.model.transformer_blocks.23.attn1.to_k",
+      "action_head.model.transformer_blocks.23.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.25.attn1.to_q",
+      "action_head.model.transformer_blocks.25.attn1.to_k",
+      "action_head.model.transformer_blocks.25.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.27.attn1.to_q",
+      "action_head.model.transformer_blocks.27.attn1.to_k",
+      "action_head.model.transformer_blocks.27.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.29.attn1.to_q",
+      "action_head.model.transformer_blocks.29.attn1.to_k",
+      "action_head.model.transformer_blocks.29.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.model.transformer_blocks.31.attn1.to_q",
+      "action_head.model.transformer_blocks.31.attn1.to_k",
+      "action_head.model.transformer_blocks.31.attn1.to_v"
+    ],
+    "tactic": 2
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.0.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.0.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.0.attn1.to_v"
+    ],
+    "tactic": 7
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.1.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.1.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.1.attn1.to_v"
+    ],
+    "tactic": 7
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.2.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.2.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.2.attn1.to_v"
+    ],
+    "tactic": 7
+  },
+  {
+    "bits": 4,
+    "members": [
+      "action_head.vl_self_attention.transformer_blocks.3.attn1.to_q",
+      "action_head.vl_self_attention.transformer_blocks.3.attn1.to_k",
+      "action_head.vl_self_attention.transformer_blocks.3.attn1.to_v"
+    ],
+    "tactic": 7
+  }
+]

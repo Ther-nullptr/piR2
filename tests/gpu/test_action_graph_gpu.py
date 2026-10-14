@@ -30,8 +30,9 @@ def equal(actual, expected):
         torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("kv_reuse", [False, True])
 @torch.inference_mode()
-def test_action_graph_fresh_inputs_noise_rng_and_owned_outputs(flow):
+def test_action_graph_fresh_inputs_noise_rng_and_owned_outputs(flow, kv_reuse):
     policy, inputs = flow
     head = policy.model.action_head
     original = head.get_action
@@ -43,7 +44,7 @@ def test_action_graph_fresh_inputs_noise_rng_and_owned_outputs(flow):
         rng.append(torch.cuda.get_rng_state().clone())
     torch.cuda.manual_seed(619)
     retained = []
-    with ActionGraph(policy, max_entries=2) as graph:
+    with ActionGraph(policy, max_entries=2, kv_reuse=kv_reuse) as graph:
         for index, ((backbone, action), request) in enumerate(zip(inputs, options)):
             actual = head.get_action(backbone, action, request)
             equal(actual, expected[index])
@@ -66,8 +67,9 @@ def test_action_graph_fresh_inputs_noise_rng_and_owned_outputs(flow):
         equal(output, saved)
 
 
+@pytest.mark.parametrize("kv_reuse", [False, True])
 @torch.inference_mode()
-def test_action_graph_stream_layout_eviction_and_hook_counts(flow):
+def test_action_graph_stream_layout_eviction_and_hook_counts(flow, kv_reuse):
     policy, inputs = flow
     head = policy.model.action_head
     original = head.get_action
@@ -80,7 +82,7 @@ def test_action_graph_stream_layout_eviction_and_hook_counts(flow):
     observe.__pir2_execution_observer__ = True
     hook = head.model.register_forward_hook(observe)
     try:
-        with ActionGraph(policy, max_entries=1) as graph:
+        with ActionGraph(policy, max_entries=1, kv_reuse=kv_reuse) as graph:
             for index, (backbone, action) in enumerate(inputs):
                 # A stepped sequence slice exercises owned input stride preservation.
                 values = dict(backbone)
@@ -106,11 +108,12 @@ def test_action_graph_stream_layout_eviction_and_hook_counts(flow):
     "mutation",
     ["weight", "training", "config", "method", "hook", "processor", "normalized_shape"],
 )
+@pytest.mark.parametrize("kv_reuse", [False, True])
 @torch.inference_mode()
-def test_frozen_execution_rejects_mutation_before_rng(flow, mutation):
+def test_frozen_execution_rejects_mutation_before_rng(flow, mutation, kv_reuse):
     policy, inputs = flow
     head = policy.model.action_head
-    with ActionGraph(policy) as graph:
+    with ActionGraph(policy, kv_reuse=kv_reuse) as graph:
         head.get_action(*inputs[0])
         if mutation == "weight":
             next(head.parameters()).add_(1)
@@ -160,9 +163,10 @@ def test_unknown_hooks_options_and_dtype_fail_without_rng_or_eager_fallback(flow
         assert torch.equal(before, torch.cuda.get_rng_state())
 
 
+@pytest.mark.parametrize("kv_reuse", [False, True])
 @torch.inference_mode()
 def test_capture_failure_keeps_wrapper_and_restores_original_on_close(
-    flow, monkeypatch
+    flow, monkeypatch, kv_reuse
 ):
     policy, inputs = flow
     head, failed = policy.model.action_head, []
@@ -172,7 +176,7 @@ def test_capture_failure_keeps_wrapper_and_restores_original_on_close(
         failed.append(1)
         raise RuntimeError("capture failed")
 
-    with ActionGraph(policy) as graph:
+    with ActionGraph(policy, kv_reuse=kv_reuse) as graph:
         monkeypatch.setattr(TensorGraphCall, "__call__", fail)
         for _ in range(2):
             with pytest.raises(RuntimeError, match="capture failed"):
@@ -222,10 +226,12 @@ def test_close_and_overlapping_calls_reject_before_restoration(flow):
             graph.lock.release()
 
 
-@pytest.mark.parametrize("precision", ["w8a8", "w4a4"])
+@pytest.mark.parametrize("precision", ["bf16", "w8a8", "w4a4"])
+@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize("kv_reuse", [False, True])
 @torch.inference_mode()
 def test_integer_action_graph_matches_same_precision_with_visual_conditioning(
-    flow, precision
+    flow, precision, fusion, kv_reuse
 ):
     from gr00t.model.modules.dit import SelfAttentionTransformer
 
@@ -245,7 +251,13 @@ def test_integer_action_graph_matches_same_precision_with_visual_conditioning(
             .eval()
             .requires_grad_(False)
         )
-    config = {"precision": precision, "component": "dit", "scope": "all"}
+    config = {
+        "precision": precision,
+        "component": "dit",
+        "scope": "all",
+        "fusion": fusion,
+        "action_graph": kv_reuse,
+    }
     expected, rng = [], []
     with GrootOptimizations(policy, OptimizationConfig(**config)):
         torch.cuda.manual_seed(401)
@@ -253,7 +265,12 @@ def test_integer_action_graph_matches_same_precision_with_visual_conditioning(
             expected.append(head.get_action(*value))
             rng.append(torch.cuda.get_rng_state().clone())
     with GrootOptimizations(
-        policy, OptimizationConfig(**config, action_graph=True, dit_graph=True)
+        policy,
+        OptimizationConfig(
+            **{**config, "action_graph": True},
+            action_kv_reuse=kv_reuse,
+            dit_graph=True,
+        ),
     ) as session:
         torch.cuda.manual_seed(401)
         for index, value in enumerate(inputs):
@@ -261,6 +278,36 @@ def test_integer_action_graph_matches_same_precision_with_visual_conditioning(
             assert torch.equal(torch.cuda.get_rng_state(), rng[index])
         assert session.action_graph.evidence()["logical_nfe_count"] == 16
         assert session.graphs is None
+
+
+@torch.inference_mode()
+def test_kv_reuse_same_pointer_refresh_and_captured_projection_proof(flow):
+    policy, inputs = flow
+    head = policy.model.action_head
+    original = head.get_action
+    backbone, action = inputs[0]
+    expected, rng = [], []
+    for index, (fresh_backbone, fresh_action) in enumerate(inputs):
+        torch.cuda.manual_seed(811 + index)
+        expected.append(original(fresh_backbone, fresh_action))
+        rng.append(torch.cuda.get_rng_state().clone())
+    with ActionGraph(policy, kv_reuse=True) as graph:
+        for index, (fresh_backbone, fresh_action) in enumerate(inputs):
+            for target, source in ((backbone, fresh_backbone), (action, fresh_action)):
+                for key in target:
+                    target[key].copy_(source[key])
+            torch.cuda.manual_seed(811 + index)
+            equal(head.get_action(backbone, action), expected[index])
+            assert torch.equal(torch.cuda.get_rng_state(), rng[index])
+            assert graph._kv_scope.retained_count == 0
+        proof = graph.evidence()["kv_reuse"]
+        assert proof["verified_body_count"] == 4
+        assert proof["python_projection_compute_count"] == 16
+        assert proof["python_projection_reuse_count"] == 48
+        assert proof["expected_projection_count"] == 64
+        assert proof["executed_projection_count"] == 16
+        assert proof["avoided_projection_count"] == 48
+        assert graph.evidence()["logical_nfe_count"] == 16
 
 
 @torch.inference_mode()
@@ -275,11 +322,12 @@ def test_guard_is_frozen_at_scope_entry_before_first_capture(flow):
         assert torch.equal(before, torch.cuda.get_rng_state())
 
 
-def test_closed_scope_preserves_new_owner_and_can_be_reentered(flow):
+@pytest.mark.parametrize("kv_reuse", [False, True])
+def test_closed_scope_preserves_new_owner_and_can_be_reentered(flow, kv_reuse):
     policy, _inputs = flow
     head = policy.model.action_head
     original = head.get_action
-    old = ActionGraph(policy)
+    old = ActionGraph(policy, kv_reuse=kv_reuse)
     with old:
         assert head.get_action != original
     with ActionGraph(policy):
