@@ -704,7 +704,7 @@ def test_graph_rejects_unknown_captured_hooks_but_backbone_observer_is_allowed(
 def test_failed_capture_restores_eager_entry_and_reentry_clears_graphs(
     policy, monkeypatch
 ):
-    from robotics_kernels.common import graph
+    from coexecution.kernels.common import graph
 
     backbone = policy.model.backbone
     batch = inputs()

@@ -4,40 +4,63 @@
 
 The parent is pinned to `3af52ca400a6ec7d141416879aa531a6f62f697a`, and the GR00T fork to `2a39d591a3af24c42bb1d1c9cd708a2dddac0600`. Our repository owns the experiment entrypoints, LIBERO adaptation, timing/evaluation tooling and explicitly recorded corrections. It does not present the algorithm as newly invented here.
 
-Source locations and commits live in [sources.lock.json](../sources.lock.json). Dependencies are downloaded to ignored directories rather than importing nested `.git` histories or copying complete source trees into commits. Local corrections are tracked as patches with the relevant upstream license and notice; the preparation command checks the exact base and fails on incompatible changes.
+Source locations and commits live in [sources.lock.json](../sources.lock.json). Model and simulation dependencies are downloaded into ignored working directories. The operator implementations used at runtime are owned under `coexecution/kernels/`, with explicit origin revisions, file hashes and retained notices. CUTLASS has an official Git submodule as its reproducible default; compatible environment installations are also supported. GR00T corrections remain patches against its pinned model source; kernel updates modify the owned implementation directly.
 
 The official release focuses on xArm6 + XHand deployment and GR00T training. Our LIBERO experiments and reconstructed Leap data therefore require separate validation; they are not the authors' original experiment assets.
 
 ## Low-bit backend reference / 低比特量化参考实现
 
-The optional `robotics-kernels` component pins
-[Speedup Paradox](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/tree/239b4a3ef2268048571c9f508ad5700f98398c2f)
-to `239b4a3ef2268048571c9f508ad5700f98398c2f`. Fetch it with
-`python tools/prepare_sources.py --component robotics-kernels`; the existing
-preparation tool verifies the revision and leaves a mismatched checkout untouched.
-It has no local patches and remains in ignored
-`third_party/robotics-the-speedup-paradox/`.
+The `robotics-kernels` origin is [Speedup Paradox](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/tree/239b4a3ef2268048571c9f508ad5700f98398c2f)
+at `239b4a3ef2268048571c9f508ad5700f98398c2f`. The selected integer/common
+runtime, CUDA GEMMs and Thor FP8/FP4 kernels now live in
+[coexecution/kernels](../coexecution/kernels/). Their source manifest distinguishes
+original upstream bytes from repository adaptations and records the default
+CUTLASS dependency. The preparation command
+`python tools/prepare_sources.py --component robotics-kernels` verifies these
+owned files and records the actual selected CUTLASS source; it does not fetch an
+external runtime checkout, initialize the submodule, or apply patches.
 
-GR00T-specific bindings, reversible installation and the local integer CUDA
-dispatch wrapper live in this repository. INT4/INT8 GEMM, integer
-weight/activation packing, modulation packing and the reference graph utility
-remain imports from that external source. The Thor adapter calls the same pinned
-checkout's `blackwell.fp8_linear` and `blackwell.fp4_linear` CUTLASS operators,
-using independent floating packed formats and dispatch choices.
+CUTLASS defaults to [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) at
+`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa`, the same revision previously recorded
+for the copied headers. piR2 tracks this default Git link at
+`coexecution/kernels/vendor/cutlass`, together with dependency metadata, rather
+than tracking each upstream header as a piR2 file. The original
+[CUTLASS license](https://github.com/NVIDIA/cutlass/blob/982748aa7356fa838c2ea4994ddcb0b2a4b4cefa/LICENSE.txt)
+and file-specific notices remain with the submodule. Actual piR2 CUDA operators
+remain local files outside that submodule.
 
-The local Triton producers in `coexecution/floating_packing.py` implement FP8
-activation packing and BF16 SwiGLU, normalization, modulation and residual
-boundaries that emit FP8/FP4 inputs. `coexecution/floating_connections.py` binds
-the normalization and residual producers to DiT. These producers follow the
-pinned floating encodings and scale layouts; they do not use integer packed
-buffers or replace the external floating GEMM. The dependency remains unmodified.
+Initialize the default checkout with
+`git submodule update --init --recursive coexecution/kernels/vendor/cutlass`.
+Authors can alternatively set `CUTLASS_ROOT=/path/to/cutlass` for a compatible
+Git checkout or complete header installation, or select a compatible local
+submodule revision. Required `include/` and `tools/util/include/` structure and
+kernel/toolchain APIs must be available; arbitrary versions are not guaranteed
+to work. Actual Git revisions are recorded when available, and a different SHA
+alone is not rejected. Existing Git clones can also be used as optional download
+caches through `--reference` and `--dissociate`.
 
-The bundled CUTLASS snapshot stays inside the dependency with its original
-license and hash manifest. Attribution for the integer and floating paths is
-recorded in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). See
-[integer environment setup](environment.md#optional-gr00t-fusion-and-integer-inference)
-and [Thor floating environment setup](environment.md#optional-thor-floating-inference)
-for their separate build and runtime requirements.
+After pulling or switching piR2 branches, use the update command when selecting
+that branch's recorded default. Preserve intentional local version choices;
+routine default setup does not need `--remote`. Keep personal submodule version
+changes out of unrelated commits. Changing the project's default CUTLASS pin
+remains a separate reviewed change. See the
+[setup choices](environment.md#cutlass-submodule).
+
+[PR #21](https://github.com/Ther-nullptr/piR2/pull/21)'s two biased M=41 FP4
+Swap-AB configurations are implemented directly in the owned FP4 CUDA source.
+The `--fp4-swap-ab` flag and exact-shape fallback remain available; the unified
+operator profile also accepts `floating_gemm=swap_ab`. No external repository
+patch or prebuilt-library path is needed. This relocation does not establish new
+hardware performance or closed-loop quality.
+
+The model adapters and floating Triton producers remain in
+`coexecution/optimization/`, separate from hardware kernels. Integer and floating
+formats retain distinct contracts. Source revisions and notices are recorded in
+[sources.lock.json](../sources.lock.json) and
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). See
+[integer setup](environment.md#optional-gr00t-fusion-and-integer-inference) and
+[Thor setup](environment.md#optional-thor-floating-inference) for toolchain and
+hardware requirements.
 
 这里复用参考实现的量化计算路径，不把它描述为新量化算法，也不将参考项目的任务成功率
 视为 GR00T 或 πR² 的质量结论。当前接入范围为标准 Flow 及串行 πR²；真实动作头的

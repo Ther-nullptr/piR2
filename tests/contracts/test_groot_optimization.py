@@ -31,6 +31,19 @@ def test_default_does_not_import_gpu_modules_or_touch_policy():
     assert set(sys.modules) == before
 
 
+def test_fp4_swap_ab_is_opt_in_and_precision_specific():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(["--inference-precision", "fp4", "--fp4-swap-ab"])
+    )
+    assert config.fp4_swap_ab
+    assert not OptimizationConfig(precision="fp4").fp4_swap_ab
+    for precision in ("bf16", "fp8", "w8a8", "w4a4"):
+        with pytest.raises(ValueError, match="Swap-AB requires precision=fp4"):
+            OptimizationConfig(precision=precision, fp4_swap_ab=True)
+
+
 @pytest.mark.parametrize("precision", ["fp8", "fp4"])
 def test_floating_precision_is_opt_in_and_accepts_serial_graph(precision):
     parser = argparse.ArgumentParser()
@@ -732,13 +745,31 @@ def test_static_vlm_installs_after_fixed_precision_before_outer_boundary(
     ]
 
 
-def test_static_vlm_preserves_the_installed_fused_vision_rope(
-    runtime_interface, monkeypatch
+@pytest.mark.parametrize(
+    "mode", ["vision_rope", "text_rope", "rope", "rmsnorm", "rope_rms", "all"]
+)
+@pytest.mark.parametrize("implementation", [None, "reference", "native"])
+def test_static_vlm_preserves_the_selected_vision_rope(
+    runtime_interface, monkeypatch, tmp_path, mode, implementation
 ):
     events = runtime_interface.events
+    profile = None
+    if implementation is not None:
+        data = {
+            "architecture": "sm_89",
+            "precision": "bf16",
+            "implementations": {"vision_rope": implementation},
+        }
+        profile = tmp_path / "operators.json"
+        profile.write_text(json.dumps(data))
+        monkeypatch.setattr(
+            "coexecution.optimization.session.preflight_backend",
+            lambda *args: {"operator_profile": data},
+        )
 
     class Fusion:
-        def __init__(self, *args):
+        def __init__(self, *args, implementations):
+            self.implementations = implementations
             self.vision = lambda *values: values
             events.append("created fusion")
 
@@ -767,15 +798,32 @@ def test_static_vlm_preserves_the_installed_fused_vision_rope(
         SimpleNamespace(PointwiseFusion=Pointwise),
     )
     with GrootOptimizations(
-        runtime_interface.policy, OptimizationConfig(fusion=True, static_vlm=True)
+        runtime_interface.policy,
+        OptimizationConfig(
+            fusion=True, fusion_mode=mode, operator_profile=profile, static_vlm=True
+        ),
     ) as session:
-        assert session.static_vlm.vision_rope is session.fusion.vision
-        assert events.index("set pointwise dit") < events.index("entered static")
+        expected = (
+            session.fusion.vision
+            if mode in ("vision_rope", "rope", "rope_rms", "all")
+            and implementation != "reference"
+            else None
+        )
+        assert session.static_vlm.vision_rope is expected
+        if mode == "all":
+            assert events.index("set pointwise dit") < events.index("entered static")
+        else:
+            assert "created pointwise" not in events
         fusion = session.fusion
         session.set_runtime(vlm_graph=True)
-        assert (
-            session.fusion is fusion and session.static_vlm.vision_rope is fusion.vision
-        )
+        assert session.fusion is fusion
+        assert session.static_vlm.vision_rope is expected
+        assert session.config.fusion_mode == mode
+        selection = session.evidence()["operator_selection"]
+        if implementation is None:
+            assert selection is None
+        else:
+            assert selection["implementations"] == {"vision_rope": implementation}
         assert events.count("created fusion") == 1
 
 

@@ -1,0 +1,348 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+    "revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+    "license_note": "Upstream-owned integer/common code has no selected project-wide license; retain UPSTREAM_NOTICE.txt. Blackwell retains MIT HAN Lab license; CUTLASS retains BSD-3-Clause/file notices."
+  },
+  "files": {
+    "UPSTREAM_NOTICE.txt": {
+      "origin": "pir2-project",
+      "sha256": "40eda68bc45a688083d36a6cfc6da0f445f4935fbb8dd769c69bcc4f5f180b97"
+    },
+    "__init__.py": {
+      "origin": "pir2-project",
+      "sha256": "ac75ec9230475fb30db053dd8c166cd1faaa75ef8ade055f8aceea184e726a29"
+    },
+    "ampere_ada/__init__.py": {
+      "origin": "pir2-project",
+      "sha256": "4143aece1ffda6aa46076df65ce148e6dffb8f4b9d051540966f908a3acac359"
+    },
+    "ampere_ada/_candidate_support.py": {
+      "origin": "pir2-project",
+      "sha256": "3e06d72a938d71d2af3ca1333fdb8a6fbc43f186ef3906af13f54f12f0340cf0"
+    },
+    "ampere_ada/build.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/ampere_ada/build.py",
+      "origin_sha256": "62dac03287ecb43c6b9fdd577f2128cbd98921936cfc0688d967f641266af7ac",
+      "sha256": "6d8a9609f39fe28c212c955bbae3a5fd63f1a4502ddffabfad42ca59337d6392",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+    },
+    "ampere_ada/csrc/int4_gemv.cu": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/csrc/int4_gemv.cu",
+      "origin_sha256": "4caa1ce174a557b8b7add4182b0cb07576f77e74a327910912cf0599af410686",
+      "sha256": "4cd42591644849f7c3bb0615d3afb973617d92ed9d2a20be4d1e6cb0f6c78809",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/csrc/int4_small_m.cu": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/csrc/int4_small_m.cu",
+      "origin_sha256": "7362df32d4ee123ee17feaa842c302ef2b0488043212aeeb7d0eed5ab86fd66a",
+      "sha256": "56718a2fa2c8747034c02f1c386cb6dd63798bb01db51e49e2541cf4faa54aaa",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/csrc/integer_dispatch.cu": {
+      "origin": "pir2-main",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "517f5189e3075c2b28a164f4b788bea387bfa4b2",
+      "origin_path": "coexecution/csrc/integer_dispatch.cu",
+      "origin_sha256": "c38999b93b6183906e1d446b30ab3dfc5aeffa51546b42b3baf7012c868b69e4",
+      "sha256": "c6f360b7669896af469befdb9a5e4621dc21a85b8e0725ec9be4b8f9db18327d",
+      "adaptation": "Moved under owned kernels; registration and integer dispatch use piR2 namespaces."
+    },
+    "ampere_ada/csrc/integer_epilogue.cu": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/csrc/integer_epilogue.cu",
+      "origin_sha256": "744bd1061ac75a3097c0c5f86587c5487e0b3b16de22b5fc60f4ecde6811d93f",
+      "sha256": "744bd1061ac75a3097c0c5f86587c5487e0b3b16de22b5fc60f4ecde6811d93f",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/csrc/integer_gemm.cu": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/ampere_ada/csrc/integer_gemm.cu",
+      "origin_sha256": "9b59140c5e798cf9d725fab0eb0c99c6fa3a68541415a8f63c2c87ecea714fea",
+      "sha256": "78689a96089653d3cf2f9fabb1fa64eeb5bb7ee835b7d3316297c7ef884a431f",
+      "adaptation": "Operator registration namespace renamed to pir2; CUDA algorithm and formatting retained."
+    },
+    "ampere_ada/csrc/integer_split_k.cu": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/csrc/integer_split_k.cu",
+      "origin_sha256": "197aa5d521fb06cbff1a17326bdf47637324aa506a46ef4b9e1584960a1f73c3",
+      "sha256": "197aa5d521fb06cbff1a17326bdf47637324aa506a46ef4b9e1584960a1f73c3",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/csrc/layernorm_pack.cu": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/csrc/layernorm_pack.cu",
+      "origin_sha256": "723e6e86b9507445f05abb550e69bc393ba9a88acbd2cf16089591771562ec66",
+      "sha256": "45b2f1d1172cd9e6b24c4a71b8f2991e7332a3697b0134c86cbb159b1f30ec3c",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/csrc/rms_statistics.cu": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/csrc/rms_statistics.cu",
+      "origin_sha256": "89263ca8761deaaee520f81653f7a8c581f927c978b93be10c2aab048d0bf961",
+      "sha256": "89263ca8761deaaee520f81653f7a8c581f927c978b93be10c2aab048d0bf961",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/epilogue.py": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/quantization_epilogue.py",
+      "origin_sha256": "8ce4100405e7a21c554c337f33781074fd7aca902f7756df419e34a96977b755",
+      "sha256": "25b676d0315864505922404386e3ff7c0362d7a34676e1899c45eec4b034cd78",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/int4_gemv.py": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/quantization_gemv.py",
+      "origin_sha256": "6cfe26b59b6eb89f6b2784696b4d38a2e345ad225dc7559b4ec92c353f5c4653",
+      "sha256": "95abfd3d572fc71aa0b878a5d1bd1d187b360b25f9d3e8af73e9b11e3b3568e6",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/int4_small_m.py": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/quantization_small_m.py",
+      "origin_sha256": "1dd2de9412a1466244ecc172cd8de9c7cb27d5e24d291f8dd04be0d31abf3521",
+      "sha256": "8a68fff093275854475375543fd5ad422e244a691c6ec241a8a96c12a88bd163",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/integer.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/ampere_ada/integer.py",
+      "origin_sha256": "bbf45987d8098e7e5289db6e2086d1ca322b08b3a928095bcda4a91d0573c5ce",
+      "sha256": "d8de21e90077230c8260a036dfc35f1e993c26946256fe5aa052154d78e5c326",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+    },
+    "ampere_ada/modulation.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/ampere_ada/modulation.py",
+      "origin_sha256": "86a3cadd90dc57fbef8410ddf7939bb84c39ebce3c48ce781db4cfce483009d9",
+      "sha256": "bf8a20b0cc2a84d229aadfb7ad7d85dc373421d0340f8419ed96dcce5b731385",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+    },
+    "ampere_ada/norm.py": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/quantization_norm.py",
+      "origin_sha256": "ee1f30a8bf130024a091b4389861c82cc46d526d3b4a0682d13834dbfc6279f5",
+      "sha256": "3c5dd63b9b2a3f2dc5d7276ef95c5d3841dbc178df5244fd1e65c1d534b7c785",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/producers.py": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/quantization_producers.py",
+      "origin_sha256": "31512d4fd51073442b6c081ced5ebabfe88a7ff33ed95bfe182eb6d428571657",
+      "sha256": "e86f94b1014eff6d18beb3f5fda7327b3458c9e452b8f79304d9973b1d81a82b",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/rms_statistics.py": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/rms_statistics.py",
+      "origin_sha256": "ccb71d80367f6625dd112207cdc7045ad3c7b3c0cebf9f0a13792e674e5b3a1e",
+      "sha256": "c3aef9190d872d38b09bb4a9b081c69a6c2a17c473dd9faecae5db04589ddd1d",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "ampere_ada/split_k.py": {
+      "origin": "pir2-integrated-fastpath",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "6f64bbe0c71d6c73c8b0e00964b037e69ae92abf",
+      "origin_path": "coexecution/quantization_split_k.py",
+      "origin_sha256": "beb12328b3029759df27e9c7adbc7f1b06caf0830de72cafbea024e0092182f1",
+      "sha256": "d9e8c3477d760b22f8970be45cac249f7208be2f41ca9250bad0e26b1263f681",
+      "adaptation": "Owned imports/source paths, shared Ada guard, source fingerprint updates, candidate-only selection, formatting."
+    },
+    "blackwell/LICENSE": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/LICENSE",
+      "origin_sha256": "e539b34a7a9b6bb05e543d9bedb1768b3991c1ea9557f972963be0a64ab083b7",
+      "sha256": "e539b34a7a9b6bb05e543d9bedb1768b3991c1ea9557f972963be0a64ab083b7",
+      "adaptation": "Unmodified source/license/provenance snapshot."
+    },
+    "blackwell/UPSTREAM_PROVENANCE.json": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/PROVENANCE.json",
+      "origin_sha256": "fc6845f15e25d467f4ffbe282e6b5b096ab2c48c0a5fc97800337f1523fca510",
+      "sha256": "fc6845f15e25d467f4ffbe282e6b5b096ab2c48c0a5fc97800337f1523fca510",
+      "adaptation": "Unmodified source/license/provenance snapshot."
+    },
+    "blackwell/__init__.py": {
+      "origin": "pir2-project",
+      "sha256": "18efb3d8d49ccf44e9c38b53c66452d39639e3e69f0221740e513ac8fad517e9"
+    },
+    "blackwell/csrc/fp4_cutlass_linear.cu": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/csrc/fp4_cutlass_linear.cu",
+      "origin_sha256": "57a8f0aef04a8889e9698c1ba32618ec2fe1b1d80c9303ec07fbc4013f03fb42",
+      "sha256": "62e489ad470dfc0ccd76968b9947389d9d589fe872f05a7054743c6cc71d4097",
+      "adaptation": "Owned namespace; PR #21 FP4 Swap-AB integrated directly, with input alignment and inference guards.",
+      "integrated_change": {
+        "url": "https://github.com/Ther-nullptr/piR2/pull/21",
+        "revision": "4147186b973fb85b32045208b9ba4028342ceacb",
+        "original_patch_path": "patches/robotics-thor-fp4-swap-ab.patch"
+      }
+    },
+    "blackwell/csrc/fp8_cutlass_linear.cu": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/csrc/fp8_cutlass_linear.cu",
+      "origin_sha256": "21594f9a5bb8d38523b7e92eb9a9c486d42f10301b3668a20c40afdfdd819982",
+      "sha256": "0e51eb551e4f84471bb84a7bd65082f3cc678f4ffe95c1629237cc5e53ff1a7d",
+      "adaptation": "Operator registration namespace renamed to pir2; CUDA algorithm and formatting retained."
+    },
+    "blackwell/csrc/sampling_bf16.cuh": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/csrc/sampling_bf16.cuh",
+      "origin_sha256": "3c23f625eb05cc5499286e2277e2daa74135f42156d0c9cec49fb3c777d1a231",
+      "sha256": "3c23f625eb05cc5499286e2277e2daa74135f42156d0c9cec49fb3c777d1a231",
+      "adaptation": "Unmodified source/license/provenance snapshot."
+    },
+    "blackwell/extension_loader.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/extension_loader.py",
+      "origin_sha256": "808dd31ef6f1f76b3a752d00662c6da23a3a5caf3a644cc3e27afd83896379ce",
+      "sha256": "9922a722444181fa3a0c7ed375d12c1c9d9218256c58b7e9ab3f1514a98f5b3c",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere. Environment defaults are strings before the unchanged integer conversion."
+    },
+    "blackwell/fp4_linear.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/fp4_linear.py",
+      "origin_sha256": "d447a2427b5b494593ffb5a8bb63a91110263dbca5ae8c5f14cfb597045c7b3f",
+      "sha256": "5572192413f6cd4071de49c948adc10ac0d0c2f572c1a7da588176a50858552d",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+    },
+    "blackwell/fp8_linear.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/blackwell/fp8_linear.py",
+      "origin_sha256": "4095f3375168638d1f56cabddb540d195137b0035414a873b4ddb0df5661306d",
+      "sha256": "2f5939db89324c0c4d71d4c40ce527ba352a5bedcadc4ec6295c5e936a4338f4",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+    },
+    "build.py": {
+      "origin": "pir2-project",
+      "sha256": "e249ca8ca13d102b5ce0a630389610e4d054b4c9e807f499323348a544f1b096"
+    },
+    "common/__init__.py": {
+      "origin": "pir2-project",
+      "sha256": "bcd91ec6cc32912ba8f424297819add0e7ca19a7ff8192d6101a9b3745c4cd41"
+    },
+    "common/csrc/adaln_modulation.cu": {
+      "origin": "pir2-main",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "517f5189e3075c2b28a164f4b788bea387bfa4b2",
+      "origin_path": "coexecution/csrc/adaln_modulation.cu",
+      "origin_sha256": "be0ad2dfd95db899334f5cd41ee0ded3f940ade845aa68241b776e9c931fbebd",
+      "sha256": "be0ad2dfd95db899334f5cd41ee0ded3f940ade845aa68241b776e9c931fbebd",
+      "adaptation": "Moved under owned kernels; registration and integer dispatch use piR2 namespaces."
+    },
+    "common/csrc/fusion_torch.cu": {
+      "origin": "pir2-main",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "517f5189e3075c2b28a164f4b788bea387bfa4b2",
+      "origin_path": "coexecution/csrc/fusion_torch.cu",
+      "origin_sha256": "e55e0c8830548a96587f67f3cd5ecc0c496232dbcb7c354fdac3be9847ef4bbd",
+      "sha256": "c074c7efbcb2dbc07c95c42a5f0c9c8241a6ba5599fda1f259b60ae490941961",
+      "adaptation": "Moved under owned kernels; registration and integer dispatch use piR2 namespaces."
+    },
+    "common/csrc/vision_rope.cu": {
+      "origin": "pir2-main",
+      "origin_url": "https://github.com/Ther-nullptr/piR2",
+      "origin_revision": "517f5189e3075c2b28a164f4b788bea387bfa4b2",
+      "origin_path": "coexecution/csrc/vision_rope.cu",
+      "origin_sha256": "be1421b63b6f0b2a44090676134af1fcbf7a5f01ca8540b1e62460cbfaeca3f0",
+      "sha256": "be1421b63b6f0b2a44090676134af1fcbf7a5f01ca8540b1e62460cbfaeca3f0",
+      "adaptation": "Moved under owned kernels; registration and integer dispatch use piR2 namespaces."
+    },
+    "common/fused.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/common/fused.py",
+      "origin_sha256": "d20a76b4b84b5c547f32f22afcf20a20371fdf2ffa05d23ba2189aeefddc77bd",
+      "sha256": "d20a76b4b84b5c547f32f22afcf20a20371fdf2ffa05d23ba2189aeefddc77bd",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+    },
+    "common/graph.py": {
+      "origin": "robotics-the-speedup-paradox",
+      "origin_url": "https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox",
+      "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
+      "origin_path": "src/robotics_kernels/common/graph.py",
+      "origin_sha256": "10fa00dec9e55510bf0528a0318757406a3606ea08c98a1eb2c203355f3f7d6c",
+      "sha256": "10fa00dec9e55510bf0528a0318757406a3606ea08c98a1eb2c203355f3f7d6c",
+      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+    },
+    "common/source_identity.cpp": {
+      "origin": "pir2-project",
+      "sha256": "83eb39d9bdb842ec34b96cc924c0350fa318eb0a1d5b4a28e9b4b7af0e775fe4"
+    },
+    "sources.py": {
+      "origin": "pir2-project",
+      "sha256": "8865b394b260db4576933787d6f7365eea1ed7038b2b0b94b19237d0087839b2"
+    }
+  },
+  "runtime_dependencies": [
+    "PyTorch headers and runtime",
+    "CUDA Toolkit",
+    "Triton"
+  ],
+  "submodules": [
+    {
+      "name": "cutlass",
+      "path": "vendor/cutlass",
+      "url": "https://github.com/NVIDIA/cutlass.git",
+      "revision": "982748aa7356fa838c2ea4994ddcb0b2a4b4cefa",
+      "scope": [
+        "include",
+        "tools/util/include",
+        "LICENSE.txt"
+      ]
+    }
+  ]
+}

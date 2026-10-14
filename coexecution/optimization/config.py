@@ -21,6 +21,7 @@ class OptimizationConfig:
     norm_modulation_quant: bool = False
     residual_norm_quant: bool = False
     fp8_fast_quant: bool = False
+    fp4_swap_ab: bool = False
     fp_shared_inputs: bool = False
     fp_grouped: bool = False
     fp_swiglu: bool = False
@@ -31,16 +32,39 @@ class OptimizationConfig:
     vlm_graph: bool = False
     image_array_preparation: bool = False
     compiled_host_guards: bool = False
+    fusion_mode: str = "all"
+    operator_profile: Path | None = None
 
     def __post_init__(self):
         if self.action_graph and self.precision not in ("bf16", "w8a8", "w4a4"):
             raise ValueError("Action graph requires BF16, W8A8 or W4A4")
         if self.vlm_graph and not self.static_vlm:
             raise ValueError("VLM graph requires static_vlm")
+        if self.fusion_mode not in (
+            "vision_rope",
+            "text_rope",
+            "rope",
+            "rmsnorm",
+            "rope_rms",
+            "all",
+        ):
+            raise ValueError("Unknown operator fusion mode")
+        if self.fusion_mode != "all" and not self.fusion:
+            raise ValueError("Selective mode requires operator fusion")
+        if self.fusion_mode != "all" and (
+            self.group_conditioning or self.norm_modulation_quant
+        ):
+            raise ValueError("DiT producer options require all operator fusion")
+        if self.operator_profile is not None and not (
+            self.fusion or self.precision != "bf16"
+        ):
+            raise ValueError("Operator profile requires fusion or low-bit precision")
         if self.precision not in ("bf16", "w8a8", "w4a4", "fp8", "fp4"):
             raise ValueError("Precision must be bf16, w8a8, w4a4, fp8 or fp4")
         if self.fp8_fast_quant and self.precision != "fp8":
             raise ValueError("Fast FP8 quantization requires precision=fp8")
+        if self.fp4_swap_ab and self.precision != "fp4":
+            raise ValueError("FP4 Swap-AB requires precision=fp4")
         if self.fp_shared_inputs and self.precision not in ("fp8", "fp4"):
             raise ValueError("Shared floating inputs require precision=fp8 or fp4")
         if (self.fp_grouped or self.fp_swiglu) and self.precision not in ("fp8", "fp4"):
@@ -114,6 +138,12 @@ def add_optimization_arguments(parser):
         default="bf16",
     )
     parser.add_argument("--operator-fusion", action="store_true")
+    parser.add_argument(
+        "--operator-fusion-mode",
+        choices=["vision_rope", "text_rope", "rope", "rmsnorm", "rope_rms", "all"],
+        default="all",
+    )
+    parser.add_argument("--operator-profile", type=Path)
     parser.add_argument("--dit-cuda-graph", action="store_true")
     parser.add_argument("--action-cuda-graph", action="store_true")
     parser.add_argument(
@@ -138,6 +168,7 @@ def add_optimization_arguments(parser):
     parser.add_argument("--norm-modulation-quant", action="store_true")
     parser.add_argument("--residual-norm-quant", action="store_true")
     parser.add_argument("--fp8-fast-quant", action="store_true")
+    parser.add_argument("--fp4-swap-ab", action="store_true")
     parser.add_argument("--fp-shared-inputs", action="store_true")
     parser.add_argument("--fp-grouped", action="store_true")
     parser.add_argument("--fp-swiglu", action="store_true")
@@ -147,6 +178,8 @@ def optimization_config(args):
     return OptimizationConfig(
         precision=args.inference_precision,
         fusion=args.operator_fusion,
+        fusion_mode=args.operator_fusion_mode,
+        operator_profile=args.operator_profile,
         dit_graph=args.dit_cuda_graph,
         action_graph=args.action_cuda_graph,
         scope=args.quantization_scope,
@@ -167,6 +200,7 @@ def optimization_config(args):
         norm_modulation_quant=args.norm_modulation_quant,
         residual_norm_quant=args.residual_norm_quant,
         fp8_fast_quant=args.fp8_fast_quant,
+        fp4_swap_ab=args.fp4_swap_ab,
         fp_shared_inputs=args.fp_shared_inputs,
         fp_grouped=args.fp_grouped,
         fp_swiglu=args.fp_swiglu,

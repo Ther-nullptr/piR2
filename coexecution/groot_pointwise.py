@@ -61,6 +61,12 @@ class PreparedAttention:
     def __call__(
         self, attn, x, encoder_hidden_states=None, attention_mask=None, **kwargs
     ):
+        y = self.attend(attn, x, encoder_hidden_states, attention_mask, **kwargs)
+        return attn.to_out[1](attn.to_out[0](y))
+
+    def attend(
+        self, attn, x, encoder_hidden_states=None, attention_mask=None, **kwargs
+    ):
         context = x if encoder_hidden_states is None else encoder_hidden_states
         if (
             len(x.shape) != 3
@@ -83,8 +89,7 @@ class PreparedAttention:
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-        y = y.transpose(1, 2).reshape(b, -1, h * d)
-        return attn.to_out[1](attn.to_out[0](y))
+        return y.transpose(1, 2).reshape(b, -1, h * d)
 
 
 class PointwiseFusion:
@@ -98,6 +103,9 @@ class PointwiseFusion:
         ]
         self.validation = False
         self.calls = Counter()
+        self.final_norm_prepare = None
+        self.final_projection_prepare = None
+        self.context_quantization_prepare = None
         device = next(policy.model.parameters()).device
         values = (
             torch.arange(65536, device=device, dtype=torch.int32)
@@ -221,6 +229,8 @@ class PointwiseFusion:
         activated, im, nm = self.prepare(temb, image_mask, backbone_attention_mask)
         x = hidden_states.contiguous()
         context = encoder_hidden_states.contiguous()
+        if self.context_quantization_prepare is not None:
+            context = self.context_quantization_prepare(context)
         history = [x]
         for i, block in enumerate(mod.transformer_blocks):
             cross = i % 2 == 0
@@ -235,7 +245,15 @@ class PointwiseFusion:
         shift, scale = mod.proj_out_1(activated).chunk(2, dim=-1)
         if scale.ndim == 2:
             scale, shift = scale[:, None], shift[:, None]
-        x = mod.norm_out(x) * (1 + scale) + shift
+        if self.final_norm_prepare is not None:
+            x = self.final_norm_prepare(x, scale, shift)
+        else:
+            normalized = mod.norm_out(x)
+            x = (
+                normalized * (1 + scale) + shift
+                if self.final_projection_prepare is None
+                else self.final_projection_prepare(normalized, scale, shift)
+            )
         result = mod.proj_out_2(x)
         return (result, history) if return_all_hidden_states else result
 

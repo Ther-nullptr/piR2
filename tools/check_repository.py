@@ -1,5 +1,6 @@
 """Reject generated assets, secrets, local paths and dangling documentation links."""
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -31,13 +32,26 @@ DOCUMENTS = {
 
 
 def main():
-    names = (
-        subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT)
+    entries = (
+        subprocess.check_output(["git", "ls-files", "--stage", "-z"], cwd=ROOT)
         .decode()
         .split("\0")
     )
+    files = []
+    for entry in filter(None, entries):
+        metadata, name = entry.split("\t", 1)
+        mode, revision, stage = metadata.split()
+        files.append((name, mode, revision, stage))
     errors = []
-    for name in filter(None, names):
+    cutlass = json.loads((ROOT / "sources.lock.json").read_text())["sources"]["cutlass"]
+    for name, mode, revision, stage in files:
+        if stage != "0":
+            errors.append(f"Unresolved Git index entry: {name}")
+            continue
+        if mode == "160000":
+            if name != cutlass["path"] or revision != cutlass["revision"]:
+                errors.append(f"Unrecorded or mismatched submodule pin: {name}")
+            continue
         path = ROOT / name
         if FORBIDDEN.intersection(path.relative_to(ROOT).parts):
             errors.append(f"Generated/dependency path: {name}")

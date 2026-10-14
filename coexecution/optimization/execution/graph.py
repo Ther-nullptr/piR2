@@ -2,8 +2,7 @@
 
 from collections import OrderedDict
 
-from robotics_kernels.common.graph import CudaGraphCall
-
+from coexecution.kernels.common.graph import CudaGraphCall
 from coexecution.optimization.execution.submission import cold_capture
 
 

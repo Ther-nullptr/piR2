@@ -9,12 +9,13 @@ from types import SimpleNamespace
 
 import torch
 import triton
-from robotics_kernels.ampere_ada.integer import (
+
+from coexecution.kernels.ampere_ada.integer import (
     IntegerLinear,
     PackedActivation,
     _prepare,
 )
-from robotics_kernels.common.fused import prepare_gelu
+from coexecution.kernels.common.fused import prepare_gelu
 
 _LAUNCHERS = {}
 

@@ -60,9 +60,9 @@ from types import ModuleType
 
 # Import-only sentinels: this contract must never execute a tensor or kernel.
 sys.modules["torch"] = ModuleType("torch")
-graph_dependency = ModuleType("robotics_kernels.common.graph")
+graph_dependency = ModuleType("coexecution.kernels.common.graph")
 graph_dependency.CudaGraphCall = object()
-sys.modules["robotics_kernels.common.graph"] = graph_dependency
+sys.modules["coexecution.kernels.common.graph"] = graph_dependency
 
 from coexecution.groot_graph import CudaGraphCall as legacy_call, DitGraphs as legacy_graph
 from coexecution.groot_projections import inventory as legacy_inventory

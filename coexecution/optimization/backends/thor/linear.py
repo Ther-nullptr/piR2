@@ -23,14 +23,21 @@ THOR_FP8_TACTICS = {
     (128, 4096, 4096, True): 6,
 }
 
+# Exact measured Thor signatures; no extrapolation to other sequence lengths.
+THOR_FP4_SWAP_AB_SHAPES = {(41, 256, 1536, True), (41, 1536, 1536, True)}
+
 
 class FloatingLinear(torch.nn.Module):
     """Explicit E4M3 or block-scaled E2M1 GEMM, with independent packed formats."""
 
-    def __init__(self, linear, name, precision="fp8", *, fast_fp8=False):
+    def __init__(
+        self, linear, name, precision="fp8", *, fast_fp8=False, fp4_swap_ab=False
+    ):
         super().__init__()
         if precision not in ("fp8", "fp4"):
             raise ValueError("Floating precision must be fp8 or fp4")
+        if fp4_swap_ab and precision != "fp4":
+            raise ValueError("FP4 Swap-AB requires precision=fp4")
         alignment = 16 if precision == "fp8" else 32
         if (
             not linear.weight.is_cuda
@@ -43,19 +50,26 @@ class FloatingLinear(torch.nn.Module):
             raise ValueError("The experimental FP adapter is validated for Thor SM110")
         self.precision = precision
         self.fast_fp8 = fast_fp8
+        self.fp4_swap_ab = fp4_swap_ab
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         if precision == "fp8":
-            from robotics_kernels.blackwell.fp8_linear import require_fp8_backend
+            from coexecution.kernels.blackwell.fp8_linear import require_fp8_backend
 
             require_fp8_backend(linear.weight.device)
-            self.ops = torch.ops.robotics_cutlass_fp8
+            self.ops = torch.ops.pir2_cutlass_fp8
             pack = self.ops.pack_linear_weight
         else:
-            from robotics_kernels.blackwell.fp4_linear import require_fp4_backend
+            from coexecution.kernels.blackwell.fp4_linear import require_fp4_backend
 
             require_fp4_backend(linear.weight.device)
-            self.ops = torch.ops.robotics_cutlass_fp4
+            self.ops = torch.ops.pir2_cutlass_fp4
+            if fp4_swap_ab and not hasattr(
+                self.ops, "linear_forward_packed_gemm_bf16_swap_ab"
+            ):
+                raise RuntimeError(
+                    "FP4 Swap-AB requires the owned FP4 backend; rebuild it"
+                )
             pack = self.ops.pack_linear_weight_gemm_bf16
         weight, scale, metadata = pack(
             linear.weight.detach().contiguous(), "pir2", name
@@ -114,6 +128,19 @@ class FloatingLinear(torch.nn.Module):
                 self.weight_scale,
                 self.bias,
                 THOR_FP8_TACTICS.get(signature, 2),
+            )
+        elif (
+            self.fp4_swap_ab
+            and (
+                packed.shape[0],
+                self.in_features,
+                self.out_features,
+                self.bias is not None,
+            )
+            in THOR_FP4_SWAP_AB_SHAPES
+        ):
+            result = self.ops.linear_forward_packed_gemm_bf16_swap_ab(
+                packed, scale, self.packed_weight, self.weight_scale, self.bias
             )
         else:
             # The default fuses bias for M>1. Explicit nonzero tactics omit
@@ -181,7 +208,9 @@ class FloatingProjectionGroup:
     therefore need separate numerical validation, especially for FP8.
     """
 
-    def __init__(self, modules, name, precision, fast_fp8, contiguous=False):
+    def __init__(
+        self, modules, name, precision, fast_fp8, contiguous=False, *, fp4_swap_ab=False
+    ):
         self.sizes = [m.out_features for m in modules]
         merged = torch.nn.Linear(
             modules[0].in_features,
@@ -205,7 +234,9 @@ class FloatingProjectionGroup:
                 ),
                 requires_grad=False,
             )
-        self.linear = FloatingLinear(merged, name, precision, fast_fp8=fast_fp8)
+        self.linear = FloatingLinear(
+            merged, name, precision, fast_fp8=fast_fp8, fp4_swap_ab=fp4_swap_ab
+        )
         self.contiguous = contiguous
         self.active, self.cache = False, None
 

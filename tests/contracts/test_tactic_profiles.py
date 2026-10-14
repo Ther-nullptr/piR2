@@ -8,7 +8,7 @@ import pytest
 from coexecution.optimization.tactics import apply_tactics, read_shape_tactics
 
 IDENTITY = {
-    "backend_id": "robotics_integer",
+    "backend_id": "pir2_integer",
     "backend_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
     "device_arch": "sm_89",
     "quant_format": "w8a8-symmetric-row-v1",
@@ -31,7 +31,7 @@ def test_matching_profile_keeps_exact_tactic(tmp_path):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("backend_id", "robotics_cutlass_fp8"),
+        ("backend_id", "pir2_cutlass_fp8"),
         ("backend_revision", "other"),
         ("device_arch", "sm_110"),
         ("quant_format", "fp8-e4m3-per-tensor-v1"),

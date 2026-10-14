@@ -13,13 +13,30 @@ This independently maintained repository studies **NVIDIA GR00T-N1.7-LIBERO** ta
 - Four-suite research targets are recorded in [the model-family manifest](configs/libero/model-family.json); the current implemented training/evaluation pipeline covers the complete Spatial suite.
 - [Leap reconstruction](simulation/README.md), SO100 profiling and browser teaching tools are auxiliary historical work, reported separately from the GR00T-LIBERO main line.
 - [Single-GPU execution tools](coexecution/README.md) support auxiliary SO100 replay profiling; their mechanisms require separate LIBERO validation before contributing main-line performance claims.
+- [LIBERO VLM/DiT contention profiling](docs/coexecution.md#libero-vlmdit-contention-profiling) compares isolated, concurrent, priority and cooperative execution with BF16/W8A8/W4A4, keeping response time, hardware counters and task quality distinct.
 - [Interactive timing tool](simulator/README.md) explains queueing and cache-age assumptions without predicting task success.
 
 Modules are introduced through focused pull requests. Model weights, datasets, environments and generated results are intentionally excluded from Git.
 
 ## Start / 开始
 
-Read [source provenance](docs/upstream.md), [environment boundaries](docs/environment.md) and [contribution rules](CONTRIBUTING.md). Fetch pinned upstream source only when needed:
+Read [source provenance](docs/upstream.md), [environment boundaries](docs/environment.md) and [contribution rules](CONTRIBUTING.md). New users can initialize the default official CUTLASS dependency with the clone:
+
+```bash
+git clone --recurse-submodules https://github.com/Ther-nullptr/piR2.git
+cd piR2
+```
+
+For an existing piR2 checkout using the default CUTLASS version, run
+`git submodule update --init --recursive coexecution/kernels/vendor/cutlass`
+after pulling or switching branches. The Git link records
+`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` as the reproducible default. Authors may
+instead set `CUTLASS_ROOT=/path/to/cutlass` to use an existing compatible full
+header tree, or keep a compatible local submodule revision; the exact SHA need
+not match. Actual CUDA operator implementations remain in this repository.
+[Setup instructions](docs/environment.md#cutlass-submodule) describe the required
+header structure, toolchain compatibility and optional Git object-cache reuse.
+Fetch the separately pinned model source when needed:
 
 ```bash
 python3 tools/prepare_sources.py --component groot

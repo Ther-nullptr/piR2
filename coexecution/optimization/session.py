@@ -32,6 +32,7 @@ class GrootOptimizations:
         self.runtime_stack = ExitStack()
         self.coverage = {}
         self.backend = {}
+        self.operator_profile = None
         self.boundary = None
         self.preparation = None
         self.tokenizer_cache = None
@@ -97,6 +98,19 @@ class GrootOptimizations:
         # or weight layouts. Dependency loading is allowed, patching is not.
         self.backend = preflight_backend(self.config, next(model.parameters()).device)
         self._bind_runtime_model(model)
+        if self.config.operator_profile is not None:
+            from coexecution.optimization.operators import OperatorProfile
+
+            data = self.backend["operator_profile"]
+            self.operator_profile = OperatorProfile(
+                data["architecture"],
+                data["precision"],
+                data["implementations"],
+                data.get("parameters", {}),
+            )
+        profile = self.operator_profile
+        implementations = {} if profile is None else dict(profile.implementations)
+        pointwise = None
 
         def clear_cache():
             pass
@@ -117,15 +131,21 @@ class GrootOptimizations:
             from coexecution.groot_fusion import NonGemmAdapters
             from coexecution.groot_pointwise import PointwiseFusion
 
-            fusion = NonGemmAdapters(self.policy, "native")
+            fusion = NonGemmAdapters(
+                self.policy,
+                "native" if self.config.fusion_mode == "all" else "triton",
+                implementations=implementations,
+            )
             self.fusion = fusion
             self.stack.callback(fusion.close)
-            fusion.set("all")
-            pointwise = PointwiseFusion(self.policy)
-            self.stack.callback(pointwise.close)
-            pointwise.set("dit")
+            fusion.set(self.config.fusion_mode)
+            if self.config.fusion_mode == "all":
+                pointwise = PointwiseFusion(self.policy)
+                self.stack.callback(pointwise.close)
+                pointwise.set("dit")
         if self.config.precision in ("fp8", "fp4"):
             from coexecution.optimization.groot.floating import FloatingProjections
+            from coexecution.optimization.installation import selected_fp4_swap_ab
 
             floating = FloatingProjections(
                 model,
@@ -133,6 +153,7 @@ class GrootOptimizations:
                 expanded=expanded,
                 precision=self.config.precision,
                 fast_fp8=self.config.fp8_fast_quant,
+                fp4_swap_ab=selected_fp4_swap_ab(self.config, profile),
                 shared_inputs=self.config.fp_shared_inputs,
                 grouped=self.config.fp_grouped,
                 swiglu=self.config.fp_swiglu,
@@ -158,15 +179,21 @@ class GrootOptimizations:
             from coexecution.optimization.groot.integer_connections import (
                 AdditionalConnections,
             )
+            from coexecution.optimization.installation import (
+                configure_integer_controller,
+                fuse_integer_modulation,
+                install_integer_adapters,
+            )
 
             controller = TransformerINT(
                 model,
                 executed,
-                native=True,
+                native=implementations.get("activation_pack", "native") == "native",
                 expanded=expanded,
                 condition_group=self.config.group_conditioning,
             )
             self.stack.callback(controller.close)
+            configure_integer_controller(controller, profile)
             extra = AdditionalConnections(self.policy, controller, categories)
             self.stack.callback(extra.close)
             apply_tactics(
@@ -176,7 +203,7 @@ class GrootOptimizations:
             extra.set(
                 self.config.precision,
                 expanded=expanded,
-                fuse=self.config.fusion,
+                fuse=fuse_integer_modulation(self.config, profile),
                 norm_quant=self.config.norm_modulation_quant,
                 residual_quant=self.config.residual_norm_quant,
             )
@@ -189,6 +216,9 @@ class GrootOptimizations:
                 "projection_groups": controller.groups,
                 "tactic_policy": "Exact runtime shape, then explicit site/group, then 0",
             }
+            self.coverage["operator_adapters"] = install_integer_adapters(
+                self, controller, pointwise, profile
+            )
             clear_cache = controller.clear_projection_cache
         # The larger graph owns the four DiT calls; nested capture is unsupported.
         if self.config.dit_graph and not self.config.action_graph:
@@ -296,7 +326,15 @@ class GrootOptimizations:
                 self.static_vlm = PolicyStaticS2(
                     self.policy,
                     cuda_graph=self.config.vlm_graph,
-                    vision_rope=None if self.fusion is None else self.fusion.vision,
+                    vision_rope=(
+                        self.fusion.vision
+                        if self.fusion is not None
+                        and self.config.fusion_mode
+                        in ("vision_rope", "rope", "rope_rms", "all")
+                        and self.fusion.implementations.get("vision_rope")
+                        != "reference"
+                        else None
+                    ),
                     guard_backend=self.guard_backend,
                 )
             self.runtime_stack.callback(self.static_vlm.close)
@@ -416,7 +454,13 @@ class GrootOptimizations:
 
     def evidence(self):
         config = asdict(self.config)
-        for key in ("coverage", "tactics", "group_tactics", "shape_tactics"):
+        for key in (
+            "coverage",
+            "tactics",
+            "group_tactics",
+            "shape_tactics",
+            "operator_profile",
+        ):
             path = config[key]
             config[key] = (
                 None
@@ -457,6 +501,11 @@ class GrootOptimizations:
                 None
                 if self.static_vlm is None or not self.config.static_vlm
                 else self.static_vlm.evidence()
+            ),
+            "operator_selection": (
+                None
+                if self.operator_profile is None
+                else self.operator_profile.to_dict()
             ),
             "scope": "Experimental serial inference; replay checks do not establish task quality",
         }

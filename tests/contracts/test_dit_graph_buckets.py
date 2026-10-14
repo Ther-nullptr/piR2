@@ -39,9 +39,9 @@ class MetadataGraph:
 
 @pytest.fixture
 def graph_module(monkeypatch):
-    provider = ModuleType("robotics_kernels.common.graph")
+    provider = ModuleType("coexecution.kernels.common.graph")
     provider.CudaGraphCall = MetadataGraph
-    monkeypatch.setitem(sys.modules, "robotics_kernels.common.graph", provider)
+    monkeypatch.setitem(sys.modules, "coexecution.kernels.common.graph", provider)
     module = importlib.import_module("coexecution.optimization.execution.graph")
     monkeypatch.setattr(module, "CudaGraphCall", MetadataGraph)
     return module

@@ -1,12 +1,10 @@
 """Reversible GR00T model installation for pinned integer projections."""
 
-from pathlib import Path
-
 import torch
 import torch.nn.functional as F
-from robotics_kernels.ampere_ada.integer import IntegerProjectionGroup
-from robotics_kernels.common.fused import prepare_gelu
 
+from coexecution.kernels.ampere_ada.integer import IntegerProjectionGroup
+from coexecution.kernels.common.fused import prepare_gelu
 from coexecution.optimization.backends.integer.linear import (
     PreparedLinear,
     prepare,
@@ -71,24 +69,15 @@ class TransformerINT:
                 )
                 self.grouped[bits].append((names, group))
         self.native = native
+        self.candidates = None
         if native:
-            from torch.utils.cpp_extension import load
+            from coexecution.kernels.build import build_extension
 
             assert all(
                 q.in_features <= 8192 and q.out_features % 8 == 0
                 for q in self.quant[8].values()
             )
-            load(
-                name="pir2_integer_dispatch",
-                sources=[
-                    str(
-                        Path(__file__).resolve().parents[2] / "csrc/integer_dispatch.cu"
-                    )
-                ],
-                extra_cuda_cflags=["-O3", "--fmad=false", "--ftz=false"],
-                is_python_module=False,
-                verbose=True,
-            )
+            build_extension("integer_dispatch")
             for bits in (8, 4):
                 models = list(self.quant[bits].values()) + [
                     g.linear for _, g in self.grouped[bits]
@@ -103,6 +92,10 @@ class TransformerINT:
         self.mode = "bf16"
 
     def dispatch(self, q, x, lut=None, up=None):
+        if self.candidates is not None:
+            result = self.candidates.dispatch(q, x, lut, up)
+            if result is not None:
+                return result
         if getattr(x, "_robotics_packed_input", False):
             return q.forward_packed(x.for_bits(q.bits))
         if self.native:
@@ -118,6 +111,29 @@ class TransformerINT:
             )
             return y[:, : q.out_features].reshape(*x.shape[:-1], q.out_features)
         return q.forward_packed(prepare(x, q.bits, lut, up))
+
+    def _pack_dispatch_input(self, q, x, lut=None, up=None):
+        if self.candidates is not None:
+            return self.candidates.pack_input(q, x, lut, up)
+        if getattr(x, "_robotics_packed_input", False):
+            return x.for_bits(q.bits)
+        return prepare(x, q.bits, lut, up)
+
+    def install_candidates(self, candidates):
+        self.candidates = candidates
+        if candidates.implementation == "reference":
+            return
+        for bits in (8, 4):
+            models = list(self.quant[bits].values()) + [
+                group.linear for _, group in self.grouped[bits]
+            ]
+            for q in models:
+                q.forward = lambda x, q=q: self.dispatch(q, x)
+                q.forward_gelu = lambda x, up=None, approximate="tanh", q=q: (
+                    self.dispatch(
+                        q, x, prepare_gelu(x.device, x.dtype, approximate), up
+                    )
+                )
 
     def clear_projection_cache(self):
         for groups in self.grouped.values():

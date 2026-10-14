@@ -144,7 +144,7 @@ def assert_equal(first, second):
 
 def assert_integer_trace(trace, bits):
     events = trace.events()
-    assert any(event.name == "robotics_integer::gemm_biasless" for event in events)
+    assert any(event.name == "pir2_integer::gemm_biasless" for event in events)
     names = [
         event.name.replace(" ", "")
         for event in events

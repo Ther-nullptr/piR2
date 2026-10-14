@@ -9,35 +9,33 @@ failures propagate; there is no automatic precision or backend fallback.
 import hashlib
 import importlib
 import importlib.metadata
-import json
-import subprocess
 from pathlib import Path
 
 BACKENDS = {
     "w8a8": {
-        "backend_id": "robotics_integer",
+        "backend_id": "pir2_integer",
         "quant_format": "w8a8-symmetric-row-v1",
         "architectures": None,
         "validated_architectures": ("sm_89",),
-        "module": "robotics_kernels.ampere_ada.integer",
+        "module": "coexecution.kernels.ampere_ada.integer",
         "loader": "load_integer_extension",
         "operators": ("gemm", "gemm_biasless"),
     },
     "w4a4": {
-        "backend_id": "robotics_integer",
+        "backend_id": "pir2_integer",
         "quant_format": "w4a4-symmetric-row-v1",
         "architectures": None,
         "validated_architectures": ("sm_89",),
-        "module": "robotics_kernels.ampere_ada.integer",
+        "module": "coexecution.kernels.ampere_ada.integer",
         "loader": "load_integer_extension",
         "operators": ("gemm", "gemm_biasless"),
     },
     "fp8": {
-        "backend_id": "robotics_cutlass_fp8",
+        "backend_id": "pir2_cutlass_fp8",
         "quant_format": "fp8-e4m3-per-tensor-v1",
         "architectures": ((11, 0),),
         "validated_architectures": ("sm_110",),
-        "module": "robotics_kernels.blackwell.fp8_linear",
+        "module": "coexecution.kernels.blackwell.fp8_linear",
         "loader": "require_fp8_backend",
         "operators": (
             "pack_linear_weight",
@@ -46,11 +44,11 @@ BACKENDS = {
         ),
     },
     "fp4": {
-        "backend_id": "robotics_cutlass_fp4",
+        "backend_id": "pir2_cutlass_fp4",
         "quant_format": "fp4-e2m1-block16-ue4m3-v1",
         "architectures": ((11, 0),),
         "validated_architectures": ("sm_110",),
-        "module": "robotics_kernels.blackwell.fp4_linear",
+        "module": "coexecution.kernels.blackwell.fp4_linear",
         "loader": "require_fp4_backend",
         "operators": (
             "pack_linear_weight_gemm_bf16",
@@ -70,76 +68,10 @@ def _sha256(path):
 
 
 def _source_identity(module):
-    """Record source evidence independently of the binary loaded into this process."""
-    pin = json.loads(
-        (Path(__file__).resolve().parents[2] / "sources.lock.json").read_text()
-    )["sources"]["robotics-kernels"]
-    result = {
-        "expected_revision": pin["revision"],
-        "url": pin["url"],
-        "revision": "unknown",
-        "dirty": "unknown",
-        "module_tracked": "unknown",
-        "module_sha256": "unknown",
-    }
-    filename = getattr(module, "__file__", None)
-    if filename is None:
-        return result
-    path = Path(filename).resolve()
-    try:
-        result["module_sha256"] = _sha256(path)
-        command = ["git", "-C", str(path.parent)]
-        repository = Path(
-            subprocess.check_output(
-                [*command, "rev-parse", "--show-toplevel"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-            ).strip()
-        ).resolve()
-        # Do not mistake a surrounding application checkout for the backend source.
-        if (
-            not path.relative_to(repository)
-            .as_posix()
-            .startswith("src/robotics_kernels/")
-        ):
-            return result
-        try:
-            subprocess.check_output(
-                [
-                    "git",
-                    "-C",
-                    str(repository),
-                    "ls-files",
-                    "--error-unmatch",
-                    "--",
-                    path.relative_to(repository).as_posix(),
-                ],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-            )
-        except subprocess.CalledProcessError:
-            result["module_tracked"] = False
-            return result
-        result["module_tracked"] = True
-        result["revision"] = subprocess.check_output(
-            [*command, "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-        result["dirty"] = bool(
-            subprocess.check_output(
-                [*command, "status", "--porcelain", "--untracked-files=all"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-            ).strip()
-        )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return result
+    """Record owned source identity separately from the loaded binary."""
+    from coexecution.kernels.sources import source_identity
+
+    return source_identity(module)
 
 
 def _loaded_libraries(torch):
@@ -204,6 +136,21 @@ def preflight_backend(config, device):
         raise ValueError(
             f"{precision} has no supported backend for SM{capability[0]}{capability[1]}"
         )
+    operator_profile = None
+    if getattr(config, "operator_profile", None) is not None:
+        from coexecution.optimization.installation import validate_selection
+        from coexecution.optimization.operators import (
+            read_operator_profile,
+            validate_profile,
+        )
+
+        operator_profile = read_operator_profile(config.operator_profile)
+        validate_profile(
+            operator_profile,
+            architecture=f"sm_{capability[0]}{capability[1]}",
+            precision=precision,
+        )
+        validate_selection(config, operator_profile)
     try:
         triton_version = importlib.metadata.version("triton")
     except importlib.metadata.PackageNotFoundError:
@@ -221,8 +168,20 @@ def preflight_backend(config, device):
             "device_name": torch.cuda.get_device_name(device),
         },
     }
+    if operator_profile is not None:
+        report["operator_profile"] = operator_profile.to_dict()
     if precision != "bf16":
         spec = BACKENDS[precision]
+        from coexecution.optimization.installation import selected_fp4_swap_ab
+
+        if precision == "fp4" and selected_fp4_swap_ab(config, operator_profile):
+            spec = dict(
+                spec,
+                operators=(
+                    *spec["operators"],
+                    "linear_forward_packed_gemm_bf16_swap_ab",
+                ),
+            )
         before = _loaded_libraries(torch)
         missing_before = _missing_operators(torch, spec)
         backend = importlib.import_module(spec["module"])

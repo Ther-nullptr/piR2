@@ -531,7 +531,7 @@ class PolicyStaticS2:
         is_new = graph is None
         if is_new:
             if self._graph_class is None:
-                from robotics_kernels.common.graph import CudaGraphCall
+                from coexecution.kernels.common.graph import CudaGraphCall
 
                 self._graph_class = CudaGraphCall
 
