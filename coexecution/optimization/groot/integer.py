@@ -141,6 +141,14 @@ class TransformerINT:
                 group._input = group._output = None
                 group._remaining.clear()
 
+    def projection_cache_clearers(self, precision):
+        """Cold-bind active-format root callbacks; full cleanup remains available."""
+        from coexecution.optimization.execution.cache import projection_cache_clearers
+
+        if precision != self.mode:
+            raise ValueError("Cache clear precision must match the installed mode")
+        return projection_cache_clearers(self.grouped, precision)
+
     def set(self, mode):
         self.clear_projection_cache()
         for m, attr, had, original in self.saved:

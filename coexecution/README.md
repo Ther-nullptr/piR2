@@ -486,7 +486,31 @@ Shape-tactic files still accept the legacy row list. A versioned integer profile
 
 This is a schema example, not a recommended tuning result; replace the revision placeholder with the recorded owned-source fingerprint from backend evidence. Old bound `robotics_integer` profiles do not automatically match the new owned namespace/source identity. Profiles with missing, unknown or mismatched runtime identity are rejected before installation; legacy lists remain explicitly unbound. W4A4 uses `w4a4-symmetric-row-v1`. Thor FP8/FP4 use their distinct floating formats and cannot consume integer profiles. Close and rebuild the optimization scope after changing precision, weights or tactics.
 
-优化根调用与 reset 共享串行保护，调用开始、结束和异常时清理投影缓存；Graph 异常恢复 eager 后仍保留该边界。该锁只管理 Python 提交，不是 CUDA 跨流同步，也不开放同进程双优化 worker。组件选择、缓存与后端契约的新增测试使用元数据/fake 对象；旧闭环结果不能作为新组合的质量结论。对应 CUDA 回归需显式执行 `tests/gpu/test_streaming_component_cache_gpu.py`，包含 eager/Graph 的 W8/W4 异常重试与 reset。本次结构和契约整理未重跑这些 GPU 测试。
+### Component projection-cache cleanup / 按组件清理投影缓存
+
+优化根调用与 reset 共享串行保护，调用开始、结束和异常时清理投影缓存；Graph
+异常恢复 eager 后仍保留该边界。`--component-cache-clear` 默认关闭，仅接受单一
+活动整数精度 W8A8 或 W4A4。启用后，在安装阶段按 VLM backbone、S1 视觉特征变换
+和 DiT 三个根划分投影组；每次 forward 只清理该根中当前精度的组。未启用时保留
+原有全量清理。每个投影组必须归属唯一根，且不能与其他组共享可变缓存对象。
+
+reset、精度模式切换和退出优化作用域仍执行完整清理，包括非活动精度的组。
+该选项不改变动作滚动缓冲、特征接纳规则或 K/V 复用语义，也不缓存跨调用的神经
+网络输出。所有根仍共用一把串行提交锁；该锁只管理 Python 提交，不是 CUDA
+跨流同步，不开放同一策略实例的并发推理。关闭作用域后才可更换精度或权重。
+运行证据中的 `cache_clear_policy` 记录全量或按根清理模式、活动精度及各根组数。
+
+公开 CI 使用元数据对象检查分组、异常恢复、串行保护和完整清理。真实 CUDA
+回归需显式执行下列命令，覆盖 W8/W4、eager/Graph、开关关闭/开启的原始 oracle、
+部分投影失败后的重试、动作缓冲、RNG 和 reset；该测试的合成特征绕过 VLM：
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_streaming_component_cache_gpu.py
+```
+
+已有本地真实 GPU 验证覆盖 Ada 上训练好的 W8 πR² 检查点的完整 VLM/动作路径、
+变化的延迟与滑动步长、失败恢复及完整 RPC 对照。该证据不构成 W4 或 Thor 的
+提速结论，也不建立 LIBERO 闭环成功率；这些组合需分别完成目标设备验证。
 
 Lightweight public CI runs only the configuration and restoration contracts. Explicit local GPU checks use no model download:
 
