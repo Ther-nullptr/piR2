@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "architecture": "sm_89",
+  "precision": "w8a8",
+  "implementations": {
+    "integer_gemm": "split_k",
+    "group_writeback": "native"
+  },
+  "parameters": {
+    "integer_gemm": {
+      "slices": 8,
+      "tile": 0
+    }
+  }
+}
