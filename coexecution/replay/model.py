@@ -74,30 +74,60 @@ def _shared_config(result, mode):
     )
 
 
+def model_run_id(root, label):
+    """Share the persisted identity with live journals before a model is loaded."""
+    return "model-" + digest([str(Path(root).resolve()), label])[:20]
+
+
+def clean_request(row, run_id, output, *, pair_key=None):
+    """Normalize one real clean invocation, shared by live and archive import."""
+    return {
+        **row,
+        "id": model_request_id(run_id, "clean", row["request_id"]),
+        "clean_wall": row.get("instrumented") is False,
+        "comparison_key": pair_key,
+        "output": output,
+        "difference_from_bf16": None,
+    }
+
+
+def model_request_id(run_id, collection, request_id):
+    return f"{run_id}/{collection}/{request_id}"
+
+
+def encode_action_arrays(arrays, *, allow_nonfinite=False):
+    """Normalize actual CPU action arrays; used by live and archived evidence."""
+    import numpy as np
+
+    output = {}
+    for key, value in arrays.items():
+        if value.dtype.kind not in "fiu":
+            raise ValueError(f"Invalid model action array: {key}")
+        finite = np.isfinite(value)
+        if not finite.all():
+            if not allow_nonfinite:
+                raise ValueError(f"Invalid model action array: {key}")
+            output[key] = {
+                "shape": list(value.shape),
+                "values": None,
+                "status": "nonfinite",
+                "nonfinite_count": int(value.size - finite.sum()),
+            }
+        else:
+            output[key] = {"shape": list(value.shape), "values": value.tolist()}
+    return output
+
+
 def _arrays(path, *, allow_nonfinite=False):
     if not path.exists():
         return {}
     import numpy as np
 
     with np.load(path, allow_pickle=False) as archive:
-        output = {}
-        for key in archive.files:
-            value = archive[key]
-            if value.dtype.kind not in "fiu":
-                raise ValueError(f"Invalid model action array: {key}")
-            finite = np.isfinite(value)
-            if not finite.all():
-                if not allow_nonfinite:
-                    raise ValueError(f"Invalid model action array: {key}")
-                output[key] = {
-                    "shape": list(value.shape),
-                    "values": None,
-                    "status": "nonfinite",
-                    "nonfinite_count": int(value.size - finite.sum()),
-                }
-            else:
-                output[key] = {"shape": list(value.shape), "values": value.tolist()}
-        return output
+        return encode_action_arrays(
+            {key: archive[key] for key in archive.files},
+            allow_nonfinite=allow_nonfinite,
+        )
 
 
 def _output(arrays, request):
@@ -180,7 +210,7 @@ def _profiles(root, label, metadata, observations, run_id):
             result.append(
                 {
                     **row,
-                    "id": f"{run_id}/profile/{key}",
+                    "id": model_request_id(run_id, "profile", key),
                     "instrumented": True,
                     "timeline_status": "unavailable",
                     "timeline": [],
@@ -203,7 +233,7 @@ def _profiles(root, label, metadata, observations, run_id):
         result.append(
             {
                 **row,
-                "id": f"{run_id}/profile/{key}",
+                "id": model_request_id(run_id, "profile", key),
                 "instrumented": True,
                 "timeline_status": "recorded",
                 "trace_anchor_us": anchor,
@@ -442,7 +472,7 @@ def model_runs(root, media, *, clock_cohort=None):
             groups.setdefault(label, [])
     runs = []
     for label, samples in groups.items():
-        run_id = "model-" + digest([str(root), label])[:20]
+        run_id = model_run_id(root, label)
         config_sha = _shared_config(result, label)
         clean = []
         for row in samples:
@@ -453,20 +483,18 @@ def model_runs(root, media, *, clock_cohort=None):
                 else None
             )
             clean.append(
-                {
-                    **row,
-                    "id": f"{run_id}/clean/{row['request_id']}",
-                    "clean_wall": row.get("instrumented") is False,
-                    "comparison_key": comparison_key(
+                clean_request(
+                    row,
+                    run_id,
+                    _output(arrays, row["request_id"]),
+                    pair_key=comparison_key(
                         kind="model",
                         observation_sha256=identity.get("sha256"),
                         seed=row.get("seed"),
                         shared_config_sha256=pair_config,
                         clock_cohort=clock_cohort,
                     ),
-                    "output": _output(arrays, row["request_id"]),
-                    "difference_from_bf16": None,
-                }
+                )
             )
         profiles, kernels, trace_sources, profile_warnings = _profiles(
             root, label, result.get("profiles", {}).get(label), observations, run_id
@@ -545,6 +573,9 @@ def model_runs(root, media, *, clock_cohort=None):
                 "checkpoint": result.get("checkpoint"),
                 "device": result.get("device"),
                 "mode_evidence": result.get("mode_evidence", {}).get(label),
+                "runtime_receipt": (
+                    result.get("mode_evidence", {}).get(label) or {}
+                ).get("runtime_receipt"),
                 "observations": list(observations.values()),
                 "clean_requests": clean,
                 "retained_outputs": retained_outputs,

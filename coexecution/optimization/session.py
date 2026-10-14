@@ -48,6 +48,7 @@ class GrootOptimizations:
         self._clear_cache = lambda: None
         self._roots = []
         self._resets = []
+        self._configuration_file_hashes = {}
 
     def __enter__(self):
         if self._active:
@@ -73,6 +74,17 @@ class GrootOptimizations:
         self.config.validate_variant(
             "pir2" if getattr(model.config, "streaming", False) else "flow"
         )
+        self._configuration_file_hashes = {
+            key: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for key in (
+                "coverage",
+                "tactics",
+                "group_tactics",
+                "shape_tactics",
+                "operator_profile",
+            )
+            if (path := getattr(self.config, key)) is not None
+        }
         expanded = self.config.scope == "all"
         if self.config.precision != "bf16":
             from coexecution.optimization.groot.projections import inventory
@@ -468,11 +480,19 @@ class GrootOptimizations:
             "operator_profile",
         ):
             path = config[key]
-            config[key] = (
+            actual = (
                 None
                 if path is None
-                else {"sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+                else hashlib.sha256(Path(path).read_bytes()).hexdigest()
             )
+            if (
+                key in self._configuration_file_hashes
+                and actual != self._configuration_file_hashes[key]
+            ):
+                raise RuntimeError(
+                    f"Installed optimization configuration file changed: {key}"
+                )
+            config[key] = None if path is None else {"sha256": actual}
         return {
             "config": config,
             "coverage": self.coverage,
