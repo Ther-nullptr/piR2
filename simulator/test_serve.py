@@ -183,3 +183,279 @@ def test_replay_rechecks_symlink_and_blocks_unlisted_media(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def stream_fixture(tmp_path):
+    from coexecution.replay.stream import ReplayJournal
+
+    catalog = replay_fixture(tmp_path)
+    run = {
+        "schema": "pir2.replay.run",
+        "version": 1,
+        "id": "a",
+        "kind": "model",
+        "precision": "w8a8",
+        "mode": "w8a8-clean",
+        "observations": [],
+        "clean_requests": [],
+        "profile_requests": [],
+        "kernels": [],
+    }
+    (tmp_path / "runs/a.json").write_text(json.dumps(run))
+    clocks = {"host": {"unit": "s", "domain": "host_monotonic"}}
+    journal = ReplayJournal(tmp_path / "streams", run, clocks)
+    data = json.loads(catalog.read_text())
+    data["streams"] = [journal.registration(tmp_path)]
+    catalog.write_text(json.dumps(data))
+    return catalog, journal
+
+
+def test_refresh_discovers_new_run_stream_and_media_without_server_restart(tmp_path):
+    from coexecution.replay.stream import ReplayJournal
+
+    catalog, original = stream_fixture(tmp_path)
+    server = preview.make_server(0, replay=catalog)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    added = None
+    try:
+        data = json.loads(catalog.read_text())
+        new_run = original.snapshot()["run"] | {"id": "new-run"}
+        (tmp_path / "runs/new.json").write_text(json.dumps(new_run))
+        added = ReplayJournal(
+            tmp_path / "new-stream",
+            new_run,
+            {"host": {"unit": "s", "domain": "host_monotonic"}},
+            max_event_bytes=8 * 1024 * 1024,
+        )
+        data["runs"].append({"id": "new-run", "path": "runs/new.json"})
+        data["streams"].append(added.registration(tmp_path))
+        replacement = tmp_path / "catalog.next"
+        replacement.write_text(json.dumps(data))
+        replacement.replace(catalog)
+        with urllib.request.urlopen(base + "/api/replay/snapshot/new-run") as response:
+            assert json.load(response)["stream_available"] is True
+        with urllib.request.urlopen(base + "/api/replay/catalog") as response:
+            assert len(json.load(response)["runs"]) == 2
+        media = json.loads((tmp_path / "media.json").read_text())
+        (tmp_path / "media/new.png").write_bytes(b"new media")
+        media["assets"].append(
+            {"id": "new-frame", "path": "media/new.png", "mime": "image/png"}
+        )
+        (tmp_path / "media.json").write_text(json.dumps(media))
+        with urllib.request.urlopen(base + "/api/replay/media/new-frame") as response:
+            assert response.read() == b"new media"
+    finally:
+        original.close()
+        if added is not None:
+            added.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_registered_large_event_reconciles_and_streams_using_same_byte_limit(tmp_path):
+    catalog, journal = stream_fixture(tmp_path)
+    journal.close()
+    from coexecution.replay.stream import ReplayJournal
+
+    journal = ReplayJournal(
+        tmp_path / "large",
+        journal.snapshot()["run"],
+        {"host": {"unit": "s", "domain": "host_monotonic"}},
+        max_event_bytes=8 * 1024 * 1024,
+    )
+    data = json.loads(catalog.read_text())
+    data["streams"] = [journal.registration(tmp_path)]
+    catalog.write_text(json.dumps(data))
+    when = {"value": 1, "unit": "s", "clock_id": "host", "domain": "host_monotonic"}
+    journal.append(
+        "run.updated",
+        occurrence=when,
+        projection={
+            "op": "replace",
+            "run": journal.snapshot()["run"]
+            | {"fixture_metadata": "x" * (2 * 1024 * 1024)},
+        },
+    )
+    server = preview.make_server(0, replay=catalog)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(base + "/api/replay/snapshot/a") as response:
+            result = json.load(response)
+            assert result["last_sequence"] == 1
+            assert len(result["run"]["fixture_metadata"]) == 2 * 1024 * 1024
+        journal.append("run.ended", occurrence=when)
+        with urllib.request.urlopen(
+            base + "/api/replay/events/a?after=0", timeout=3
+        ) as response:
+            body = response.read()
+            assert b"id: 1\n" in body and b"id: 2\n" in body
+            assert b"event: end\n" in body
+    finally:
+        journal.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_invalid_refresh_keeps_previous_indexes_and_never_opens_escape(tmp_path):
+    catalog = replay_fixture(tmp_path)
+    files = preview.ReplayFiles(catalog)
+    previous = files.runs
+    data = json.loads(catalog.read_text())
+    data["runs"].append({"id": "escape", "path": "../secret.json"})
+    catalog.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="root"):
+        files.refresh()
+    assert files.runs is previous
+    assert "escape" not in files.runs
+    catalog.unlink()
+    catalog.symlink_to("/etc/passwd")
+    with pytest.raises(OSError):
+        files.refresh()
+
+
+@pytest.mark.parametrize("limit", [True, 0, 8 * 1024 * 1024 + 1])
+def test_stream_registration_rejects_invalid_byte_limit(tmp_path, limit):
+    catalog, journal = stream_fixture(tmp_path)
+    journal.close()
+    data = json.loads(catalog.read_text())
+    data["streams"][0]["max_event_bytes"] = limit
+    catalog.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="limit"):
+        preview.ReplayFiles(catalog)
+
+
+def test_malformed_manifest_refresh_preserves_previous_index(tmp_path):
+    catalog = replay_fixture(tmp_path)
+    files = preview.ReplayFiles(catalog)
+    before = files.media
+    for invalid in ([], {"assets": [None]}, {"assets": {"id": "not-a-list"}}):
+        (tmp_path / "media.json").write_text(json.dumps(invalid))
+        with pytest.raises(TypeError, match="manifest|rows|object"):
+            files.refresh()
+        assert files.media is before
+
+
+def test_stream_snapshot_reconciles_checkpoint_and_sse_resumes_then_ends(tmp_path):
+    catalog, journal = stream_fixture(tmp_path)
+    occurrence = {
+        "value": 1.0,
+        "unit": "s",
+        "clock_id": "host",
+        "domain": "host_monotonic",
+    }
+    journal.append(
+        "observation.loaded",
+        occurrence=occurrence,
+        sources={"observation_id": "obs"},
+        projection={
+            "op": "append",
+            "collection": "observations",
+            "items": [{"observation_id": "obs"}],
+        },
+    )
+    server = preview.make_server(0, replay=catalog)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(base + "/api/replay/snapshot/a") as response:
+            snapshot = json.load(response)
+            assert snapshot["last_sequence"] == 1
+            assert snapshot["run"]["observations"] == [{"observation_id": "obs"}]
+        journal.append("run.ended", occurrence=occurrence | {"value": 2.0})
+        request = urllib.request.Request(
+            base + "/api/replay/events/a?after=0", headers={"Last-Event-ID": "1"}
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            body = response.read().decode()
+            assert (
+                response.headers["Content-Type"] == "text/event-stream; charset=utf-8"
+            )
+            assert "id: 1\n" not in body and "id: 2\n" in body
+            assert "event: end\n" in body
+            assert body.index("id: 2\n") < body.index("event: end\n")
+        with urllib.request.urlopen(
+            base + "/api/replay/events/a?after=99", timeout=2
+        ) as response:
+            body = response.read().decode()
+            assert "event: resnapshot\n" in body and "cursor_ahead" in body
+        for route, expected in (
+            ("/api/replay/events/no", 404),
+            ("/api/replay/snapshot/..%2Fa", 404),
+            ("/api/replay/events/a?after=-1", 400),
+        ):
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(base + route)
+            assert error.value.code == expected
+    finally:
+        journal.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_legacy_snapshot_is_historical_without_starting_a_stream(tmp_path):
+    catalog, journal = stream_fixture(tmp_path)
+    journal.close()
+    data = json.loads(catalog.read_text())
+    data.pop("streams")
+    catalog.write_text(json.dumps(data))
+    server = preview.make_server(0, replay=catalog)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(base + "/api/replay/snapshot/a") as response:
+            snapshot = json.load(response)
+            assert snapshot["stream_available"] is False
+            assert snapshot["state"]["status"] == "historical"
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.urlopen(base + "/api/replay/events/a")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_open_sse_delivers_newly_committed_events_and_preserves_occurrence(tmp_path):
+    from coexecution.replay.stream import BoundedEventWriter
+
+    catalog, journal = stream_fixture(tmp_path)
+    writer = BoundedEventWriter(journal)
+    server = preview.make_server(0, replay=catalog)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(
+            base + "/api/replay/events/a?after=0", timeout=3
+        ) as response:
+            occurrence = {
+                "value": 7.25,
+                "unit": "s",
+                "clock_id": "host",
+                "domain": "host_monotonic",
+            }
+            assert writer.emit(
+                "model.stage.started",
+                occurrence=occurrence,
+                payload={"stage": "vlm", "duration": None},
+            )
+            writer.close(status="ended", occurrence=occurrence | {"value": 7.5})
+            lines = response.read().decode().splitlines()
+            data = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+            assert data[0]["occurrence"] == occurrence
+            assert data[0]["payload"]["duration"] is None
+            assert [row.get("sequence") for row in data[:-1]] == [1, 2]
+            assert data[-1] == {"run_id": "a", "last_sequence": 2, "status": "ended"}
+    finally:
+        writer.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()

@@ -3,14 +3,18 @@
 import argparse
 import io
 import json
+import re
 import sys
+import threading
+import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from coexecution.replay.http import ReplayFiles, byte_range
+from coexecution.replay.stream import MAX_SEQUENCE, StreamGap, sse
 
 ALLOWED = [ROOT / "simulator"]
 ALLOWED_FILES = {
@@ -40,10 +44,122 @@ class PreviewHandler(SimpleHTTPRequestHandler):
             outputfile.write(data)
             remaining -= len(data)
 
+    def do_GET(self):
+        route = urlsplit(self.path).path
+        if route.startswith("/api/replay/events/"):
+            self.replay_events(route)
+            return
+        super().do_GET()
+
+    def replay_events(self, route):
+        replay = self.server.replay_files
+        parts = route.split("/")
+        if replay is not None:
+            try:
+                replay.refresh()
+            except (OSError, ValueError, KeyError, TypeError):
+                self.send_error(503, "Replay catalog currently unavailable")
+                return
+        if replay is None or len(parts) != 5 or parts[4] not in replay.streams:
+            self.send_error(404)
+            return
+        identifier = parts[4]
+        try:
+            cursor = self.headers.get("Last-Event-ID")
+            if cursor is None:
+                values = parse_qs(
+                    urlsplit(self.path).query, keep_blank_values=True
+                ).get("after", ["0"])
+                if len(values) != 1:
+                    raise ValueError("One cursor is required")
+                cursor = values[0]
+            if not re.fullmatch(r"[0-9]+", cursor) or int(cursor) > MAX_SEQUENCE:
+                raise ValueError("Invalid cursor")
+            cursor = int(cursor)
+        except ValueError:
+            self.send_error(400, "Invalid replay sequence cursor")
+            return
+        try:
+            snapshot, tail = replay.stream_session(identifier, after=cursor)
+        except (OSError, ValueError, KeyError, TypeError):
+            self.send_error(503, "Replay snapshot currently unavailable")
+            return
+        terminal = (
+            snapshot["state"]["status"]
+            if snapshot["state"]["status"] in ("ended", "failed")
+            else None
+        )
+        terminal_sequence = snapshot["last_sequence"] if terminal else None
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        heartbeat = time.monotonic()
+        try:
+            while not self.server.stream_stop.is_set():
+                try:
+                    events = tail.poll()
+                except (StreamGap, OSError, ValueError) as error:
+                    reason = (
+                        str(error)
+                        if isinstance(error, StreamGap)
+                        else "journal_unavailable"
+                    )
+                    self.wfile.write(
+                        sse(
+                            "resnapshot",
+                            {
+                                "run_id": identifier,
+                                "reason": reason,
+                                "last_sequence": snapshot["last_sequence"],
+                                "snapshot_url": f"/api/replay/snapshot/{identifier}",
+                            },
+                        )
+                    )
+                    self.wfile.flush()
+                    return
+                for event in events:
+                    self.wfile.write(sse("replay", event, sequence=event["sequence"]))
+                    if event["type"] in ("run.ended", "run.failed", "stream.failed"):
+                        terminal = "ended" if event["type"] == "run.ended" else "failed"
+                        terminal_sequence = event["sequence"]
+                if events:
+                    self.wfile.flush()
+                if terminal and tail.after >= terminal_sequence:
+                    self.wfile.write(
+                        sse(
+                            "end",
+                            {
+                                "run_id": identifier,
+                                "last_sequence": terminal_sequence,
+                                "status": terminal,
+                            },
+                        )
+                    )
+                    self.wfile.flush()
+                    return
+                now = time.monotonic()
+                if now - heartbeat >= 1.0:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    heartbeat = now
+                self.server.stream_stop.wait(0.05)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+
     def replay_head(self, route):
         replay = self.server.replay_files
         if replay is None:
             self.send_error(404, "No replay catalog configured")
+            return None
+        try:
+            replay.refresh()
+        except (OSError, ValueError, KeyError, TypeError):
+            self.send_error(503, "Replay catalog currently unavailable")
             return None
         if route == "/api/replay/catalog":
             data = json.dumps(replay.catalog).encode()
@@ -54,8 +170,32 @@ class PreviewHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             return io.BytesIO(data)
         parts = route.split("/")
-        if len(parts) != 5 or parts[3] not in {"run", "media"}:
+        if len(parts) != 5 or parts[3] not in {"run", "media", "snapshot", "events"}:
             self.send_error(404)
+            return None
+        if parts[3] == "snapshot":
+            if parts[4] not in replay.runs:
+                self.send_error(404)
+                return None
+            try:
+                data = json.dumps(replay.snapshot(parts[4]), allow_nan=False).encode()
+            except (OSError, ValueError, KeyError, TypeError):
+                self.send_error(503, "Replay snapshot currently unavailable")
+                return None
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return io.BytesIO(data)
+        if parts[3] == "events":
+            if parts[4] not in replay.streams:
+                self.send_error(404)
+                return None
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return None
         media = parts[3] == "media"
         entry = (replay.media if media else replay.runs).get(parts[4])
@@ -153,9 +293,23 @@ class PreviewHandler(SimpleHTTPRequestHandler):
         return super().send_head()
 
 
+class PreviewServer(ThreadingHTTPServer):
+    def __init__(self, *args, **kwargs):
+        self.stream_stop = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def shutdown(self):
+        self.stream_stop.set()
+        super().shutdown()
+
+    def server_close(self):
+        self.stream_stop.set()
+        super().server_close()
+
+
 def make_server(port, report=None, replay=None):
     replay_files = ReplayFiles(replay) if replay is not None else None
-    server = ThreadingHTTPServer(("127.0.0.1", port), PreviewHandler)
+    server = PreviewServer(("127.0.0.1", port), PreviewHandler)
     server.replay_files = replay_files
     server.report_path = Path(report).resolve() if report is not None else None
     return server
