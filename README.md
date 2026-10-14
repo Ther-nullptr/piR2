@@ -15,6 +15,7 @@ This independently maintained repository studies **NVIDIA GR00T-N1.7-LIBERO** ta
 - [Single-GPU execution tools](coexecution/README.md) support auxiliary SO100 replay profiling; their mechanisms require separate LIBERO validation before contributing main-line performance claims.
 - [LIBERO VLM/DiT contention profiling](docs/coexecution.md#libero-vlmdit-contention-profiling) compares isolated, concurrent, priority and cooperative execution with BF16/W8A8/W4A4, keeping response time, hardware counters and task quality distinct.
 - [Interactive timing tool](simulator/README.md) explains queueing and cache-age assumptions without predicting task success.
+- [Jetson 与流式回放交接](docs/platform-handoff.md) maps AGX Orin/Thor porting gates, reproducible measurements and the replay integration contract.
 
 Modules are introduced through focused pull requests. Model weights, datasets, environments and generated results are intentionally excluded from Git.
 

@@ -7,7 +7,7 @@ python3 tools/prepare_sources.py --component groot
 python3 tools/prepare_sources.py --component playground
 ```
 
-The GR00T environment used Python 3.10, PyTorch 2.7.1, Transformers 4.57.3, Diffusers 0.35.1 and NumPy 1.26.4. Install the pinned fork following its own dependency instructions. The LIBERO environment used Python 3.12, hf-libero 0.1.4, robosuite 1.4.0 and MuJoCo 3.8.1. Leap used a separate CUDA JAX 0.5.3 / MuJoCo-MJX 3.14.0 environment. These are observed compatibility versions, not a claim that all transitive dependencies have been tested on a new machine.
+The current Ada CUDA regression and official Spatial paired model-replay environment uses Python 3.10, PyTorch `2.7.1+cu126`, a CUDA 12.8 `nvcc` toolkit, Transformers 4.57.3, Diffusers 0.35.1 and NumPy 1.26.4. The Torch CUDA runtime version and extension compiler version are separate recorded inputs. Install the pinned fork following its own dependency instructions. The LIBERO environment used Python 3.12, hf-libero 0.1.4, robosuite 1.4.0 and MuJoCo 3.8.1. Leap used a separate CUDA JAX 0.5.3 / MuJoCo-MJX 3.14.0 environment. These are observed compatibility versions, not a claim that all transitive dependencies have been tested on a new machine.
 
 Keep `.venv/`, `.venv-pi05/`, `.venv-sim/`, `.libero-config-pi05/`, weights and datasets local. The `.venv-pi05` name is historical: the current LIBERO evaluator uses it as a simulator environment; it does not imply π0.5 model training.
 
@@ -91,13 +91,16 @@ object cache, but can still be selected directly with `CUTLASS_ROOT` as above.
 
 ## Optional GR00T fusion and integer inference
 
-Use a separate Linux CUDA model environment for the experimental GR00T fusion and
-W8A8/W4A4 adapters. The measured development configuration used an NVIDIA RTX 6000
-Ada (SM89), PyTorch `2.9.0+cu128` and CUDA 12.8, with BF16 model weights. This is
-separate from the PyTorch 2.7.1 training/inference environment above; compatibility
-with that environment has not been established. Keep the pinned GR00T source and
-its model dependencies, including Transformers 4.57.3 and Diffusers 0.35.1. Do not
-upgrade the working model environment merely to install the optional backend.
+Use an isolated Linux CUDA model environment for the experimental GR00T fusion
+and W8A8/W4A4 adapters. Historical operator development recorded an NVIDIA RTX
+6000 Ada (SM89), PyTorch `2.9.0+cu128` and CUDA 12.8 with BF16 model weights.
+Current Ada CUDA regression and official Spatial Flow4 paired replay instead
+use the `2.7.1+cu126` model environment and CUDA 12.8 compiler described above.
+This validates the exercised paths in that environment; it does not extend
+every candidate's contract to another Torch build or GPU. Keep the pinned GR00T
+source and its model dependencies, including Transformers 4.57.3 and Diffusers
+0.35.1. Do not upgrade the working model environment merely to install the
+optional backend. See [platform handoff](platform-handoff.md) for Jetson gates.
 
 The extension requires a CUDA toolkit with `nvcc`, a compatible C++17 compiler,
 Ninja, and the Torch-compatible Triton package. Explicit builds or the first
@@ -158,19 +161,24 @@ to inspect each implementation before enabling it; organization has not added
 new measured speedups or task-quality evidence.
 
 The adapters are opt-in for standard Flow and serial πR² inference, with optional pure-DiT CUDA Graph.
-Streaming condition grouping and paired optimized workers remain unsupported.
+Streaming condition grouping and paired whole-action CUDA Graph/K/V reuse remain unsupported; paired optimized VLM/DiT workers use coordinated capture.
 Synthetic streaming checks do not establish trained-checkpoint or closed-loop quality.
 See [execution configuration and validation](../coexecution/README.md). GPU/model checks
 remain explicit local commands, not public CI dependencies.
 
 ## Optional Thor floating inference
 
-The FP8/FP4 adapter targets NVIDIA Thor (SM110, aarch64). The tested environment
-uses JetPack 7.2 / L4T 39.2, CUDA toolkit 13.2, PyTorch `2.10.0+cu130`, Triton 3.6.0,
+The FP8/FP4 adapter targets NVIDIA Thor (SM110, aarch64). The repository's prior
+Thor environment record uses JetPack 7.2 / L4T 39.2, CUDA toolkit 13.2,
+PyTorch `2.10.0+cu130`, Triton 3.6.0,
 Python 3.12, Transformers 4.57.3 and Diffusers 0.35.1. It uses SDPA attention.
 Keep NumPy 1.26.4 with compatible dependencies; the model environment used
-PyArrow 20.0.0, tifffile 2024.9.20 and PyAV 16.1.0. These are observed versions,
-not an instruction to upgrade a shared installation.
+PyArrow 20.0.0, tifffile 2024.9.20 and PyAV 16.1.0. These are previously recorded
+versions, not a new Thor validation of the current Ada changes or an instruction
+to upgrade a shared installation. The service's floating modes do not yet imply
+ActionGraph/K/V-reuse, paired-measurement or replay-viewer support for FP8/FP4;
+the [handoff capability matrix](platform-handoff.md#precision-support) separates
+these interfaces.
 
 Use a personal checkout, environment, build directory and caches. CUDA requires
 access to the platform GPU device nodes (including `/dev/nvmap` on the tested

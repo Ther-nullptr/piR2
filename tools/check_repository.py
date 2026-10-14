@@ -28,6 +28,7 @@ DOCUMENTS = {
     "libero.md",
     "timing-protocols.md",
     "coexecution.md",
+    "platform-handoff.md",
 }
 
 
