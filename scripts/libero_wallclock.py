@@ -33,6 +33,8 @@ from coexecution.libero.resident import (
 )
 from coexecution.libero.scheduling import (
     AdmissionSchedule,
+    ExecutionCadence,
+    validate_execution_clock,
 )
 
 
@@ -566,21 +568,39 @@ def run_control_loop(
     clock=None,
     events=None,
     fixed_delay=None,
+    replay_recorder=None,
+    execution_clock="paced",
 ):
     """The actor/vision interfaces are injectable so clock contracts can be tested."""
     clock = clock or RealClock()
+    validate_execution_clock(execution_clock, fixed_delay=fixed_delay)
+    if execution_clock == "ready" and initial_delay != 1:
+        raise ValueError("Ready execution uses a one-step committed prefix")
     if fixed_delay is not None:
         if fixed_delay not in range(1, 6):
             raise ValueError("Fixed deployment delay must be between 1 and 5 ticks")
         if initial_delay != fixed_delay:
             raise ValueError("Bootstrap and control loop must use the same fixed delay")
-    events = events or QueueTrace(clock=clock.now)
+    events = events or QueueTrace(
+        clock=clock.now,
+        max_records=max_steps * 128 + 4096 if replay_recorder is not None else None,
+    )
     if isinstance(actor, ActionWorker):
         actor.events = events
     if isinstance(vision, VisionWorker):
         vision.queue.events = events
     timeline = CommandTimeline(initial_plan)
+    if replay_recorder is not None:
+        replay_recorder.initial(initial, capture_s=initial_capture_s)
     base = clock.now()
+    cadence = ExecutionCadence(execution_clock, period, base)
+    delay_policy = (
+        "one_step_committed"
+        if not cadence.paced
+        else "fixed"
+        if fixed_delay is not None
+        else "adaptive_nondecreasing"
+    )
     bootstrap_feature = {
         "sequence": 0,
         "meta": {"source_tick": 0, "capture_s": initial_capture_s},
@@ -589,9 +609,12 @@ def run_control_loop(
         "control_start",
         t_s=base,
         period_s=period,
+        execution_clock=execution_clock,
+        physics_step_seconds=period,
+        nominal_physics_hz=1 / period,
         max_steps=max_steps,
         initial_delay_ticks=initial_delay,
-        delay_policy="fixed" if fixed_delay is not None else "adaptive_nondecreasing",
+        delay_policy=delay_policy,
         initial_capture_s=initial_capture_s,
         bootstrap_action_slots=len(initial_plan),
         **feature_dependency(bootstrap_feature),
@@ -608,15 +631,16 @@ def run_control_loop(
     frames = []
     fallbacks = expired = protected = misses = over_budget = 0
     observation_events = []
+    plan_ready_times = {}
+    applied_requests = set()
     for tick in range(max_steps):
-        target = base + tick * period
-        clock.sleep_until(target)
+        target = cadence.wait(clock, tick)
         tick_started = clock.now()
-        # A quickly computed o[k] is withheld until Tk. It is never exposed to
-        # a GPU worker in the preceding physical interval.
-        capture = next_capture if tick == 0 else tick_started
+        # Paced observations remain withheld until Tk; ready observations retain
+        # their actual post-step capture time and are released at this boundary.
+        capture = next_capture if tick == 0 or not cadence.paced else tick_started
         current = Observation(next_data, tick, capture)
-        observation_events.append((tick, tick_started, target))
+        observation_events.append((tick, tick_started, target, capture))
         vision.offer(current)
         if pending is not None and pending.done():
             result = pending.result()
@@ -631,17 +655,23 @@ def run_control_loop(
             )
             expired += publication.expired
             protected += publication.protected
-            late = timing["completed_s"] > timing["deadline_s"]
-            misses += int(late)
-            budget, ood = latency_budget(
-                timing["completed_s"] - timing["submitted_s"] + 0.005, period
-            )
-            over_budget += int(ood)
-            if late and fixed_delay is None:
-                delay = max(delay, budget)
+            late = None
+            if cadence.paced:
+                late = timing["completed_s"] > timing["deadline_s"]
+                misses += int(late)
+                budget, ood = latency_budget(
+                    timing["completed_s"] - timing["submitted_s"] + 0.005, period
+                )
+                over_budget += int(ood)
+                if late and fixed_delay is None:
+                    delay = max(delay, budget)
+            adopted = clock.now()
+            plan_ready_times[audit["request_tick"]] = timing["completed_s"]
             record = {
                 "kind": "request_completed",
+                "t_s": adopted,
                 "consumed_at_tick": tick,
+                "ready_to_adopt_seconds": adopted - timing["completed_s"],
                 "expired_slots": publication.expired,
                 "protected_slots": publication.protected,
                 "installed_slots": publication.installed,
@@ -653,7 +683,10 @@ def run_control_loop(
             events.emit(**record)
             events.emit(
                 "action_adopted",
+                t_s=adopted,
                 request_tick=audit["request_tick"],
+                completed_s=timing["completed_s"],
+                ready_to_adopt_seconds=adopted - timing["completed_s"],
                 adopted_at_tick=tick,
                 installed_slots=publication.installed,
                 expired_slots=publication.expired,
@@ -673,7 +706,7 @@ def run_control_loop(
                 state_tick=current.tick,
                 state_capture_s=current.capture_s,
                 delay_ticks=delay,
-                deadline_s=base + (tick + delay) * period,
+                deadline_s=cadence.target(tick + delay),
                 committed_start_tick=tick,
                 committed_end_tick=tick + delay,
                 **feature_dependency(visual or bootstrap_feature),
@@ -684,7 +717,7 @@ def run_control_loop(
                 delay,
                 prefix,
                 visual,
-                base + (tick + delay) * period,
+                cadence.target(tick + delay),
                 submitted,
             )
             next_request = tick + delay
@@ -693,6 +726,11 @@ def run_control_loop(
         camera_snapshot = vision.snapshot() if hasattr(vision, "snapshot") else None
         fallbacks += int(fallback)
         applied = clock.now()
+        producer = timeline.last_execution.get("producer_request_tick")
+        ready_at = plan_ready_times.get(producer)
+        first_application = ready_at is not None and producer not in applied_requests
+        if first_application:
+            applied_requests.add(producer)
         next_data, success, terminated = step_fn(action)
         computed = clock.now()
         next_data = copy_observation(next_data)
@@ -702,11 +740,19 @@ def run_control_loop(
             "tick": tick,
             "scheduled_s": target,
             "applied_s": applied,
-            "lateness_s": max(0, applied - target),
+            "lateness_s": max(0, applied - target) if target is not None else None,
             "sensor_capture_s": capture,
             "sensor_release_s": tick_started,
             "next_observation_computed_s": computed,
-            "next_observation_release_not_before_s": base + (tick + 1) * period,
+            "next_observation_release_not_before_s": cadence.target(tick + 1),
+            "execution_clock": execution_clock,
+            "physics_step_seconds": period,
+            "simulated_elapsed_seconds": (tick + 1) * period,
+            "command_ready_s": ready_at,
+            "ready_to_apply_seconds": applied - ready_at
+            if ready_at is not None
+            else None,
+            "first_application_of_request": first_application,
             "environment_step_s": computed - applied,
             "action": action.tolist(),
             "fallback": fallback,
@@ -718,16 +764,18 @@ def run_control_loop(
             "action_buffer_phase": "after_execute",
             "camera_queue": camera_snapshot,
         }
+        if replay_recorder is not None:
+            row["robot_response"] = replay_recorder.step(current.data, next_data, row)
         ticks.append(row)
         events.emit(t_s=applied, **row)
         if record_video:
             frames.append(next_data["video.image"].copy())
         if success or terminated:
             reason = "success" if success else "environment_terminated"
-            clock.sleep_until(base + (tick + 1) * period)
+            cadence.wait(clock, tick + 1)
             break
     else:
-        clock.sleep_until(base + max_steps * period)
+        cadence.wait(clock, max_steps)
     controlled_end = clock.now()
     events.emit(
         "control_end", t_s=controlled_end, control_steps=len(ticks), reason=reason
@@ -775,17 +823,33 @@ def run_control_loop(
     extra = [x["audit"]["extra_buffer_shift"] for x in completed]
     applied = [x["applied_s"] for x in ticks]
     hz = (len(applied) - 1) / (applied[-1] - applied[0]) if len(applied) > 1 else None
-    lateness = [x["lateness_s"] for x in ticks]
-    mean_rate_valid = hz is not None and abs(hz - 1 / period) / (1 / period) <= 0.02
+    lateness = [x["lateness_s"] for x in ticks if x["lateness_s"] is not None]
+    mean_rate_valid = (
+        (hz is not None and abs(hz - 1 / period) / (1 / period) <= 0.02)
+        if cadence.paced
+        else None
+    )
     intervals = np.diff(applied).tolist()
-    deadline_valid = max(lateness) <= 0.005
-    period_valid = bool(intervals) and max(abs(x - period) for x in intervals) <= 0.005
-    valid = mean_rate_valid and deadline_valid and period_valid
+    deadline_valid = (
+        bool(lateness) and max(lateness) <= 0.005 if cadence.paced else None
+    )
+    period_valid = (
+        (bool(intervals) and max(abs(x - period) for x in intervals) <= 0.005)
+        if cadence.paced
+        else None
+    )
+    valid = (
+        mean_rate_valid and deadline_valid and period_valid if cadence.paced else None
+    )
     result = {
         "success": bool(success),
         "termination_reason": reason,
         "control_steps": len(ticks),
-        "target_control_hz": 1 / period,
+        "execution_clock": execution_clock,
+        "physics_step_seconds": period,
+        "nominal_physics_hz": 1 / period,
+        "target_control_hz": 1 / period if cadence.paced else None,
+        "fixed_rate_timing_applicable": cadence.paced,
         "actual_control_hz": hz,
         "control_rate_valid": valid,
         "mean_control_rate_valid": mean_rate_valid,
@@ -796,10 +860,16 @@ def run_control_loop(
         "controlled_start_s": base,
         "controlled_end_s": controlled_end,
         "physical_control_seconds": len(ticks) * period,
+        "simulated_elapsed_seconds": len(ticks) * period,
+        "real_time_factor": len(ticks) * period / (controlled_end - base)
+        if controlled_end > base
+        else None,
         "first_success_tick": ticks[-1]["tick"] if success else None,
         "measurement_mode": "success_terminated_closed_loop",
         "control_lateness_seconds": metric_summary(lateness),
-        "control_deadline_misses_over5ms": sum(x > 0.005 for x in lateness),
+        "control_deadline_misses_over5ms": sum(x > 0.005 for x in lateness)
+        if cadence.paced
+        else None,
         "environment_step_seconds": metric_summary(
             [x["environment_step_s"] for x in ticks]
         ),
@@ -813,6 +883,18 @@ def run_control_loop(
             x["client_timing"]["deadline_s"] <= controlled_end
             and x["client_timing"]["completed_s"] > x["client_timing"]["deadline_s"]
             for x in completed
+        )
+        if cadence.paced
+        else None,
+        "action_ready_to_adopt_seconds": metric_summary(
+            [x["ready_to_adopt_seconds"] for x in request_records]
+        ),
+        "action_ready_to_first_apply_seconds": metric_summary(
+            [
+                x["ready_to_apply_seconds"]
+                for x in ticks
+                if x["first_application_of_request"]
+            ]
         ),
         "action_rpc_seconds": metric_summary(rpc),
         "action_server_seconds": metric_summary(compute),
@@ -830,15 +912,15 @@ def run_control_loop(
         "buffer_restarts": sum(
             x["audit"].get("buffer_restarted", False) for x in completed
         ),
-        "over_training_budget_events": over_budget,
+        "over_training_budget_events": over_budget if cadence.paced else None,
         "rpc_over_training_budget_count": sum(
             latency_budget(seconds + 0.005, period)[1] for seconds in rpc
-        ),
+        )
+        if cadence.paced
+        else None,
         "initial_action_delay_ticks": initial_delay,
         "final_action_delay_ticks": delay,
-        "action_delay_policy": "fixed"
-        if fixed_delay is not None
-        else "adaptive_nondecreasing",
+        "action_delay_policy": delay_policy,
         "vlm_work": {
             k: v for k, v in vlm_stats.items() if k not in {"rpc_seconds", "rpc_times"}
         },
@@ -861,9 +943,13 @@ def run_control_loop(
             ),
         },
         "sensor_release_contract_verified": all(
-            released >= target for _, released, target in observation_events
+            released >= capture and (target is None or released >= target)
+            for _, released, target, capture in observation_events
         ),
     }
+    if replay_recorder is not None:
+        result["replay_recording"] = replay_recorder.status()
+        result["replay_trace"] = events.status()
     return result, frames
 
 
@@ -992,6 +1078,12 @@ def deployment_episode(env, observation, client, args, seed, trace):
     feature_rpc = getattr(args, "feature_rpc", "separate")
     feature_transport = getattr(args, "feature_transport", "numpy_fp32")
     fixed_delay = getattr(args, "deployment_fixed_delay", None)
+    execution_clock = getattr(args, "execution_clock", "paced")
+    validate_execution_clock(
+        execution_clock,
+        variant=getattr(args, "variant", "flow"),
+        fixed_delay=fixed_delay,
+    )
     capture = time.monotonic()
     if not hasattr(args, "slow_warmup"):
         from gr00t.policy.server_client import PolicyClient
@@ -1085,6 +1177,8 @@ def deployment_episode(env, observation, client, args, seed, trace):
             slow.socket.close()
             slow.context.term()
     d, calibration = args.calibration
+    if execution_clock == "ready":
+        d = 1
     if fixed_delay is not None:
         d = fixed_delay
     # Each task can introduce a new VLM graph bucket. Prepare S2 before the
@@ -1108,7 +1202,15 @@ def deployment_episode(env, observation, client, args, seed, trace):
             "seed": seed,
         },
     )
-    events = QueueTrace()
+    recorder = None
+    if getattr(args, "record_replay", False):
+        from coexecution.replay.recording import ReplayRecorder
+
+        recorder = ReplayRecorder(max_frames=args.replay_max_frames)
+    args.replay_recorder = recorder
+    events = QueueTrace(
+        max_records=args.max_steps * 128 + 4096 if recorder is not None else None
+    )
     actor = ActionWorker(
         args.port,
         events=events,
@@ -1150,6 +1252,8 @@ def deployment_episode(env, observation, client, args, seed, trace):
             args.record_video,
             events=events,
             fixed_delay=fixed_delay,
+            replay_recorder=recorder,
+            execution_clock=execution_clock,
         )
     finally:
         if gc_was_enabled:
@@ -1169,6 +1273,10 @@ def deployment_episode(env, observation, client, args, seed, trace):
         "feature_transport": feature_transport,
         "server_layout": getattr(args, "server_layout", "split"),
         "deployment_fixed_delay": fixed_delay,
+        "execution_clock": execution_clock,
+        "delay_selection": "one atomic physics step committed; solo RPC calibration is evidence only"
+        if execution_clock == "ready"
+        else "fixed override or solo RPC calibration",
         "calibrated_delay_ticks": calibration["selected_delay_ticks"],
         "effective_initial_delay_ticks": d,
         "scope": "real GPU inference with client-visible latency floors; scored calls unchanged, episode preparation reported separately",
