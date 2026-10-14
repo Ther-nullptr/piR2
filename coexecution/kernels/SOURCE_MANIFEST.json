@@ -315,8 +315,8 @@
       "origin_revision": "239b4a3ef2268048571c9f508ad5700f98398c2f",
       "origin_path": "src/robotics_kernels/common/graph.py",
       "origin_sha256": "10fa00dec9e55510bf0528a0318757406a3606ea08c98a1eb2c203355f3f7d6c",
-      "sha256": "10fa00dec9e55510bf0528a0318757406a3606ea08c98a1eb2c203355f3f7d6c",
-      "adaptation": "Owned package/namespace/build paths; focused floating loaders; formatting only elsewhere."
+      "sha256": "6687e90dd919606c82361aafcbf141722f66e275e7b92587c39bbf4ab141f707",
+      "adaptation": "Owned graph lifetime handling, opt-in tuple outputs, caller capture keys, retained constants on warmup/replay streams."
     },
     "common/source_identity.cpp": {
       "origin": "pir2-project",

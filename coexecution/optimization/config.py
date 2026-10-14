@@ -9,6 +9,7 @@ class OptimizationConfig:
     precision: str = "bf16"
     fusion: bool = False
     dit_graph: bool = False
+    vlm_graph: bool = False
     scope: str = "transformer"
     category_id: int | None = None
     coverage: Path | None = None
@@ -29,6 +30,10 @@ class OptimizationConfig:
     operator_profile: Path | None = None
 
     def __post_init__(self):
+        if self.vlm_graph and self.precision not in ("bf16", "w8a8", "w4a4"):
+            raise ValueError("VLM Graph supports BF16, W8A8 and W4A4 only")
+        if self.vlm_graph and self.component == "dit":
+            raise ValueError("VLM Graph requires the VLM component")
         if self.fusion_mode not in (
             "vision_rope",
             "text_rope",
@@ -103,10 +108,13 @@ class OptimizationConfig:
             self.precision != "bf16"
             or self.fusion
             or self.dit_graph
+            or self.vlm_graph
             or self.vision_channels_last
         )
 
     def validate_variant(self, variant):
+        if variant == "pir2" and self.vlm_graph:
+            raise ValueError("VLM Graph currently supports standard Flow only")
         if variant == "pir2" and self.group_conditioning:
             raise ValueError("Streaming piR2 condition grouping is not validated")
 
@@ -125,6 +133,7 @@ def add_optimization_arguments(parser):
     )
     parser.add_argument("--operator-profile", type=Path)
     parser.add_argument("--dit-cuda-graph", action="store_true")
+    parser.add_argument("--vlm-cuda-graph", action="store_true")
     parser.add_argument(
         "--quantization-scope", choices=["transformer", "all"], default="transformer"
     )
@@ -154,6 +163,7 @@ def optimization_config(args):
         fusion_mode=args.operator_fusion_mode,
         operator_profile=args.operator_profile,
         dit_graph=args.dit_cuda_graph,
+        vlm_graph=args.vlm_cuda_graph,
         scope=args.quantization_scope,
         component=args.quantization_component,
         category_id=args.quantization_category_id,

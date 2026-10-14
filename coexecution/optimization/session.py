@@ -33,6 +33,7 @@ class GrootOptimizations:
         self.backend = {}
         self.operator_profile = None
         self.boundary = None
+        self.vlm_graphs = None
 
     def __enter__(self):
         if not self.config.enabled:
@@ -200,6 +201,12 @@ class GrootOptimizations:
             graphs = DitGraphs(model.action_head.model)
             self.stack.callback(graphs.close)
             graphs.set(self.config.precision)
+        if self.config.vlm_graph:
+            from coexecution.optimization.execution.vlm import VlmGraphs
+
+            self.vlm_graphs = VlmGraphs(model.backbone)
+            self.stack.callback(self.vlm_graphs.close)
+            self.vlm_graphs.install()
         head = getattr(model, "action_head", None)
         roots = [
             root
@@ -235,6 +242,9 @@ class GrootOptimizations:
             "config": config,
             "coverage": self.coverage,
             "backend": self.backend,
+            "vlm_graph": (
+                None if self.vlm_graphs is None else self.vlm_graphs.evidence()
+            ),
             "operator_selection": (
                 None
                 if self.operator_profile is None

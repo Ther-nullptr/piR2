@@ -494,3 +494,46 @@ python -m coexecution.feature_usage \
 The optional raw-root audit verifies published and consumed source identities against the original traces. Counts always use the actual feature sequence, never the nearest publication to an RPC timestamp: a request can hold an older snapshot while a new version arrives during installation. Outputs contain per-feature DiT reads, distinct directly executed producer requests, execution ticks, zero/one/multiple-read distributions and count-weighted valid-episode summaries. Bootstrap and right-censored final features are separate; unknown sources explicitly mark accounting incomplete. Direct execution does not represent all causal contributions through the neural rolling buffer.
 
 Use `queue_report --no-figures` to export replay without Matplotlib. The optional Source Han webfont remains a separately downloaded local asset; generated reports inline it with its license when present.
+
+### Opt-in VLM CUDA Graph / 可选 VLM CUDA Graph
+
+`--vlm-cuda-graph` captures the complete Qwen3-VL visual encoder (patch embed,
+vision blocks, DeepStack and final mergers) and individual text decoder blocks.
+It works with the existing BF16, W8A8 and W4A4 execution paths without changing
+their precision. Combine it with the existing `--dit-cuda-graph` and
+`--operator-fusion` flags when measuring a matched execution baseline.
+No Graph is enabled by default. This option currently accepts standard Flow,
+Flash Attention 2, BF16 CUDA activations and fresh text prefill only. Padding
+masks, historical KV decoding, training and multiple caller streams are rejected.
+The same-process paired-worker guard remains active; the contention diagnostic
+also rejects this Graph configuration.
+
+视觉位置元数据按实际 T/H/W grid 缓存；输入每次刷新，返回的视觉、DeepStack、文本
+输出和 KV 使用独立副本。真实 KV cache 的更新保留在 Graph 外。改变输入签名或 grid
+会重新捕获；编译、预热和捕获必须排除在稳定计时之外。捕获及 replay 次数通过
+`GrootOptimizations.evidence()["vlm_graph"]` 记录。调用者仍须独占模型、权重及一个
+CUDA stream，在提交结束后同步该 stream，再退出优化作用域。退出时恢复原 forward，
+没有修改采样步数、观测选择或策略的视觉缓存语义。
+
+The AGX research prototype using all candidate W4A4 projections reduced a
+same-cohort complete local Flow request from 445.48 ms (vision block graphs) to
+428.84 ms (whole-vision graph), a 3.74% reduction, on three fixed observations.
+This is prototype evidence on Orin SM87, 15W with unlocked DVFS, official Spatial
+Flow weights, one VLM plus four DiT forwards; it is not a performance claim for
+this refactored integration. The complete quantization recipe and its 2.379x
+scan endpoint are not introduced by this Graph-only change. W4A4 policy quality
+failed the retained closed-loop pilot; replay equality does not establish task
+quality or asynchronous rolling piR2 latency.
+
+轻量配置检查通过普通仓库检查运行，不执行模型。GPU 检查需显式选择，并与稳定性能
+测量分开；使用已配置的个人 CUDA 模型环境和固定 Transformers 4.57.3：
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_vlm_graph_gpu.py
+```
+
+These tests exercise CUDA tuple-output retention, changing capture keys,
+Qwen3-VL visual/text replay, eager KV publication, unsupported masks/cache,
+exception exit and restoration. They use a small CUDA-only configuration without
+task weights. Full-checkpoint A/B and a new unprofiled benchmark remain separate
+requirements before promoting this experimental integration.

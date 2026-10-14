@@ -57,6 +57,7 @@ class ComponentBoundaries:
                 getattr(optimized.config, option, False)
                 for option in (
                     "dit_graph",
+                    "vlm_graph",
                     "norm_modulation_quant",
                     "residual_norm_quant",
                     "group_conditioning",
