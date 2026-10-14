@@ -26,6 +26,7 @@ def main():
         "tests/contracts/test_adapter_lifecycle.py",
         "tests/contracts/test_groot_optimization.py",
         "tests/contracts/test_vlm_graph_configuration.py",
+        "tests/contracts/test_integer_precision_maps.py",
         "tests/contracts/test_optimization_imports.py",
         "tests/contracts/test_backend_capabilities.py",
         "tests/contracts/test_streaming_components.py",

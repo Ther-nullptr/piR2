@@ -28,8 +28,36 @@ class OptimizationConfig:
     component: str = "all"
     fusion_mode: str = "all"
     operator_profile: Path | None = None
+    precision_map: Path | None = None
+    int4_calibration: Path | None = None
+    int4_balance_alpha: float = 0.5
+    int4_prepare: str = "register"
 
     def __post_init__(self):
+        import math
+
+        if self.precision_map is not None and self.precision not in ("w8a8", "w4a4"):
+            raise ValueError("Precision maps require integer precision")
+        if self.int4_prepare not in ("register", "reference"):
+            raise ValueError("INT4 preparation must be register or reference")
+        if (
+            isinstance(self.int4_balance_alpha, bool)
+            or not isinstance(self.int4_balance_alpha, (int, float))
+            or not math.isfinite(self.int4_balance_alpha)
+            or not 0 <= self.int4_balance_alpha <= 1
+        ):
+            raise ValueError("INT4 balance alpha must be finite in [0, 1]")
+        if self.int4_calibration is not None and self.precision not in ("w8a8", "w4a4"):
+            raise ValueError("INT4 calibration requires integer precision")
+        if (self.precision_map is not None or self.int4_calibration is not None) and (
+            self.operator_profile is not None
+            or self.group_conditioning
+            or self.norm_modulation_quant
+            or self.residual_norm_quant
+        ):
+            raise ValueError(
+                "Calibrated/mixed integer routes do not support producer overrides"
+            )
         if self.vlm_graph and self.precision not in ("bf16", "w8a8", "w4a4"):
             raise ValueError("VLM Graph supports BF16, W8A8 and W4A4 only")
         if self.vlm_graph and self.component == "dit":
@@ -113,6 +141,12 @@ class OptimizationConfig:
         )
 
     def validate_variant(self, variant):
+        if variant == "pir2" and (
+            self.precision_map is not None or self.int4_calibration is not None
+        ):
+            raise ValueError(
+                "Calibrated/mixed integer routes currently support Flow only"
+            )
         if variant == "pir2" and self.vlm_graph:
             raise ValueError("VLM Graph currently supports standard Flow only")
         if variant == "pir2" and self.group_conditioning:
@@ -145,6 +179,12 @@ def add_optimization_arguments(parser):
     parser.add_argument("--quantization-tactics", type=Path)
     parser.add_argument("--quantization-group-tactics", type=Path)
     parser.add_argument("--quantization-shape-tactics", type=Path)
+    parser.add_argument("--quantization-precision-map", type=Path)
+    parser.add_argument("--int4-calibration", type=Path)
+    parser.add_argument("--int4-balance-alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--int4-prepare", choices=["register", "reference"], default="register"
+    )
     parser.add_argument("--group-conditioning", action="store_true")
     parser.add_argument("--vision-channels-last", action="store_true")
     parser.add_argument("--norm-modulation-quant", action="store_true")
@@ -171,6 +211,10 @@ def optimization_config(args):
         tactics=args.quantization_tactics,
         group_tactics=args.quantization_group_tactics,
         shape_tactics=args.quantization_shape_tactics,
+        precision_map=args.quantization_precision_map,
+        int4_calibration=args.int4_calibration,
+        int4_balance_alpha=args.int4_balance_alpha,
+        int4_prepare=args.int4_prepare,
         group_conditioning=args.group_conditioning,
         vision_channels_last=args.vision_channels_last,
         norm_modulation_quant=args.norm_modulation_quant,

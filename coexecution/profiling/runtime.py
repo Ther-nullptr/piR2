@@ -58,6 +58,8 @@ class ComponentBoundaries:
                 for option in (
                     "dit_graph",
                     "vlm_graph",
+                    "precision_map",
+                    "int4_calibration",
                     "norm_modulation_quant",
                     "residual_norm_quant",
                     "group_conditioning",

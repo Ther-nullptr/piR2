@@ -92,6 +92,12 @@ class TransformerINT:
         self.mode = "bf16"
 
     def dispatch(self, q, x, lut=None, up=None):
+        if getattr(q, "inverse_balance", None) is not None:
+            if getattr(x, "_robotics_packed_input", False):
+                return q.forward_packed(x.for_bits(4))
+            from coexecution.kernels.ampere_ada.balanced import linear
+
+            return linear(q, x, lut, up)
         if self.candidates is not None:
             result = self.candidates.dispatch(q, x, lut, up)
             if result is not None:
@@ -113,6 +119,16 @@ class TransformerINT:
         return q.forward_packed(prepare(x, q.bits, lut, up))
 
     def _pack_dispatch_input(self, q, x, lut=None, up=None):
+        if getattr(q, "inverse_balance", None) is not None:
+            if getattr(x, "_robotics_packed_input", False):
+                return x.for_bits(4)
+            from coexecution.kernels.ampere_ada.balanced import (
+                prepare as balanced_prepare,
+            )
+
+            return balanced_prepare(
+                x, q.inverse_balance, lut, up, route=q.prepare_route
+            )
         if self.candidates is not None:
             return self.candidates.pack_input(q, x, lut, up)
         if getattr(x, "_robotics_packed_input", False):
@@ -173,3 +189,33 @@ class TransformerINT:
 
     def close(self):
         self.set("bf16")
+
+    def set_mapping(self, mapping):
+        from coexecution.optimization.precision import checked_precision_map
+
+        mapping = checked_precision_map(mapping, self.sites, self.groups)
+        self.set("bf16")
+        for name, (module, _, _) in self.sites.items():
+            module.forward = self.quant[mapping[name]][name].forward
+        for bits, records in self.grouped.items():
+            for names, group in records:
+                if mapping[names[0]] == bits:
+                    for index, name in enumerate(names):
+                        self.sites[name][0].forward = lambda x, g=group, i=index: (
+                            g.project(x, i)
+                        )
+        for activation, attr, down, approximate in self.activations:
+            setattr(activation, attr, lambda x: x)
+            q = self.quant[mapping[down]][down]
+            self.sites[down][0].forward = lambda x, q=q, a=approximate: q.forward_gelu(
+                x, approximate=a
+            )
+        for mlp, down in self.text:
+
+            def forward(x, module=mlp, q=self.quant[mapping[down]][down]):
+                return self.dispatch(
+                    q, module.gate_proj(x), self.silu_lut, module.up_proj(x)
+                )
+
+            mlp.forward = forward
+        self.mode = "mixed"

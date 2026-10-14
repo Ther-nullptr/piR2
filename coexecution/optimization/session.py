@@ -171,16 +171,39 @@ class GrootOptimizations:
             configure_integer_controller(controller, profile)
             extra = AdditionalConnections(self.policy, controller, categories)
             self.stack.callback(extra.close)
+            balance_evidence = None
+            if self.config.int4_calibration is not None:
+                from coexecution.optimization.groot.calibration import install_balance
+
+                balance_evidence = install_balance(
+                    controller,
+                    extra,
+                    self.config.int4_calibration,
+                    alpha=self.config.int4_balance_alpha,
+                    route=self.config.int4_prepare,
+                )
             apply_tactics(
                 controller, extra, self.config, recorded, backend_evidence=self.backend
             )
-            controller.set(self.config.precision)
+            precision_map = None
+            if self.config.precision_map is not None:
+                from coexecution.optimization.precision import read_precision_map
+
+                precision_map = read_precision_map(
+                    self.config.precision_map,
+                    {*controller.sites, *categories},
+                    controller.groups,
+                )
+                controller.set_mapping({n: precision_map[n] for n in controller.sites})
+            else:
+                controller.set(self.config.precision)
             extra.set(
                 self.config.precision,
                 expanded=expanded,
                 fuse=fuse_integer_modulation(self.config, profile),
                 norm_quant=self.config.norm_modulation_quant,
                 residual_quant=self.config.residual_norm_quant,
+                precision_map=precision_map,
             )
             self.coverage = {
                 "linears": sorted(controller.sites),
@@ -190,6 +213,8 @@ class GrootOptimizations:
                 "category_id": self.config.category_id,
                 "projection_groups": controller.groups,
                 "tactic_policy": "Exact runtime shape, then explicit site/group, then 0",
+                "int4_balance": balance_evidence,
+                "precision_map": precision_map,
             }
             self.coverage["operator_adapters"] = install_integer_adapters(
                 self, controller, pointwise, profile
@@ -231,6 +256,8 @@ class GrootOptimizations:
             "group_tactics",
             "shape_tactics",
             "operator_profile",
+            "precision_map",
+            "int4_calibration",
         ):
             path = config[key]
             config[key] = (

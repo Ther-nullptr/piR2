@@ -13,6 +13,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 _FAILED_BUILDS = set()
 BACKENDS = {
+    "int4_prepare": {
+        "namespace": "pir2_int4_prepare",
+        "sources": ("ampere_ada/csrc/int4_balanced_prepare.cu",),
+        "cutlass": False,
+        "cuda_flags": ("--fmad=false", "--ftz=false"),
+        "operators": ("prepare", "linear"),
+    },
     "integer": {
         "namespace": "pir2_integer",
         "sources": ("ampere_ada/csrc/integer_gemm.cu",),

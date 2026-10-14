@@ -78,7 +78,14 @@ class AdditionalConnections:
                 )
 
     def set(
-        self, mode, *, expanded=True, fuse=True, norm_quant=False, residual_quant=False
+        self,
+        mode,
+        *,
+        expanded=True,
+        fuse=True,
+        norm_quant=False,
+        residual_quant=False,
+        precision_map=None,
     ):
         self.close()
         if (norm_quant or residual_quant) and (not fuse or mode == "bf16"):
@@ -89,7 +96,12 @@ class AdditionalConnections:
             raise ValueError("Residual fusion requires norm quantization fusion")
         if mode == "bf16":
             return
-        bits = {"w8a8": 8, "w4a4": 4}[mode]
+        default_bits = {"w8a8": 8, "w4a4": 4}[mode]
+        if precision_map is not None and (norm_quant or residual_quant):
+            raise ValueError(
+                "Mixed precision does not support norm/residual producer overrides"
+            )
+        bits = default_bits
         if residual_quant:
             quantized = {id(module) for module, _, _ in self.controller.sites.values()}
             self.blocks = [
@@ -114,7 +126,10 @@ class AdditionalConnections:
             )
         if expanded:
             for name, (module, category) in self.categories.items():
-                q = self.quant[bits][name]
+                selected = (
+                    default_bits if precision_map is None else precision_map[name]
+                )
+                q = self.quant[selected][name]
 
                 def forward(x, cat_ids, q=q, category=category):
                     if (
@@ -133,27 +148,48 @@ class AdditionalConnections:
 
                 module.forward = forward
         if fuse:
+            names = {
+                id(module): name
+                for name, (module, _, _) in self.controller.sites.items()
+            }
             for norm in self.norms:
+                block = next(b for b in self.all_blocks if b.norm1 is norm)
+                query_name = names[id(block.attn1.to_q)]
+                selected = (
+                    default_bits if precision_map is None else precision_map[query_name]
+                )
+                q = self.controller.quant[selected][query_name]
+                inverse = getattr(q, "inverse_balance", None)
 
-                def forward(x, temb=None, norm=norm):
+                def forward(x, temb=None, norm=norm, bits=selected, inverse=inverse):
                     scale, shift = norm.linear(norm.silu(temb)).chunk(2, dim=-1)
                     normalized = x if norm_quant else norm.norm(x)
                     prepare = (
                         prepare_norm_modulation if norm_quant else prepare_modulation
                     )
                     options = {"eps": norm.norm.eps} if norm_quant else {}
+                    if inverse is not None:
+                        from coexecution.kernels.ampere_ada.balanced import (
+                            prepare_modulation as balanced_modulation,
+                        )
+
+                        prepare = balanced_modulation
                     if scale.ndim == 3:
                         width = x.shape[-1]
                         packed = prepare(
                             normalized.reshape(-1, 1, width),
                             scale.reshape(-1, 1, width),
                             shift.reshape(-1, 1, width),
-                            bits,
+                            inverse if inverse is not None else bits,
                             **options,
                         )
                     else:
                         packed = prepare(
-                            normalized, scale[:, None], shift[:, None], bits, **options
+                            normalized,
+                            scale[:, None],
+                            shift[:, None],
+                            inverse if inverse is not None else bits,
+                            **options,
                         )
                     return packed_input(packed, x.shape)
 

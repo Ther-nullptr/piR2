@@ -520,8 +520,8 @@ same-cohort complete local Flow request from 445.48 ms (vision block graphs) to
 428.84 ms (whole-vision graph), a 3.74% reduction, on three fixed observations.
 This is prototype evidence on Orin SM87, 15W with unlocked DVFS, official Spatial
 Flow weights, one VLM plus four DiT forwards; it is not a performance claim for
-this refactored integration. The complete quantization recipe and its 2.379x
-scan endpoint are not introduced by this Graph-only change. W4A4 policy quality
+this refactored integration. The integer recipe and progressive protocol are
+described below. W4A4 policy quality
 failed the retained closed-loop pilot; replay equality does not establish task
 quality or asynchronous rolling piR2 latency.
 
@@ -537,3 +537,100 @@ Qwen3-VL visual/text replay, eager KV publication, unsupported masks/cache,
 exception exit and restoration. They use a small CUDA-only configuration without
 task weights. Full-checkpoint A/B and a new unprofiled benchmark remain separate
 requirements before promoting this experimental integration.
+
+### Calibrated INT4 and progressive INT8/INT4 / 校准量化与渐进精度
+
+The default integer recipe is unchanged. `--int4-calibration FILE` explicitly
+enables per-input-channel balancing for INT4: `A_absmax**alpha /
+W_absmax**(1-alpha)`, with alpha default 0.5 and scale clamped to [1e-3,1e3].
+Shared-input projection siblings use a common scale. Original BF16 parameters
+and INT8 packs remain untouched. Weight balancing is materialized in BF16
+before INT4 weight packing; activation balancing is fused after the existing
+BF16 nonlinear/gated-product boundary and before RN row quantization. This is
+a lossy recipe, not bitwise equivalence to BF16 or unbalanced INT4.
+
+`--int4-prepare register` uses the register-resident CUDA preparation kernel:
+read activation/LUT/gated product once, retain values during row absmax
+reduction, then quantize and write low-nibble-first bytes. It keeps RN division;
+the rejected reciprocal-division experiment is not part of this path.
+`--int4-prepare reference` explicitly selects the Triton comparison route.
+Register preparation supports BF16 CUDA rows with feature stride1, logical
+K<=8192 and padded widths128/256/512/768/1024/1536/2048/3072/4096/6144/8192.
+The runtime rejects unsupported widths rather than changing precision.
+The native Linear dispatch reuses the existing integer GEMM, scale/bias order,
+BF16 output and shape-tactic selector. It is not a new INT8/INT4 dot implementation.
+
+校准需在调用者的原始 BF16 CUDA policy 上显式执行，使用匹配的权重和观测，放在性能
+计时之外。`ActivationCalibration` 收集实际执行候选的逐通道 absmax，退出后移除
+全部 hook；`statistics()` 拒绝缺失候选或非有限值。示例中的 `observation` 应为当前
+policy 处理器要求的真实输入，采样步数和 seed 由调用者固定：
+
+```python
+import torch
+from coexecution.optimization.groot.calibration import ActivationCalibration
+
+with (
+    torch.inference_mode(),
+    ActivationCalibration(policy, expanded=True, category_id=2) as calibration,
+):
+    policy.get_action(observation)
+torch.save(calibration.statistics(), ".local/calibration-maxima.pt")
+```
+
+Calibrated and mixed routes currently accept standard Flow only. They reject
+condition grouping, norm/residual producer overrides and operator profiles
+whose interaction was not validated. Existing ordinary integer and serial piR2
+options retain their previous behavior. Only privately owned frozen models are
+supported; the serial and same-process paired-worker restrictions stay active.
+
+`--quantization-precision-map FILE` accepts a versioned complete map:
+`{"schema_version":1,"precision_map":{"candidate.name":4,...}}`.
+Every selected Linear and fixed-category projection must appear exactly once,
+with integer value4 or8. Shared input groups must select one common precision;
+partial maps, extra sites, Boolean values and split groups fail installation.
+Noncandidate modules stay BF16. `GrootOptimizations.evidence()` records file
+hashes, the executed precision map, calibration alpha/route and scale ranges.
+There is no process-global precision map or class-wide quantizer monkeypatch.
+
+`progressive_maps` in `coexecution.optimization.precision` generates a fixed
+cumulative order: Vision -> text -> visual-feature transformer -> DiT ->
+additional -> category. Shared groups switch atomically. The x-axis is the
+actual candidate count fraction, not parameters or FLOPs. For the retained
+GR00T inventory (469 Linear +7 category sites), its11 maps exactly reproduce
+the measured counts0/48/96/145/191/238/286/334/382/429/476. Maps select real
+W8A8/W4A4 implementations, with no candidate BF16 fallback. A new scope can
+load each map; packing, warmup/capture and mode setup stay outside timing.
+Close and drain a scope before changing precision; this interface does not
+hot-switch live Graphs. The historical sweep reused persistent packs, so its
+setup cost is not a claim about this scoped installation's setup cost.
+
+`benchmark_integer_tactics(q, packed)` and `benchmark_linear_pair(source, q, x)`
+in `coexecution.optimization.benchmark` require caller-supplied CUDA weights and
+actual captured inputs. The former times all8 existing tactics on real integer
+payloads and retains tactic0 unless the median improves by3%; the latter
+includes activation quantization/packing and output conversion. Both warm up,
+capture outside timing and interleave stable Graph samples with a fixed seed.
+They report GPU elapsed; complete model request wall latency and kernel totals
+must be measured separately. Selection needs repeated validation on other
+inputs, not just the local minimum. Benchmark only idle privately owned inputs.
+
+AGX 实验原型的三个固定真实观测（task0/3/7、初始0、seed1000/4000/8000），串行
+官方 Flow、VLM1+DiT4 的完整本地请求扫描中位数：原始 BF16 993.51ms，同辅助优化
+BF16 633.97ms，全 W8A8 502.01ms（总体1.979x、量化增量1.263x），全 W4A4
+417.61ms（总体2.379x、量化增量1.518x）。这是原型完整执行链，包括已有融合、
+DiT Graph 和本节 VLM Graph；不是单一新 kernel 的收益，也不是此整理版本的复测。
+Orin SM87 /15W，DVFS未锁。W4A4 误差仍大、闭环初验0/10，不能宣称策略质量达标。
+原始 BF16 与同辅助优化 BF16 必须同时保留；量化扫描不是 rolling并发或闭环加速。
+
+显式 CUDA 检查包含独立 FP64 除法/整数 dot 参考、真实 INT8/INT4 GEMM、LUT/门控/零值/
+非连续行打包、AdaLN BF16 边界、校准与映射端点、实例隔离、原参数及退出恢复：
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q \
+  tests/gpu/test_balanced_integer_gpu.py tests/gpu/test_vlm_graph_gpu.py
+```
+
+Compile/warm outside performance timing. These checks do not establish full
+checkpoint quality; full-weight same-observation A/B and closed-loop assessment
+remain separate. Generated calibration, maps, measured tactic profiles, curves,
+traces and task results belong under local experiment directories, never Git.
