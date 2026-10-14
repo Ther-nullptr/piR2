@@ -3,14 +3,37 @@
 import gc
 import json
 import math
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from libero_protocol_scheduler import CommandTimeline, latency_budget, summarize_values
 from libero_queue_trace import LatestFrameMailbox, QueueTrace, feature_dependency
+
+# Preserve direct scripts-directory imports from outside the repository cwd.
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from coexecution.libero.features import (
+    TIMING_VERSION,
+    prepare_episode_vision,
+    validate_feature_meta,
+    validate_feature_options,
+)
+from coexecution.libero.resident import (
+    ClientFeatureLeases,
+    close_remote_features,
+    feature_rpc_client,
+    remote_feature_session,
+)
+from coexecution.libero.scheduling import (
+    AdmissionSchedule,
+)
 
 
 @dataclass(frozen=True)
@@ -86,8 +109,20 @@ def release_service(anchor_s, raw_completed_s, min_service_ms, clock):
 
 
 class VisionWorker:
-    def __init__(self, port, events=None, min_service_ms=0, clock=None):
+    def __init__(
+        self,
+        port,
+        events=None,
+        min_service_ms=0,
+        clock=None,
+        max_hz=0,
+        feature_transport="numpy_fp32",
+    ):
         validate_service_floor(min_service_ms)
+        validate_feature_options(feature_transport)
+        self.feature_transport, self.leases = feature_transport, None
+        self.admission_schedule = AdmissionSchedule(max_hz)
+        self.max_hz = max_hz
         self.port = port
         self.min_service_ms = min_service_ms
         self.clock = clock or RealClock()
@@ -97,18 +132,24 @@ class VisionWorker:
         self.error = None
         self.submitted = 0
         self.completed = 0
+        self.offered_frames = 0
         self.skipped_frames = 0
+        self.admissions = []
         self.latencies = []
         self.rpc_times = []
         self.stop_time = None
+        self.stop_requested_s = None
         self.dropped_at_stop = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def offer(self, observation):
         with self.condition:
+            self.offered_frames += 1
             if self.queue.offer(observation) is not None:
                 self.skipped_frames += 1
+            if self.stopping and self.queue.drop_pending() is not None:
+                self.dropped_at_stop += 1
             self.condition.notify()
 
     def snapshot(self):
@@ -132,24 +173,72 @@ class VisionWorker:
 
         client = PolicyClient(host="127.0.0.1", port=self.port, timeout_ms=120000)
         try:
+            if self.feature_transport == "cuda_local":
+                identity = client.call_endpoint("identity", requires_input=False)
+                self.leases = ClientFeatureLeases.new(identity["feature_exchange"])
+                self.leases.open(client.call_endpoint)
             while True:
                 with self.condition:
-                    self.condition.wait_for(
-                        lambda: self.stopping or self.queue.pending is not None
-                    )
+                    wait_started = None
+                    while not self.stopping:
+                        self.condition.wait_for(
+                            lambda: self.stopping or self.queue.pending is not None
+                        )
+                        if self.stopping:
+                            break
+                        admitted = self.clock.now()
+                        remaining = self.admission_schedule.remaining(admitted)
+                        if remaining <= 0:
+                            break
+                        if wait_started is None:
+                            wait_started = admitted
+                        self.queue.events.emit(
+                            "vision_admission_wait",
+                            t_s=admitted,
+                            vision_max_hz=self.max_hz,
+                            admission_eligible_s=self.admission_schedule.next_admission_s,
+                            admission_wait_started_s=wait_started,
+                            camera_queue=self.queue.snapshot(),
+                        )
+                        # Keep the pending frame replaceable until admission.
+                        # Every offer and stop wakes this wait to recheck state.
+                        self.condition.wait(min(remaining, threading.TIMEOUT_MAX))
                     if self.stopping:
                         break
+                    admission = {
+                        "admitted_s": admitted,
+                        "admission_eligible_s": self.admission_schedule.next_admission_s,
+                        "admission_wait_started_s": wait_started,
+                        "admission_wait_seconds": admitted - wait_started
+                        if wait_started is not None
+                        else 0.0,
+                        "vision_max_hz": self.max_hz,
+                    }
+                    self.admission_schedule.record_admission(admitted)
                     observation = self.queue.take()
                     self.submitted += 1
+                    self.admissions.append(admission)
+                    self.queue.events.emit(
+                        "vision_admitted",
+                        t_s=admitted,
+                        source_tick=observation.tick,
+                        capture_s=observation.capture_s,
+                        camera_queue=self.queue.snapshot(),
+                        **admission,
+                    )
+                # RPC entry is distinct from admission: stop can be observed
+                # after an admission while this already-owned request starts.
                 start = self.clock.now()
-                result = client.call_endpoint(
-                    "vision",
-                    {
-                        "observation": to_nested(observation.data),
-                        "capture_s": observation.capture_s,
-                        "source_tick": observation.tick,
-                        "return_features": True,
-                    },
+                payload = {
+                    "observation": to_nested(observation.data),
+                    "capture_s": observation.capture_s,
+                    "source_tick": observation.tick,
+                    "return_features": True,
+                }
+                result = (
+                    self.leases.vision(client.call_endpoint, payload)
+                    if self.leases is not None
+                    else client.call_endpoint("vision", payload)
                 )
                 if result["meta"]["vlm_forward_calls"] != 1:
                     raise RuntimeError(
@@ -165,6 +254,7 @@ class VisionWorker:
                     raw_service_seconds=raw_completed - start,
                     service_floor_ms=self.min_service_ms,
                     server_vlm_seconds=result["meta"]["vlm_seconds"],
+                    **admission,
                 )
                 timing = release_service(
                     start, raw_completed, self.min_service_ms, self.clock
@@ -174,10 +264,16 @@ class VisionWorker:
                 self.rpc_times.append(
                     {
                         "started_s": start,
+                        **admission,
                         **timing,
                         "source_tick": observation.tick,
                         "capture_s": observation.capture_s,
                         "server_vlm_seconds": result["meta"]["vlm_seconds"],
+                        "feature_wire": result["meta"].get("feature_wire"),
+                        "graph_execution": result["meta"].get("graph_execution"),
+                        "feature_exchange": result.get("feature_exchange"),
+                        "frame_hashes": result["meta"].get("frame_hashes"),
+                        "requested_tick": result["meta"].get("requested_tick"),
                     }
                 )
                 with self.condition:
@@ -193,8 +289,16 @@ class VisionWorker:
 
     def request_stop(self, cutoff=None):
         with self.condition:
-            if self.stop_time is None:
-                self.stop_time = self.clock.now() if cutoff is None else cutoff
+            if not self.stopping:
+                self.stop_requested_s = self.clock.now()
+                self.stop_time = self.stop_requested_s if cutoff is None else cutoff
+                self.queue.events.emit(
+                    "vision_stop_requested",
+                    t_s=self.stop_requested_s,
+                    control_end_cutoff_s=self.stop_time,
+                    vision_max_hz=self.max_hz,
+                    camera_queue=self.queue.snapshot(),
+                )
             if self.queue.drop_pending() is not None:
                 self.dropped_at_stop += 1
             self.stopping = True
@@ -203,9 +307,37 @@ class VisionWorker:
     def close(self):
         self.request_stop()
         self.thread.join()
+        # The controller joins ActionWorker first. Its pending task/fallback
+        # references can no longer use a lease when this session is revoked.
+        if self.leases is not None:
+            with self.condition:
+                if self.queue.latest is not None:
+                    self.queue.latest = {
+                        "meta": self.queue.latest["meta"],
+                        "sequence": self.queue.latest["sequence"],
+                    }
+        close_remote_features(self.leases, self.port)
         if self.error is not None:
             raise RuntimeError("VLM worker failed") from self.error
+        starts = [row["admitted_s"] for row in self.admissions]
+        span = starts[-1] - starts[0] if starts else 0
         return {
+            "vision_max_hz": self.max_hz,
+            "offered_sensor_frames": self.offered_frames,
+            "admitted": len(starts),
+            "admission_starts_s": starts,
+            "admission_wait_seconds": [
+                row["admission_wait_seconds"] for row in self.admissions
+            ],
+            "actual_admission_hz": (len(starts) - 1) / span if span > 0 else None,
+            "stop_requested_s": self.stop_requested_s,
+            "control_end_cutoff_s": self.stop_time,
+            "admitted_after_stop_request": sum(
+                started > self.stop_requested_s for started in starts
+            ),
+            "admitted_after_control_end": sum(
+                started > self.stop_time for started in starts
+            ),
             "submitted": self.submitted,
             "completed": self.completed,
             "skipped_sensor_frames": self.skipped_frames,
@@ -223,17 +355,26 @@ class VisionWorker:
 
 class ActionWorker:
     def __init__(
-        self, port, events=None, initial_feature=None, min_service_ms=0, clock=None
+        self,
+        port,
+        events=None,
+        initial_feature=None,
+        min_service_ms=0,
+        clock=None,
+        feature_rpc="separate",
     ):
         validate_service_floor(min_service_ms)
+        validate_feature_options(rpc=feature_rpc)
         self.port = port
         self.min_service_ms = min_service_ms
         self.clock = clock or RealClock()
         self.events = events or QueueTrace(clock=self.clock.now)
         self.initial_feature = initial_feature
+        self.feature_rpc = feature_rpc
         self.local = threading.local()
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.completed = []
+        self.closed = False
 
     def submit(
         self,
@@ -268,6 +409,12 @@ class ActionWorker:
         client = self.local.client
         started = self.clock.now()
         selected = visual if visual is not None else self.local.feature
+        if selected is not None:
+            validate_feature_meta(
+                selected["meta"],
+                state_capture_s=observation.capture_s,
+                request_tick=observation.tick,
+            )
         self.events.emit(
             "action_started",
             t_s=started,
@@ -279,25 +426,46 @@ class ActionWorker:
             deadline_s=deadline_s,
             **feature_dependency(selected),
         )
-        if visual is not None and visual["sequence"] != self.local.installed:
+        new_feature = visual is not None and visual["sequence"] != self.local.installed
+        payload = {
+            "observation": {"state": to_nested(observation.data)["state"]},
+            "request_tick": r,
+            "delay_ticks": d,
+            "committed_actions": prefix,
+            "state_capture_s": observation.capture_s,
+            "output_scope": "native",
+        }
+        if new_feature and self.feature_rpc == "separate":
             client.call_endpoint(
                 "install", {"vl_embeds": visual["vl_embeds"], "meta": visual["meta"]}
             )
             self.local.installed = visual["sequence"]
             self.local.feature = visual
+        elif new_feature:
+            payload.update(vl_embeds=visual["vl_embeds"], feature_meta=visual["meta"])
         plan_rpc_start = self.clock.now()
-        result = client.call_endpoint(
-            "plan",
-            {
-                "observation": {"state": to_nested(observation.data)["state"]},
-                "request_tick": r,
-                "delay_ticks": d,
-                "committed_actions": prefix,
-                "state_capture_s": observation.capture_s,
-                "output_scope": "native",
-            },
-        )
+        result = client.call_endpoint("plan", payload)
+        if new_feature and self.feature_rpc == "combined":
+            self.local.installed = visual["sequence"]
+            self.local.feature = visual
         raw_completed = self.clock.now()
+        server_start = result["audit"].get("server_plan_started_s")
+        server_timing = {
+            "timing_version": TIMING_VERSION if server_start is not None else 1,
+            "feature_rpc": self.feature_rpc,
+            "feature_use_boundary": "server_plan_started_s"
+            if server_start is not None
+            else "plan_rpc_started_s",
+            **{
+                name: result["audit"].get(name)
+                for name in (
+                    "server_request_started_s",
+                    "server_install_started_s",
+                    "server_install_completed_s",
+                    "server_plan_started_s",
+                )
+            },
+        }
         actual_feature = {
             "sequence": selected.get("sequence") if selected else None,
             "meta": result["audit"]["cache"],
@@ -322,6 +490,7 @@ class ActionWorker:
             **timing,
             "deadline_s": deadline_s,
             "plan_rpc_started_s": plan_rpc_start,
+            **server_timing,
             "state_tick": observation.tick,
             "state_capture_s": observation.capture_s,
             **feature_dependency(actual_feature),
@@ -331,6 +500,16 @@ class ActionWorker:
             "state_age_at_request_ms": max(
                 0.0, (plan_rpc_start - observation.capture_s) * 1000
             ),
+            "cache_age_at_server_plan_ms": max(
+                0.0, (server_start - result["audit"]["cache"]["capture_s"]) * 1000
+            )
+            if server_start is not None
+            else None,
+            "state_age_at_server_plan_ms": max(
+                0.0, (server_start - observation.capture_s) * 1000
+            )
+            if server_start is not None
+            else None,
         }
         self.events.emit(
             "action_completed",
@@ -346,13 +525,30 @@ class ActionWorker:
             request_elapsed_s=completed - submitted_s,
             worker_elapsed_s=completed - started,
             **timing,
+            **server_timing,
             **feature_dependency(actual_feature),
         )
         self.completed.append(result)
         return result
 
     def close(self):
-        self.pool.shutdown(wait=True)
+        if self.closed:
+            return
+
+        def release():
+            if hasattr(self.local, "client"):
+                self.local.feature = None
+                if hasattr(self.local.client, "socket"):
+                    self.local.client.socket.close()
+                    self.local.client.context.term()
+                del self.local.client
+
+        try:
+            self.pool.submit(release).result()
+        finally:
+            self.pool.shutdown(wait=True)
+            self.initial_feature = None
+            self.closed = True
 
 
 def run_control_loop(
@@ -654,6 +850,16 @@ def run_control_loop(
             ),
             "slow_gpu_vlm": vlm_stats["completed"],
         },
+        "scored_cold_capture_requests": {
+            "action": sum(
+                bool(x["audit"].get("graph_execution", {}).get("cold_capture"))
+                for x in completed
+            ),
+            "vlm": sum(
+                bool((x.get("graph_execution") or {}).get("cold_capture"))
+                for x in vlm_stats.get("rpc_times", [])
+            ),
+        },
         "sensor_release_contract_verified": all(
             released >= target for _, released, target in observation_events
         ),
@@ -671,6 +877,8 @@ def calibrate(
     port,
     action_min_service_ms=0,
     clock=None,
+    feature_rpc="separate",
+    feature_transport="numpy_fp32",
 ):
     clock = clock or RealClock()
     boot = client.call_endpoint(
@@ -685,7 +893,9 @@ def calibrate(
     queue = CommandTimeline(boot["actions"])
     samples = []
     raw_samples = []
-    actor = ActionWorker(port, min_service_ms=action_min_service_ms, clock=clock)
+    actor = ActionWorker(
+        port, min_service_ms=action_min_service_ms, clock=clock, feature_rpc=feature_rpc
+    )
     try:
         for tick in range(12):
             prefix = queue.reserve(tick, 1)
@@ -708,6 +918,7 @@ def calibrate(
                     "excluded": tick < 2,
                     "rpc_seconds": elapsed,
                     "server_seconds": result["audit"]["server_seconds"],
+                    "graph_execution": result["audit"].get("graph_execution"),
                     **{
                         key: value
                         for key, value in result["client_timing"].items()
@@ -724,6 +935,16 @@ def calibrate(
                             "raw_target_overrun_seconds",
                             "target_overrun_seconds",
                             "floor_miss",
+                            "plan_rpc_started_s",
+                            "server_request_started_s",
+                            "server_install_started_s",
+                            "server_install_completed_s",
+                            "server_plan_started_s",
+                            "feature_use_boundary",
+                            "timing_version",
+                            "feature_rpc",
+                            "cache_age_at_request_ms",
+                            "cache_age_at_server_plan_ms",
                         }
                     },
                 }
@@ -753,6 +974,8 @@ def calibrate(
         "over_training_budget": ood,
         "includes_cache_install_and_thread_queue": True,
         "action_min_service_ms": action_min_service_ms,
+        "feature_rpc": feature_rpc,
+        "feature_transport": feature_transport,
         "service_floor_scope": "submission to visible result, including executor queue, install and plan; raw server time unchanged",
         "workload": "solo_action_with_cache_install_without_concurrent_vlm",
         "scope": "warm GPU/RPC timing; reset and fresh sensor capture follow before scored control",
@@ -765,81 +988,112 @@ def deployment_episode(env, observation, client, args, seed, trace):
     period = 1 / args.control_hz
     action_floor = getattr(args, "action_min_service_ms", 0)
     vision_floor = getattr(args, "vision_min_service_ms", 0)
+    vision_max_hz = getattr(args, "vision_max_hz", 0)
+    feature_rpc = getattr(args, "feature_rpc", "separate")
+    feature_transport = getattr(args, "feature_transport", "numpy_fp32")
     fixed_delay = getattr(args, "deployment_fixed_delay", None)
     capture = time.monotonic()
     if not hasattr(args, "slow_warmup"):
         from gr00t.policy.server_client import PolicyClient
 
         slow = PolicyClient(host="127.0.0.1", port=args.slow_port, timeout_ms=120000)
-        records = []
-        for sample_index in range(getattr(args, "slow_warmup_calls", 12)):
-            started = time.monotonic()
-            visual = slow.call_endpoint(
-                "vision",
-                {
-                    "observation": to_nested(observation),
-                    "capture_s": capture,
-                    "source_tick": 0,
-                    "return_features": True,
-                },
-            )
-            assert visual["meta"]["vlm_forward_calls"] == 1
-            timing = release_service(
-                started, time.monotonic(), vision_floor, RealClock()
-            )
-            records.append(
-                {
-                    "rpc_seconds": timing["completed_s"] - started,
-                    **timing,
-                    "sample_index": sample_index,
-                    "excluded": sample_index < 2,
-                    "vlm_seconds": visual["meta"]["vlm_seconds"],
-                    "vlm_forward_calls": 1,
+        try:
+            with remote_feature_session(
+                slow, args.slow_port, feature_transport
+            ) as warmup_leases:
+                records = []
+                for sample_index in range(getattr(args, "slow_warmup_calls", 12)):
+                    started = time.monotonic()
+                    payload = {
+                        "observation": to_nested(observation),
+                        "capture_s": capture,
+                        "source_tick": 0,
+                        "return_features": True,
+                    }
+                    visual = (
+                        warmup_leases.vision(slow.call_endpoint, payload)
+                        if warmup_leases is not None
+                        else slow.call_endpoint("vision", payload)
+                    )
+                    assert visual["meta"]["vlm_forward_calls"] == 1
+                    timing = release_service(
+                        started, time.monotonic(), vision_floor, RealClock()
+                    )
+                    records.append(
+                        {
+                            "rpc_seconds": timing["completed_s"] - started,
+                            **timing,
+                            "sample_index": sample_index,
+                            "excluded": sample_index < 2,
+                            "vlm_seconds": visual["meta"]["vlm_seconds"],
+                            "vlm_forward_calls": 1,
+                            "feature_wire": visual["meta"].get("feature_wire"),
+                            "graph_execution": visual["meta"].get("graph_execution"),
+                        }
+                    )
+                args.slow_warmup = {
+                    "scope": "outside scored control, repeated for each condition/process",
+                    "vision_min_service_ms": vision_floor,
+                    "service_floor_scope": "worker RPC start to visible result; real VLM is computed before any wait",
+                    "calls": records,
+                    "workload": "solo_vlm_without_concurrent_action",
+                    "included_sample_count": sum(
+                        not row["excluded"] for row in records
+                    ),
+                    "rpc_seconds": summarize_values(
+                        [row["rpc_seconds"] for row in records if not row["excluded"]]
+                    ),
+                    "server_vlm_seconds": summarize_values(
+                        [row["vlm_seconds"] for row in records if not row["excluded"]]
+                    ),
                 }
-            )
-        slow.socket.close()
-        slow.context.term()
-        args.slow_warmup = {
-            "scope": "outside scored control, repeated for each condition/process",
-            "vision_min_service_ms": vision_floor,
-            "service_floor_scope": "worker RPC start to visible result; real VLM is computed before any wait",
-            "calls": records,
-            "workload": "solo_vlm_without_concurrent_action",
-            "included_sample_count": sum(not row["excluded"] for row in records),
-            "rpc_seconds": summarize_values(
-                [row["rpc_seconds"] for row in records if not row["excluded"]]
-            ),
-            "server_vlm_seconds": summarize_values(
-                [row["vlm_seconds"] for row in records if not row["excluded"]]
-            ),
-        }
-        (args.output / "slow-warmup.json").write_text(
-            json.dumps(args.slow_warmup, indent=2) + "\n"
-        )
-        calibration_path = args.output / "calibration.json"
-        if calibration_path.exists():
-            calibration = json.loads(calibration_path.read_text())
-            if calibration.get("action_min_service_ms", 0) != action_floor:
-                raise RuntimeError(
-                    "Action service floor changed from saved calibration"
+                (args.output / "slow-warmup.json").write_text(
+                    json.dumps(args.slow_warmup, indent=2) + "\n"
                 )
-            d = calibration["selected_delay_ticks"]
-        else:
-            d, calibration = calibrate(
-                client,
-                observation,
-                capture,
-                seed,
-                period,
-                visual,
-                args.port,
-                action_min_service_ms=action_floor,
-            )
-        args.calibration = (d, calibration)
-        calibration_path.write_text(json.dumps(calibration, indent=2) + "\n")
+                calibration_path = args.output / "calibration.json"
+                if calibration_path.exists():
+                    calibration = json.loads(calibration_path.read_text())
+                    if calibration.get("action_min_service_ms", 0) != action_floor:
+                        raise RuntimeError(
+                            "Action service floor changed from saved calibration"
+                        )
+                    if (
+                        calibration.get("feature_rpc", "separate") != feature_rpc
+                        or calibration.get("feature_transport", "numpy_fp32")
+                        != feature_transport
+                    ):
+                        raise RuntimeError(
+                            "Feature transport changed from saved calibration"
+                        )
+                    d = calibration["selected_delay_ticks"]
+                else:
+                    d, calibration = calibrate(
+                        client,
+                        observation,
+                        capture,
+                        seed,
+                        period,
+                        visual,
+                        args.port,
+                        action_min_service_ms=action_floor,
+                        feature_rpc=feature_rpc,
+                        feature_transport=feature_transport,
+                    )
+                args.calibration = (d, calibration)
+                calibration_path.write_text(json.dumps(calibration, indent=2) + "\n")
+        finally:
+            slow.socket.close()
+            slow.context.term()
     d, calibration = args.calibration
     if fixed_delay is not None:
         d = fixed_delay
+    # Each task can introduce a new VLM graph bucket. Prepare S2 before the
+    # fresh S1 bootstrap capture, for all layouts/transports; no warmup feature
+    # enters the scored mailbox or replaces a scored frame's neural execution.
+    with feature_rpc_client(args.slow_port) as slow:
+        vision_preparation = prepare_episode_vision(
+            slow, to_nested(observation), capture
+        )
     gc.collect()
     observation = env._process_observation(
         env._env.env._get_observations(force_update=True)
@@ -863,8 +1117,15 @@ def deployment_episode(env, observation, client, args, seed, trace):
             "meta": {"capture_s": capture, "source_tick": 0},
         },
         min_service_ms=action_floor,
+        feature_rpc=feature_rpc,
     )
-    vision = VisionWorker(args.slow_port, events=events, min_service_ms=vision_floor)
+    vision = VisionWorker(
+        args.slow_port,
+        events=events,
+        min_service_ms=vision_floor,
+        max_hz=vision_max_hz,
+        feature_transport=feature_transport,
+    )
 
     def advance(action):
         from evaluate_libero_protocol import checked_env_step
@@ -899,13 +1160,18 @@ def deployment_episode(env, observation, client, args, seed, trace):
     result["bootstrap_forward_counts"] = boot["forward_counts"]
     result["calibration"] = calibration
     result["visual_solo_calibration"] = args.slow_warmup
+    result["vision_preparation"] = vision_preparation
     result["service_controls"] = {
         "action_min_service_ms": action_floor,
         "vision_min_service_ms": vision_floor,
+        "vision_max_hz": vision_max_hz,
+        "feature_rpc": feature_rpc,
+        "feature_transport": feature_transport,
+        "server_layout": getattr(args, "server_layout", "split"),
         "deployment_fixed_delay": fixed_delay,
         "calibrated_delay_ticks": calibration["selected_delay_ticks"],
         "effective_initial_delay_ticks": d,
-        "scope": "real GPU inference with client-visible latency floors; no accelerated or extra model calls",
+        "scope": "real GPU inference with client-visible latency floors; scored calls unchanged, episode preparation reported separately",
     }
     result["cyclic_gc_disabled_during_control"] = True
     return result, frames

@@ -9,6 +9,7 @@ class OptimizationConfig:
     precision: str = "bf16"
     fusion: bool = False
     dit_graph: bool = False
+    action_graph: bool = False
     scope: str = "transformer"
     category_id: int | None = None
     coverage: Path | None = None
@@ -25,10 +26,20 @@ class OptimizationConfig:
     fp_grouped: bool = False
     fp_swiglu: bool = False
     component: str = "all"
+    input_preparation: bool = False
+    tokenizer_cache: bool = False
+    static_vlm: bool = False
+    vlm_graph: bool = False
+    image_array_preparation: bool = False
+    compiled_host_guards: bool = False
     fusion_mode: str = "all"
     operator_profile: Path | None = None
 
     def __post_init__(self):
+        if self.action_graph and self.precision not in ("bf16", "w8a8", "w4a4"):
+            raise ValueError("Action graph requires BF16, W8A8 or W4A4")
+        if self.vlm_graph and not self.static_vlm:
+            raise ValueError("VLM graph requires static_vlm")
         if self.fusion_mode not in (
             "vision_rope",
             "text_rope",
@@ -103,10 +114,19 @@ class OptimizationConfig:
             self.precision != "bf16"
             or self.fusion
             or self.dit_graph
+            or self.action_graph
             or self.vision_channels_last
+            or self.input_preparation
+            or self.tokenizer_cache
+            or self.static_vlm
+            or self.vlm_graph
+            or self.image_array_preparation
+            or self.compiled_host_guards
         )
 
     def validate_variant(self, variant):
+        if self.action_graph and variant != "flow":
+            raise ValueError("Action graph requires non-streaming Flow4")
         if variant == "pir2" and self.group_conditioning:
             raise ValueError("Streaming piR2 condition grouping is not validated")
 
@@ -125,6 +145,7 @@ def add_optimization_arguments(parser):
     )
     parser.add_argument("--operator-profile", type=Path)
     parser.add_argument("--dit-cuda-graph", action="store_true")
+    parser.add_argument("--action-cuda-graph", action="store_true")
     parser.add_argument(
         "--quantization-scope", choices=["transformer", "all"], default="transformer"
     )
@@ -138,6 +159,12 @@ def add_optimization_arguments(parser):
     parser.add_argument("--quantization-shape-tactics", type=Path)
     parser.add_argument("--group-conditioning", action="store_true")
     parser.add_argument("--vision-channels-last", action="store_true")
+    parser.add_argument("--input-preparation", action="store_true")
+    parser.add_argument("--tokenizer-cache", action="store_true")
+    parser.add_argument("--static-vlm", action="store_true")
+    parser.add_argument("--vlm-cuda-graph", action="store_true")
+    parser.add_argument("--image-array-preparation", action="store_true")
+    parser.add_argument("--compiled-host-guards", action="store_true")
     parser.add_argument("--norm-modulation-quant", action="store_true")
     parser.add_argument("--residual-norm-quant", action="store_true")
     parser.add_argument("--fp8-fast-quant", action="store_true")
@@ -154,6 +181,7 @@ def optimization_config(args):
         fusion_mode=args.operator_fusion_mode,
         operator_profile=args.operator_profile,
         dit_graph=args.dit_cuda_graph,
+        action_graph=args.action_cuda_graph,
         scope=args.quantization_scope,
         component=args.quantization_component,
         category_id=args.quantization_category_id,
@@ -163,6 +191,12 @@ def optimization_config(args):
         shape_tactics=args.quantization_shape_tactics,
         group_conditioning=args.group_conditioning,
         vision_channels_last=args.vision_channels_last,
+        input_preparation=args.input_preparation,
+        tokenizer_cache=args.tokenizer_cache,
+        static_vlm=args.static_vlm,
+        vlm_graph=args.vlm_cuda_graph,
+        image_array_preparation=args.image_array_preparation,
+        compiled_host_guards=args.compiled_host_guards,
         norm_modulation_quant=args.norm_modulation_quant,
         residual_norm_quant=args.residual_norm_quant,
         fp8_fast_quant=args.fp8_fast_quant,

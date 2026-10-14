@@ -34,6 +34,9 @@ GR00T optimization implementations live under `coexecution/optimization`:
 | `groot/*_connections.py` | GR00T norm/residual producer boundaries; 模型连接 |
 | `execution/graph.py` | Shared pure-DiT graph capture; 共用 Graph |
 | `execution/cache.py` | Invocation-local cache ownership and serial guards; 调用边界 |
+| `execution/preparation.py`, `execution/tokenization.py` | Scoped input routing and exact-text token preparation; 输入准备 |
+| `execution/guards.py`, `execution/patching.py` | Host metadata guards and instance-local callable adaptation; 状态校验 |
+| `groot/vlm.py` | Static VLM metadata and optional complete VLM capture; 完整 VLM 执行 |
 | `backends/integer/linear.py` | Integer packing, GEMM and dispatch; 整数算子 |
 | `backends/thor/linear.py`, `backends/thor/packing.py` | Thor floating formats and execution; 浮点算子 |
 
@@ -57,7 +60,108 @@ Optimization contracts are in `tests/contracts`, explicit CUDA tests in
 `PIR2_GPU_TESTS=1`; public CI checks configuration, scheduling and accounting only.
 The separate SO100/queue tools retain their existing modules and tests.
 
-这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；整数后端源码来自固定版本的 Speedup Paradox，现由本仓集中管理。当前范围是单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝，同进程并发优化服务也不支持。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
+### Common policy runtime / 公共推理路径
+
+Common runtime options apply to the same BF16 or quantized CUDA policy:
+`--input-preparation` routes only consumed tensor fields to each model component;
+`--tokenizer-cache` caches exact expanded text after fresh image processing;
+`--static-vlm` prepares fixed text/grid/mask metadata without device-side scalar
+reads; `--vlm-cuda-graph` captures the complete VLM and requires `--static-vlm`.
+`--image-array-preparation` replaces the pinned GR00T processor's PIL conversion
+with owned contiguous uint8 RGB arrays. Its original conversation, chat template,
+crop/resize, state and Qwen collation still run; every image buffer is fresh.
+Scope entry checks pinned GR00T/Transformers source and live method code and
+admits the stock Qwen2VL fast or slow pixel processor. Replacement processors or
+methods require closing the scope; unsupported implementations fail admission.
+Heights of 1 or 3 pixels are rejected because ndarray channel inference would be
+ambiguous; normal task images retain their original preprocessing.
+`--compiled-host-guards` compiles the exact Python guard source with Cython and
+binds its predicate methods to each guard instance. Discovery and all frozen
+execution checks retain the Python reference behavior, including tracked weight
+mutations, methods, hooks, closures, defaults, configuration and topology.
+Images, robot state and VLM features are recomputed for every observation.
+These options default off. Graph and metadata caches are bounded, and new input
+signatures require warmup. Runtime changes through `optimized.set_runtime(...)`
+retain the selected precision controller and the separate DiT graph cache.
+
+Compiled guards require CPython, a working host C compiler and the optional
+`Cython==3.1.2` and `setuptools` packages in the model environment. Install them
+with `python -m pip install Cython==3.1.2 setuptools==84.0.0` when using that flag.
+Startup builds a native extension from the unchanged guard source; generated
+source, binaries and build logs stay in `~/.cache/pir2/host-guards`, or the directory
+specified by `PIR2_HOST_GUARD_CACHE`. The cache is locked across processes and
+keyed by exact source, CPython ABI, platform, compiler identity and build settings.
+Evidence records those inputs and the compiled binary hash. Missing dependencies
+or build failures fail explicitly. Normal imports, CLI help and the default
+Python backend never invoke a compiler.
+
+Use `python -m coexecution.libero.measurement --help` for paired measurements of
+raw-observation policy wall time, prepared-input complete-model time, CUDA event
+spans and separately collected GPU activity. These timing scopes overlap and
+must not be added or subtracted as a CPU/GPU decomposition. The module validates
+same-precision actions and checks that timed graph calls replay without capture.
+It requires CUDA, the official Spatial task checkpoint and its dataset; profiler
+output and numerical archives stay local.
+The cumulative modes are `baseline`, `prepared`, `tokenized`, `static`, `graph`,
+`images` and `compiled`; the last two add image arrays and compiled guards to the
+preceding mode. Keep `--action-cuda-graph` and precision settings fixed for each
+paired run. Use the same runtime flags for BF16, W8A8 and W4A4 comparisons.
+The default mode list remains `baseline` through `graph`; explicitly select
+`--modes graph images compiled` to measure the new host optimizations.
+Same-precision action checks use `baseline` when requested, otherwise the first
+requested mode (`graph` in this example); results record that reference explicitly.
+
+Run `PIR2_NATIVE_TESTS=1 python -m pytest tests/native/test_compiled_host_guards.py`
+for native predicate/mutation gates, and
+`PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_image_preparation_gpu.py` in the
+pinned environment for actual image/collator equality and ownership checks.
+The latter performs deployment preprocessing only; complete policy action/RNG
+gates still require CUDA.
+
+`--action-cuda-graph` additionally captures S1 visual/state conditioning and the
+unchanged four-step Flow action head. It supports BF16, W8A8 and W4A4, requires
+non-streaming H40, and preserves the policy's decoded horizon and output API.
+The adapter calls the pinned upstream algorithm with one fresh explicit noise
+tensor per request, including the first capture. Features, state, embodiment ID
+and masks are copied freshly; validated integer image delay is part of the
+bounded eight-entry graph signature along with shape, dtype, stride and stream.
+Inpaint, rolling/streaming requests and unknown options or hooks are rejected.
+Scheduler state, cache timestamps, noise generation and policy decoding remain
+outside the graph. Returned tensors have independent storage.
+
+When both graph flags are selected, the action graph supersedes the inner
+`--dit-cuda-graph`; evidence reports this explicitly. Runtime mode changes close
+and recapture action graphs after installing new serial boundaries. Warm each
+signature before measuring. Capture failures propagate and the adapter stays
+installed until explicit scope close, with no automatic eager fallback. Close
+before replacing weights, methods or attention settings; tracked mutations are
+rejected, while untracked `.data`/foreign writes are outside the frozen scope
+contract. CUDA callers must establish input/weight readiness on their stream.
+
+Service audits preserve `python_forward_counts` as physical hook observations.
+For the larger graph, `forward_counts.dit` is the logical NFE proved by four DiT
+calls in every captured Flow body and explicit replay counts; `dit_count_source`
+and `action_graph` identify that source. Warmup/capture hooks and logical request
+work are separate. The measurement and profiler modules require one whole-action
+replay and four logical evaluations per timed call. Select the same graph flag
+for BF16 and quantized comparisons; these execution checks establish neither
+quantization quality nor closed-loop success.
+
+Run `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_action_graph_gpu.py` in the
+pinned CUDA environment for full-action/RNG, freshness, stride/stream, output
+lifetime, failure, frozen-execution and restoration gates.
+
+The opt-in numerical suite is
+`PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_policy_vlm_gpu.py` in the pinned
+CUDA environment. This checks execution behavior, not closed-loop task success.
+For full Spatial evaluation, see the declared-condition runner in
+[LIBERO](../docs/libero.md). Separate action and VLM processes can share an
+explicitly declared GPU. The opt-in `--server-layout paired` service uses two
+independent policy instances/streams and coordinates cold VLM/DiT capture across
+all endpoint CUDA submissions. See [transport and placement](../docs/timing-protocols.md)
+for bounded resident feature leases and the paired NumPy control.
+
+这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；整数后端源码来自固定版本的 Speedup Paradox，现由本仓集中管理。当前范围是每个策略单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝。配对服务使用独立策略实例与流，首次 VLM/DiT capture 通过进程共享协调器排他执行；配对 whole-action graph 仍被拒绝。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
 
 The modules provide instance-local, reversible adaptations. Weight packing happens during installation; activation scales, quantization and packing run online. Integer GEMM uses INT32 accumulation and a fused scale/bias/BF16 output epilogue. Compatible QKV/KV and gate/up projections share preparation. The native dispatch can combine activation preparation with GELU or SiLU-times-up; AdaLN modulation can produce the packed input directly. Fused SDPA remains floating point. No checkpoint, convolution layout, sampling schedule, observation or VLM-cache policy is changed by enabling quantization.
 
@@ -72,7 +176,7 @@ python scripts/serve_libero_protocol.py \
   --quantization-scope all --quantization-category-id 2
 ```
 
-This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` is a separate serial-only option for Flow and πR². It captures only the pure DiT forward; rolling buffers, noise, action decoding and the VLM remain eager: first calls and new tensor signatures capture graphs and must be excluded from timing. The current reference Graph helper is not suitable for concurrent S1/S2 capture. Enabled experimental optimizations therefore reject paired `--vlm-device` workers in one process; default BF16 paired workers remain supported. Close the optimization scope before changing weights or using the policy concurrently.
+This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` requires serial submissions to each Flow or πR² policy. It captures only the pure DiT forward; rolling buffers, noise and action decoding stay outside that graph. First calls and new tensor signatures capture graphs and must be excluded from steady timing. In paired service mode, a process-wide submission coordinator gives cold VLM/DiT graph calls exclusive CUDA access without changing the pinned graph implementation. Steady handlers can overlap. Close the optimization scope before changing weights or using the same policy concurrently.
 
 - `--operator-fusion`: enable BF16 fusion. The default mode `all` retains RoPE/RMSNorm, AdaLN modulation and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
 - `--operator-fusion-mode {vision_rope,text_rope,rope,rmsnorm,rope_rms,all}`: select the BF16 component set while fusion is enabled. `rope` selects both RoPE paths; only `all` installs DiT pointwise preparation. A selective mode requires `--operator-fusion`; condition grouping and norm/residual producer flags require `all`. The option defaults to `all` and does not enable fusion by itself.

@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from coexecution import fused_ops as ops
+from coexecution.optimization.execution.patching import clone_forward
 
 
 @triton.jit
@@ -87,33 +88,6 @@ def same(a, b):
             b.flatten().contiguous().view(torch.uint8),
         )
     )
-
-
-def clone_forward(fn, replacements):
-    # Keep Transformers' deprecation wrapper, but also rebind its wrapped
-    # function. Patching only wrapper globals leaves text RoPE untouched.
-    wrapped = getattr(fn, "__wrapped__", None)
-
-    def cell(value):
-        return (lambda: value).__closure__[0]
-
-    closure = fn.__closure__
-    if wrapped is not None and closure:
-        closure = tuple(
-            cell(clone_forward(wrapped, replacements))
-            if c.cell_contents is wrapped
-            else c
-            for c in closure
-        )
-    result = types.FunctionType(
-        fn.__code__,
-        {**fn.__globals__, **replacements},
-        fn.__name__,
-        fn.__defaults__,
-        closure,
-    )
-    result.__kwdefaults__ = fn.__kwdefaults__
-    return result
 
 
 class NonGemmAdapters:

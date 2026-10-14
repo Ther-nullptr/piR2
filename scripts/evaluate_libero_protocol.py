@@ -4,12 +4,17 @@ import argparse
 import fcntl
 import hashlib
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 from libero_protocol_scheduler import CommandTimeline, initial_frame_index
+
+_ROOT = str(Path(__file__).resolve().parents[1])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 KEYS = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
 
@@ -256,6 +261,8 @@ def save_summary(output, records, config):
 
 
 def build_parser():
+    from coexecution.libero.features import add_feature_arguments
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--protocol", choices=["algorithm", "deployment"], required=True
@@ -264,6 +271,7 @@ def build_parser():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=5570)
     parser.add_argument("--slow-port", type=int, default=5572)
+    parser.add_argument("--server-layout", choices=("split", "paired"), default="split")
     parser.add_argument("--episodes-per-task", type=int, default=20)
     parser.add_argument(
         "--task-ids", nargs="+", type=int, choices=range(10), default=list(range(10))
@@ -276,6 +284,7 @@ def build_parser():
     parser.add_argument("--action-delay", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--artificial-compute-wait", type=float, default=0)
+    add_feature_arguments(parser, rpc=True)
     parser.add_argument(
         "--action-min-service-ms",
         type=float,
@@ -289,6 +298,12 @@ def build_parser():
         help="Deployment: hold real VLM result until worker start plus this duration",
     )
     parser.add_argument(
+        "--vision-max-hz",
+        type=float,
+        default=0,
+        help="Deployment: cap scored VLM admissions; zero keeps unlimited admission",
+    )
+    parser.add_argument(
         "--deployment-fixed-delay",
         type=int,
         choices=range(1, 6),
@@ -300,15 +315,27 @@ def build_parser():
 def validate_deployment_controls(args):
     from libero_wallclock import validate_service_floor
 
+    from coexecution.libero.features import validate_feature_options
+    from coexecution.libero.scheduling import validate_vision_max_hz
+
     validate_service_floor(args.action_min_service_ms)
     validate_service_floor(args.vision_min_service_ms)
+    validate_vision_max_hz(args.vision_max_hz)
+    validate_feature_options(args.feature_transport, args.feature_rpc)
+    if args.feature_transport == "cuda_local" and (
+        args.server_layout != "paired" or args.variant != "flow"
+    ):
+        raise ValueError("cuda_local requires paired Flow workers")
     if args.protocol != "deployment" and (
         args.action_min_service_ms
         or args.vision_min_service_ms
+        or args.vision_max_hz
         or args.deployment_fixed_delay is not None
+        or args.feature_transport != "numpy_fp32"
+        or args.feature_rpc != "separate"
     ):
         raise ValueError(
-            "Service floors and fixed deployment delay require the deployment protocol"
+            "Service floors, vision admission limits, feature controls and fixed delay require the deployment protocol"
         )
 
 
@@ -323,8 +350,24 @@ def save_run_configuration(output, config):
             key: {
                 name: value
                 for name, value in identity.items()
-                if name not in {"pid", "cuda_stream"}
+                if name
+                not in {
+                    "pid",
+                    "cuda_stream",
+                    "server_instance",
+                    "policy_instance",
+                    "feature_exchange",
+                }
             }
+            | (
+                {
+                    "feature_exchange": {
+                        "max_leases": identity["feature_exchange"]["max_leases"]
+                    }
+                }
+                if "feature_exchange" in identity
+                else {}
+            )
             for key, identity in identities.items()
         },
     }
@@ -370,7 +413,7 @@ def main():
     config["checkpoint"] = identity
     config["suite"] = "libero_spatial"
     config["initial_state_indices"] = list(range(args.episodes_per_task))
-    config["version"] = 6
+    config["version"] = 8
     config["measurement_mode"] = "success_terminated_closed_loop"
     config["input_dependencies"] = {
         "camera": "physical observation released at each control tick; latest waiting frame replaces older waiting frames",
@@ -400,6 +443,10 @@ def main():
         "coexecution/libero/loading.py",
         "coexecution/libero/backend.py",
         "coexecution/libero/service.py",
+        "coexecution/libero/scheduling.py",
+        "coexecution/libero/features.py",
+        "coexecution/libero/resident.py",
+        "coexecution/optimization/execution/submission.py",
         "scripts/libero_streaming_client.py",
         "scripts/libero_observations.py",
         "upstream/learning/Isaac-GR00T/gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
@@ -410,10 +457,29 @@ def main():
         for name in implementation_files
     }
     if args.protocol == "deployment":
+        from coexecution.libero.features import (
+            validate_feature_identity,
+            validate_worker_pair,
+        )
+
         config.pop("visual_delay")
         config.pop("action_delay")
         slow = wait_server(args.slow_port)
         config["slow_checkpoint"] = slow.call_endpoint("identity", requires_input=False)
+        for worker_identity in (identity, config["slow_checkpoint"]):
+            validate_feature_identity(worker_identity, args.feature_transport)
+        validate_worker_pair(
+            identity,
+            config["slow_checkpoint"],
+            args.server_layout,
+            args.feature_transport,
+        )
+        if args.feature_rpc == "combined" and "combined" not in identity.get(
+            "feature_rpc_modes", []
+        ):
+            raise ValueError(
+                "Action worker does not declare combined feature RPC support"
+            )
         if config["slow_checkpoint"]["role"] != "vlm":
             raise ValueError("The slow endpoint must be a VLM worker")
         del slow
@@ -424,6 +490,12 @@ def main():
             "cyclic_gc_disabled_during_control": True,
             "slow_vlm_warmup_calls_per_condition": args.slow_warmup_calls,
             "slow_vlm_calibration_excluded_initial_calls": 2,
+            "episode_vision_preparation": {
+                "calls_per_episode": 1,
+                "scope": "real S2 VLM before fresh S1 bootstrap capture and scored control, for every layout and transport",
+                "publication": "return_features=False; preparation outputs are never published or installed in S1",
+                "evidence": "episode vision_preparation contains original source/clock times, physical VLM count and graph deltas; scored cold captures remain separately reported",
+            },
             "strict_timing_validity": "mean frequency within2%, max lateness and adjacent interval error each<=5ms",
             "fallback": "zero Cartesian delta; retain last committed gripper",
             "flow_publication": "all native clean positions after committed prefix",
@@ -439,6 +511,28 @@ def main():
                 "vision_anchor": "worker RPC start; feature publication and next VLM admission withheld until release",
                 "target_overruns": "real completion beyond target retained; raw and visible times both recorded",
                 "calibration": "same per-role floors as scored workers; bootstrap is outside scored service timing",
+            },
+            "vision_admission_contract": {
+                "max_hz": args.vision_max_hz,
+                "scope": "scored asynchronous vision worker only; bootstrap and solo warmup remain uncapped",
+                "anchor": "actual monotonic admission under mailbox lock, selecting the newest pending frame; distinct from RPC started_s",
+                "spacing": "zero disables the limit; first admission immediate, subsequent admissions at least 1/max_hz after the previous actual admission; no catch-up",
+                "camera": "physical 20Hz offers continue, replacing the latest waiting frame until admission",
+                "publication": "admission waits never hold completed feature publication; service floors remain independent",
+                "stop": "no new admission after stop observed under the same lock; already admitted RPCs may start or complete afterward; control cutoff stays unchanged",
+            },
+            "feature_transport_contract": {
+                "encoding": args.feature_transport,
+                "server_layout": args.server_layout,
+                "rpc": args.feature_rpc,
+                "timing_version": 2,
+                "selection": "unchanged completed-feature selection and sequence deduplication; combined replies advance client installation only on success",
+                "plan_rpc_started_s": "actual client plan network call entry; combined calls include feature installation",
+                "server_plan_started_s": "server plan entry after optional feature installation and stream readiness; preferred cache-age boundary, not the first neural kernel",
+                "server_seconds": "server plan wall time after installation; server_request_seconds also includes combined installation",
+                "whole_call": "submission through completion includes executor queue, installation, network and planning in both modes",
+                "clock": "loopback workers and client share the host monotonic clock",
+                "representation": "numpy_bf16 preserves BF16 bits; cuda_local uses bounded same-process leases, producer completion, consumer event wait and stream ownership; independent of model precision",
             },
         }
     config = save_run_configuration(args.output, config)

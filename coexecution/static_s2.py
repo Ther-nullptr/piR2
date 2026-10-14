@@ -39,6 +39,11 @@ import torch
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.qwen3_vl import modeling_qwen3_vl as qwen
 
+from coexecution.optimization.execution.patching import (
+    clone_forward,
+    metadata_producer_stamp,
+)
+
 METADATA_KEYS = ("input_ids", "attention_mask", "image_grid_thw")
 
 
@@ -66,10 +71,12 @@ class InputMetadata:
     input_shape: tuple[int, ...]
     text_width: int
     image_tokens: int
+    causal_mask: torch.Tensor | None
+    visual_indices: torch.Tensor
     ready: torch.cuda.Event
 
     def tensors(self):
-        return (
+        tensors = (
             self.visual.pos_embeds,
             *self.visual.position_embeddings,
             self.visual.cu_seqlens,
@@ -80,7 +87,9 @@ class InputMetadata:
             self.image_mask,
             self.placeholder_image_mask,
             self.placeholder_video_mask,
+            self.visual_indices,
         )
+        return tensors if self.causal_mask is None else (*tensors, self.causal_mask)
 
 
 @dataclass
@@ -109,9 +118,27 @@ def ordinary_clone(tensor):
         return tensor.detach().clone()
 
 
+def metadata_content_key(cpu_inputs, device, model_stamp):
+    """Exact CPU contents, not a hash or a signature of resident GPU values."""
+    content = []
+    for name in METADATA_KEYS:
+        host = cpu_inputs[name]
+        if not torch.is_tensor(host) or host.device.type != "cpu":
+            raise ValueError("Static policy preparation requires CPU metadata")
+        if host.layout != torch.strided or not host.is_contiguous():
+            raise ValueError("Static policy requires contiguous strided CPU metadata")
+        content.append(
+            (tuple(host.shape), host.dtype, device, tuple(host.reshape(-1).tolist()))
+        )
+    return tuple(content), model_stamp
+
+
 class StaticS2:
-    def __init__(self, workload):
+    def __init__(self, workload, vision_rope=None):
+        if vision_rope is not None and not callable(vision_rope):
+            raise ValueError("StaticS2 vision_rope must be callable")
         self.workload = workload
+        self.vision_rope = vision_rope
         self.inner = workload.model.backbone.model.model
         self.visual = self.inner.visual
         self.counts = Counter()
@@ -123,6 +150,7 @@ class StaticS2:
         self._active = None
         self._active_inputs = None
         self._entered = False
+        self.metadata_epoch = 0
 
     def _replace(self, target, name, replacement):
         existed = name in vars(target)
@@ -130,7 +158,7 @@ class StaticS2:
         self.restore.append((target, name, existed, original))
         setattr(target, name, replacement)
 
-    def _check_supported(self, inputs):
+    def _check_supported(self, inputs, pixel_values=None):
         if not self.workload.features_only:
             raise ValueError("StaticS2 requires the features-only S2 workload")
         if self.inner.training or self.visual.training:
@@ -144,10 +172,14 @@ class StaticS2:
             for key in ("pixel_values_videos", "video_grid_thw")
         ):
             raise ValueError("StaticS2 only supports image-only inputs")
-        for key in (*METADATA_KEYS, "pixel_values"):
-            if not torch.is_tensor(inputs.get(key)):
+        selected = {key: inputs.get(key) for key in METADATA_KEYS}
+        selected["pixel_values"] = (
+            inputs.get("pixel_values") if pixel_values is None else pixel_values
+        )
+        for key, tensor in selected.items():
+            if not torch.is_tensor(tensor):
                 raise ValueError(f"StaticS2 requires tensor {key}")
-            if inputs[key].device != self.visual.pos_embed.weight.device:
+            if tensor.device != self.visual.pos_embed.weight.device:
                 raise ValueError(f"StaticS2 requires resident metadata/pixels: {key}")
 
     def _model_stamp(self):
@@ -166,10 +198,16 @@ class StaticS2:
             tensor_stamp(visual.rotary_pos_emb.inv_freq),
             self.inner.get_input_embeddings().embedding_dim,
             visual.dtype,
+            self.metadata_epoch,
+            metadata_producer_stamp(
+                self.inner,
+                visual,
+                getattr(self, "_causal_mask_original", qwen.create_causal_mask),
+            ),
         )
 
     @torch.inference_mode()
-    def _prepare_visual(self, grid, rows, stamp):
+    def _prepare_visual(self, grid, rows, stamp, host_grid=None):
         key = (rows, grid.dtype, grid.device, stamp)
         if key in self.vision_cache:
             metadata = self.vision_cache[key]
@@ -187,8 +225,9 @@ class StaticS2:
         for length in lengths:
             cumulative.append(cumulative[-1] + length)
         # Preserve the original floating-point interpolation/rotary arithmetic.
-        pos_embeds = self.visual.fast_pos_embed_interpolate(grid)
-        rotary = self.visual.rot_pos_emb(grid).reshape(cumulative[-1], -1)
+        preparation_grid = grid if host_grid is None else host_grid
+        pos_embeds = self.visual.fast_pos_embed_interpolate(preparation_grid)
+        rotary = self.visual.rot_pos_emb(preparation_grid).reshape(cumulative[-1], -1)
         emb = torch.cat((rotary, rotary), dim=-1)
         metadata = VisionMetadata(
             pos_embeds=pos_embeds,
@@ -205,13 +244,26 @@ class StaticS2:
         return metadata
 
     @torch.inference_mode()
-    def _register(self, inputs, stamp):
+    def _register(self, inputs, stamp, cpu_metadata=None):
         started = perf_counter()
         for key in METADATA_KEYS:
             if torch.is_inference(inputs[key]):
                 inputs[key] = ordinary_clone(inputs[key])
         tensors = tuple(inputs[key] for key in METADATA_KEYS)
-        cpu = tuple(tensor.detach().cpu() for tensor in tensors)
+        cpu = (
+            tuple(tensor.detach().cpu() for tensor in tensors)
+            if cpu_metadata is None
+            else tuple(cpu_metadata[key] for key in METADATA_KEYS)
+        )
+        if any(
+            host.device.type != "cpu"
+            or host.shape != resident.shape
+            or host.dtype != resident.dtype
+            for host, resident in zip(cpu, tensors)
+        ):
+            raise ValueError(
+                "StaticS2 CPU metadata must match resident shape and dtype"
+            )
         ids, mask, grid = cpu
         if (
             ids.ndim != 2
@@ -246,7 +298,12 @@ class StaticS2:
             if bool((ids == config.video_token_id).any()):
                 raise ValueError("StaticS2 only supports image-only token sequences")
             rows = tuple(tuple(row) for row in grid.tolist())
-            visual = self._prepare_visual(inputs["image_grid_thw"], rows, stamp)
+            visual = self._prepare_visual(
+                inputs["image_grid_thw"],
+                rows,
+                stamp,
+                host_grid=None if cpu_metadata is None else grid,
+            )
             image_tokens = int((ids == config.image_token_id).sum())
             if image_tokens != sum(visual.image_splits):
                 raise ValueError(
@@ -262,11 +319,37 @@ class StaticS2:
             image_mask = inputs["input_ids"] == config.image_token_id
             video_mask = inputs["input_ids"] == config.video_token_id
             width = self.inner.get_input_embeddings().embedding_dim
+            position_ids = positions.to(token_device)
+            cache_position = torch.arange(ids.shape[1], device=token_device)
+            # Cold registration calls the ORIGINAL mask helper with the original
+            # 2-D padding mask. Retain its exact None/4-D result and backend
+            # decision; passing None or forcing 4-D would change Qwen MRoPE/SDPA.
+            causal_mask = self._causal_mask_original(
+                config=self.inner.language_model.config,
+                input_embeds=torch.empty(
+                    (*ids.shape, width),
+                    device=token_device,
+                    dtype=self.inner.get_input_embeddings().weight.dtype,
+                ),
+                attention_mask=inputs["attention_mask"],
+                cache_position=cache_position,
+                past_key_values=None,
+                position_ids=position_ids[0],
+            )
+            visual_indices = torch.tensor(
+                [
+                    index
+                    for index, token in enumerate(ids.reshape(-1).tolist())
+                    if token == config.image_token_id
+                ],
+                device=token_device,
+                dtype=torch.long,
+            )
             metadata = InputMetadata(
                 visual=visual,
-                position_ids=positions.to(token_device),
+                position_ids=position_ids,
                 rope_deltas=deltas.to(token_device),
-                cache_position=torch.arange(ids.shape[1], device=token_device),
+                cache_position=cache_position,
                 attention_mask=inputs["attention_mask"] == 1,
                 image_mask=image_mask,
                 placeholder_image_mask=image_mask.unsqueeze(-1).expand(
@@ -278,6 +361,8 @@ class StaticS2:
                 input_shape=tuple(ids.shape),
                 text_width=width,
                 image_tokens=image_tokens,
+                causal_mask=causal_mask,
+                visual_indices=visual_indices,
                 ready=torch.cuda.Event(),
             )
             metadata.ready.record()
@@ -294,8 +379,8 @@ class StaticS2:
         self.preparation_host_ms += (perf_counter() - started) * 1000
         return metadata
 
-    def _lookup(self, inputs):
-        self._check_supported(inputs)
+    def _lookup(self, inputs, pixel_values=None):
+        self._check_supported(inputs, pixel_values)
         stamp = self._model_stamp()
         record = self.registrations.get(id(inputs))
         stamps = tuple(tensor_stamp(inputs[key]) for key in METADATA_KEYS)
@@ -370,7 +455,12 @@ class StaticS2:
             .unbind(0)
         )
         cos, sin = position_embeddings
-        query, key = qwen.apply_rotary_pos_emb_vision(query, key, cos, sin)
+        rope = (
+            qwen.apply_rotary_pos_emb_vision
+            if self.vision_rope is None
+            else self.vision_rope
+        )
+        query, key = rope(query, key, cos, sin)
         query = query.transpose(0, 1).unsqueeze(0)
         key = key.transpose(0, 1).unsqueeze(0)
         value = value.transpose(0, 1).unsqueeze(0)
@@ -428,32 +518,83 @@ class StaticS2:
             raise ValueError("Image features and image tokens do not match")
         return metadata.placeholder_image_mask, metadata.placeholder_video_mask
 
+    def _causal_mask(self, *args, **kwargs):
+        if self._active is None:
+            return self._causal_mask_original(*args, **kwargs)
+        if (
+            args
+            or kwargs.get("past_key_values") is not None
+            or kwargs.get("cache_position") is not self._active.cache_position
+            or kwargs.get("attention_mask") is not self._active_inputs["attention_mask"]
+        ):
+            raise ValueError("StaticS2 causal mask requires its registered inputs")
+        return self._active.causal_mask
+
+    def _deepstack(self, _module, hidden_states, visual_pos_masks, visual_embeds):
+        if self._active is None:
+            return self._deepstack_original(
+                hidden_states, visual_pos_masks, visual_embeds
+            )
+        metadata = self._active
+        if (
+            hidden_states.shape != (*metadata.input_shape, metadata.text_width)
+            or visual_embeds.shape != (metadata.image_tokens, metadata.text_width)
+            or not hidden_states.is_contiguous()
+        ):
+            raise ValueError(
+                "StaticS2 DeepStack requires a contiguous hidden-state view"
+            )
+        # A true view of the original tensor is essential: copying reshape would
+        # silently scatter into an unrelated allocation. Integer indices are
+        # ordered/unique from cold CPU IDs and preserve boolean gather order.
+        flat = hidden_states.view(-1, metadata.text_width)
+        visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+        local = flat.index_select(0, metadata.visual_indices).clone() + visual_embeds
+        flat.index_copy_(0, metadata.visual_indices, local)
+        return hidden_states
+
     @torch.inference_mode()
     def _slow(self, index):
-        if self._active is not None:
-            raise RuntimeError("StaticS2 supports one S2 caller at a time")
         inputs = self.workload.backbone_inputs[
             index % len(self.workload.backbone_inputs)
         ]
-        metadata = self._lookup(inputs)
+        return self.forward_inputs(inputs, inputs["pixel_values"])
+
+    @torch.inference_mode()
+    def forward_inputs(self, inputs, pixel_values):
+        """Execute fresh pixels against a stable metadata-only input binding."""
+        if not self._entered:
+            raise RuntimeError("StaticS2 execution requires an active scope")
+        if self._active is not None:
+            raise RuntimeError("StaticS2 supports one S2 caller at a time")
+        metadata = self._lookup(inputs, pixel_values)
         stream = torch.cuda.current_stream(inputs["input_ids"].device)
-        stream.wait_event(metadata.ready)
+        if not torch.cuda.is_current_stream_capturing():
+            # Policy execution fences readiness on the caller before invoking
+            # CudaGraphCall. Its capture stream waits that caller. An external
+            # event wait inside capture would introduce uncaptured dependencies;
+            # eager execution and side-stream warmup retain the original fence.
+            stream.wait_event(metadata.ready)
         # Metadata are owned by this scope but may execute on an S2 worker stream.
         for tensor in (*metadata.tensors(), *(inputs[key] for key in METADATA_KEYS)):
             tensor.record_stream(stream)
-        inputs["pixel_values"].record_stream(stream)
+        pixel_values.record_stream(stream)
         self.counts["calls"] += 1
         self._active, self._active_inputs = metadata, inputs
         try:
+            self.workload._pre_final_norm = None
             self.inner.rope_deltas = metadata.rope_deltas
             self.inner(
-                **{key: inputs[key] for key in (*METADATA_KEYS, "pixel_values")},
+                **{key: inputs[key] for key in METADATA_KEYS},
+                pixel_values=pixel_values,
                 position_ids=metadata.position_ids,
                 cache_position=metadata.cache_position,
                 use_cache=False,
                 output_hidden_states=False,
                 return_dict=True,
             )
+            if not torch.is_tensor(self.workload._pre_final_norm):
+                raise RuntimeError("StaticS2 requires the pre-final-norm capture hook")
             return BatchFeature(
                 {
                     "backbone_features": self.workload._pre_final_norm,
@@ -469,6 +610,8 @@ class StaticS2:
             raise RuntimeError("StaticS2 scopes cannot be entered twice")
         self._entered = True
         self._rope_before = self.inner.rope_deltas
+        self._causal_mask_original = qwen.create_causal_mask
+        self._deepstack_original = self.inner.language_model._deepstack_process
         try:
             prepared_inputs = []
             for original in self.workload.backbone_inputs:
@@ -485,6 +628,20 @@ class StaticS2:
             self._replace(self.visual, "forward", self._visual_forward)
             self._replace(self.inner, "get_image_features", self._image_features)
             self._replace(self.inner, "get_placeholder_mask", self._placeholder_mask)
+            text = self.inner.language_model
+            installed = text.forward
+            original_function = getattr(installed, "__func__", installed)
+            self._replace(
+                text,
+                "forward",
+                MethodType(
+                    clone_forward(
+                        original_function, {"create_causal_mask": self._causal_mask}
+                    ),
+                    text,
+                ),
+            )
+            self._replace(text, "_deepstack_process", MethodType(self._deepstack, text))
             for block in self.visual.blocks:
                 original = block.attn.forward
 
@@ -534,4 +691,9 @@ class StaticS2:
             "pixel_outputs_cached": False,
             "unsupported_policy": "explicit ValueError; no silent eager fallback",
             "metadata_validity": "identity/version/shape/dtype/device + cold full contents",
+            "vision_rope_binding": (
+                "dynamic Transformers module function"
+                if self.vision_rope is None
+                else "explicit callable"
+            ),
         }

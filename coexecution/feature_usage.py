@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 
+from coexecution.libero.features import feature_use_time
+
 
 def _check(condition, message):
     if not condition:
@@ -435,12 +437,14 @@ def audit_raw(condition, episode, root):
             capture - base if capture is not None else None,
             "feature capture",
         )
-        started = timing.get("plan_rpc_started_s")
+        boundary, started = feature_use_time(actual)
         _same(
             request.get("use_s"),
             started - base if started is not None else None,
-            "plan RPC start",
+            boundary,
         )
+        if "use_boundary" in request:
+            _same(request["use_boundary"], boundary, "feature-use boundary")
     _same(len(publications), len(episode["feature_updates"]), "publication count")
     for update in episode["feature_updates"]:
         raw_update = publications.get(update["feature_sequence"])

@@ -8,7 +8,7 @@ from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
 from transformers.feature_extraction_utils import BatchFeature
 
 
-def make_policy_and_inputs():
+def make_policy_and_inputs(*, streaming=True):
     torch.manual_seed(107)
     config = Gr00tN1d7Config(
         backbone_embedding_dim=128,
@@ -20,7 +20,7 @@ def make_policy_and_inputs():
         max_num_embodiments=1,
         max_seq_len=64,
         num_inference_timesteps=4,
-        streaming=True,
+        streaming=streaming,
         streaming_schedule_mode="pir2",
         streaming_chunk_size_max=5,
         image_delay_max=5,
