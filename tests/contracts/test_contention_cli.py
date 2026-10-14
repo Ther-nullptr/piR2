@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
     "command,module,prefix",
     [
         ("worker", "worker", []),
+        ("flow", "flow", []),
         ("campaign", "campaign", []),
         ("analyze", "reporting", ["analyze"]),
         ("report", "reporting", ["campaign"]),

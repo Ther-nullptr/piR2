@@ -54,6 +54,7 @@ def main():
         "tests/contracts/test_libero_model_loading.py",
         "tests/contracts/test_libero_imports.py",
         "tests/contracts/test_contention_cli.py",
+        "tests/contracts/test_flow_contention.py",
         "tests/contracts/test_contention_worker.py",
         "tests/contracts/test_contention_campaign.py",
         "tests/contracts/test_contention_analysis.py",

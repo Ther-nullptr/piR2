@@ -4,6 +4,7 @@ import argparse
 import importlib
 
 COMMANDS = {
+    "flow": ("flow", ()),
     "worker": ("worker", ()),
     "campaign": ("campaign", ()),
     "analyze": ("reporting", ("analyze",)),

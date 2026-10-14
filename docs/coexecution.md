@@ -137,6 +137,61 @@ provenance and units. Different hardware, model/fixture, implementation or timin
 cohorts are kept separate. Raw traces, generated reports and local plans belong
 under ignored artifact directories, not in Git.
 
+### Official Spatial Flow4 scheduling diagnostic
+
+The additive `flow` command uses the official non-streaming Spatial H40/Flow4
+checkpoint. The existing `worker` and `campaign` commands retain their streaming
+piR2 contracts. Each Flow4 invocation loads two independent full policies once,
+then measures all selected modes with the same precision and placement:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/profile_libero_contention.py flow \
+  --checkpoint models/GR00T-N1.7-LIBERO/libero_spatial \
+  --dataset datasets/groot-libero-spatial --output artifacts/flow4/bf16 \
+  --precision bf16 --group optimized --iterations 30 --offsets-ms 0 5 \
+  --action-device cuda:0 --vlm-device cuda:0
+```
+
+Use `--precision w8a8` or `w4a4` for the repository's current Ada recipes.
+W8 uses the full split-K operator profile and shape tactics; W4 uses the legacy
+grouping and norm producers. Both retain category 2 and site/group tactics.
+The optimized group uses whole VLM and whole action graphs with action K/V reuse,
+static preparation and compiled guards. Every fixture is warmed on each
+execution stream, including the higher-priority action stream. A cold capture,
+changed launcher cache, altered feature storage or RNG-consumption mismatch
+invalidates measurement.
+
+`--group cooperative` disables the whole VLM graph for every matched control.
+It includes VLM-alone, serial, equal/priority concurrent, separately fenced
+controls, and cooperative priority. Permanent no-op layer hooks are common to
+this group; fenced cases synchronize completed CUDA layer boundaries. Compare
+the cooperative case with its fenced controls to distinguish yielding from
+fence cost, and compare equal/priority cases within one graph group.
+
+For two devices, make both visible and set `--action-device cuda:0 --vlm-device
+cuda:1`. Retain this placement's alone and serial baselines and external clock
+telemetry. Old features are copied into action-device storage before timing;
+S2 completion is local to its VLM device and excludes subsequent feature
+transport. Each pair uses a frozen, previously completed generation for S1
+while S2 computes the next fixture. It is distinct from same-frame VLM-to-action
+latency and from a LIBERO closed-loop rollout.
+
+`measurement.json` records per-request release/submission/ready timestamps,
+pair makespan, local CUDA event spans, graph/KV audits, observed quantization
+coverage, source hashes, fixture identities and numerical differences against
+matched serial outputs. Numerical MAE, maximum absolute error and relative L2
+are reported without an exact-equality veto; keys, shapes, finiteness, RNG,
+freshness and output lifetimes remain strict. CUDA event-span intersection is
+not used as evidence of kernel overlap.
+
+Add `--profile-iterations 1` for a separate short Torch profiler pass per case;
+these calls are excluded from clean samples. Worker NVTX ranges carry actual
+S1/S2 request and fixture identities. Add `--cuda-profiler-range` when launching
+under Nsight Systems with `--capture-range=cudaProfilerApi`; only the separate
+probe is bracketed. Inspect actual CUDA activities and stream IDs for overlap.
+The generated Flow4 evidence has its own schema and is not input to the legacy
+streaming campaign report command.
+
 ## Auxiliary SO100 replay
 
 The original `coexecution.run` replay workload uses the SO100 GR00T example, H16, BF16 and preprocessed observations on GPU. It does not load the main LIBERO task checkpoint by default and is not a drop-in LIBERO benchmark. Its purpose is to validate execution mechanisms before applying them to the real closed-loop task.
