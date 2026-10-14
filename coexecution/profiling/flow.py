@@ -10,7 +10,7 @@ from pathlib import Path
 from coexecution.optimization.config import OptimizationConfig
 
 from .common import save
-from .flow_protocol import MODES, FlowCase
+from .flow_protocol import MODES, FlowCase, validate_start_gate
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE_ROOT = ROOT / "configs/quantization/groot-libero-spatial-ada"
@@ -57,6 +57,12 @@ def parser():
         action="store_true",
         help="Bracket only separate profile pairs with cudaProfilerStart/Stop for Nsight",
     )
+    result.add_argument(
+        "--start-gate",
+        type=Path,
+        help="Fresh release-file path; publish start-ready.json after warmup, then wait before clean measurements",
+    )
+    result.add_argument("--gate-timeout-s", type=float, default=600.0)
     return result
 
 
@@ -114,6 +120,7 @@ def cases(args):
 
 def validate_options(args):
     cases(args)
+    validate_start_gate(args.start_gate, args.gate_timeout_s)
     if args.cuda_profiler_range and not args.profile_iterations:
         raise ValueError("CUDA profiler range requires separate profile iterations")
     for device in (args.action_device, args.vlm_device):

@@ -612,3 +612,101 @@ def test_coverage_declares_only_installed_static_vlm_lm_head_inactive(
         controller.dispatch(inactive, 1)
         assert observer.evidence()["passes"]
     observer.close()
+
+
+def test_start_gate_defaults_and_validation_are_host_only(tmp_path):
+    args = arguments()
+    assert args.start_gate is None and args.gate_timeout_s == 600.0
+    flow.validate_options(args)
+    gate = tmp_path / "release"
+    flow.validate_options(arguments("--start-gate", str(gate)))
+    gate.touch()
+    with pytest.raises(ValueError, match="start gate"):
+        flow.validate_options(arguments("--start-gate", str(gate)))
+    for value in ("0", "-1", "nan", "inf"):
+        with pytest.raises(ValueError, match="timeout"):
+            flow.validate_options(arguments("--gate-timeout-s", value))
+
+
+def test_disabled_start_gate_does_not_read_clock_wait_or_publish(monkeypatch):
+    from coexecution.profiling import flow_protocol
+
+    def unexpected(*_args):
+        raise AssertionError("Disabled gate must not alter execution")
+
+    monkeypatch.setattr(flow_protocol.time, "perf_counter_ns", unexpected)
+    monkeypatch.setattr(flow_protocol.time, "sleep", unexpected)
+    assert flow_protocol.wait_start_gate(None, 600.0, on_ready=unexpected) is None
+
+
+def test_start_gate_publishes_ready_before_host_release_and_records_wait(
+    tmp_path, monkeypatch
+):
+    from coexecution.profiling import flow_protocol
+
+    gate = tmp_path / "release"
+    clock = {"ns": 1_000_000_000}
+    polls, ready = [], []
+
+    def sleep(seconds):
+        assert ready and not gate.exists()
+        polls.append(seconds)
+        clock["ns"] += round(seconds * 1e9)
+        if len(polls) == 2:
+            gate.touch()
+
+    monkeypatch.setattr(flow_protocol.time, "perf_counter_ns", lambda: clock["ns"])
+    monkeypatch.setattr(flow_protocol.time, "sleep", sleep)
+    result = flow_protocol.wait_start_gate(gate, 2, on_ready=ready.append)
+    assert len(ready) == 1
+    assert ready[0]["ready_ns"] == result["ready_ns"] == 1_000_000_000
+    assert result["start_ns"] == 1_100_000_000
+    assert result["gate_wait_ms"] == 100.0
+    assert result["gate"] == str(gate)
+    assert polls == [0.05, 0.05]
+
+
+def test_start_gate_rejects_early_release_and_times_out_in_bounded_polls(
+    tmp_path, monkeypatch
+):
+    from coexecution.profiling import flow_protocol
+
+    gate = tmp_path / "release"
+    gate.touch()
+    with pytest.raises(ValueError, match="start gate"):
+        flow_protocol.wait_start_gate(gate, 1, on_ready=lambda _record: None)
+    gate.unlink()
+    clock = {"ns": 0}
+    polls, ready = [], []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        clock["ns"] += round(seconds * 1e9)
+
+    monkeypatch.setattr(flow_protocol.time, "perf_counter_ns", lambda: clock["ns"])
+    monkeypatch.setattr(flow_protocol.time, "sleep", sleep)
+    with pytest.raises(TimeoutError, match="start gate"):
+        flow_protocol.wait_start_gate(gate, 0.12, on_ready=ready.append)
+    assert len(ready) == 1
+    assert clock["ns"] == 120_000_000
+    assert len(polls) == 3 and all(0 < duration <= 0.05 for duration in polls)
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_start_gate_rejects_symlink_created_after_ready(
+    tmp_path, monkeypatch, target_exists
+):
+    from coexecution.profiling import flow_protocol
+
+    gate, target = tmp_path / "release", tmp_path / "old-file"
+    if target_exists:
+        target.write_text("old release")
+
+    def unexpected_sleep(_seconds):
+        pytest.fail("A symlink release must be rejected immediately")
+
+    monkeypatch.setattr(flow_protocol.time, "sleep", unexpected_sleep)
+    with pytest.raises(ValueError, match="start gate"):
+        flow_protocol.wait_start_gate(
+            gate, 1, on_ready=lambda _record: gate.symlink_to(target)
+        )

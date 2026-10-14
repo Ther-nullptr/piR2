@@ -16,7 +16,7 @@ from .common import (
     save,
     stats,
 )
-from .flow_protocol import FlowCase, FlowSchedule, difference
+from .flow_protocol import FlowCase, FlowSchedule, difference, wait_start_gate
 
 LOGGER = logging.getLogger(__name__)
 
@@ -289,6 +289,18 @@ def run_group(args):
                 )
                 return row
 
+            start_coordination = None
+            if args.start_gate is not None:
+
+                def publish_ready(record):
+                    save(args.output / "start-ready.json", record)
+                    status("ready", **record)
+
+                start_coordination = wait_start_gate(
+                    args.start_gate, args.gate_timeout_s, on_ready=publish_ready
+                )
+                save(args.output / "start-gate.json", start_coordination)
+
             for case in plan:
                 status("measuring", case=case.identity)
                 before = graph_state(workload)
@@ -425,7 +437,10 @@ def run_group(args):
                 "samples": samples,
                 "summary": summaries,
                 "profiles": profiles,
-                "provenance": source_evidence(args),
+                "provenance": {
+                    **source_evidence(args),
+                    "start_coordination": start_coordination,
+                },
                 "limitations": [
                     "CUDA event spans are per-request queue/submission/execution spans, not kernel busy time. No event-span intersection is claimed as kernel overlap.",
                     "Stream priority is a scheduling hint. Cooperative handoff occurs after synchronizing a completed VLM layer boundary, never inside whole-VLM graph replay.",

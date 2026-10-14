@@ -1,10 +1,12 @@
 """Framework-free Flow4 request scheduling and numerical evidence contracts."""
 
 import math
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from pathlib import Path
 
 from .common import response_ms
 from .scheduling import CooperativeGate
@@ -21,6 +23,57 @@ MODES = (
     "concurrent_dit_priority_fenced",
     "cooperative_dit_priority",
 )
+
+
+def validate_start_gate(path, timeout_s):
+    """Reject stale release signals before loading any models."""
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError("Start gate timeout must be positive and finite")
+    if path is not None:
+        path = Path(path)
+        if path.exists() or path.is_symlink():
+            raise ValueError("The start gate must not already exist")
+
+
+def wait_start_gate(path, timeout_s, *, on_ready):
+    """Host-only coordination after callers have proved all CUDA streams idle.
+
+    The callback publishes readiness before polling. A release created before
+    this boundary is rejected even if it was absent at CLI validation. Without
+    a gate, this function does not inspect clocks, publish, or wait.
+    """
+    if path is None:
+        return None
+    validate_start_gate(path, timeout_s)
+    path = Path(path).absolute()
+    ready_ns = time.perf_counter_ns()
+    deadline_ns = ready_ns + round(timeout_s * 1e9)
+    record = {
+        "gate": str(path),
+        "ready_ns": ready_ns,
+        "timeout_s": timeout_s,
+        "poll_interval_s": 0.05,
+        "clock": "time.perf_counter_ns",
+    }
+    on_ready(dict(record))
+    while True:
+        now_ns = time.perf_counter_ns()
+        if now_ns >= deadline_ns:
+            raise TimeoutError(f"Timed out waiting for start gate: {path}")
+        try:
+            release = path.lstat()
+        except FileNotFoundError:
+            release = None
+        if release is not None:
+            if not stat.S_ISREG(release.st_mode):
+                raise ValueError("The start gate release must be a regular file")
+            start_ns = time.perf_counter_ns()
+            return {
+                **record,
+                "start_ns": start_ns,
+                "gate_wait_ms": response_ms(ready_ns, start_ns),
+            }
+        time.sleep(min(0.05, (deadline_ns - now_ns) / 1e9))
 
 
 @dataclass(frozen=True)
