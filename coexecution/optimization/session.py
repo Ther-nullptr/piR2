@@ -48,6 +48,7 @@ class GrootOptimizations:
         self._clear_cache = lambda: None
         self._roots = []
         self._resets = []
+        self.cache_clear_policy = {"mode": "global"}
         self._configuration_file_hashes = {}
 
     def __enter__(self):
@@ -355,8 +356,38 @@ class GrootOptimizations:
     def _install_boundary(self):
         self.boundary = None
         if self.config.enabled:
+            forward_clears = []
+            if self.config.component_cache_clear:
+                controller = getattr(self._clear_cache, "__self__", None)
+                bind = getattr(controller, "projection_cache_clearers", None)
+                if not callable(bind):
+                    raise ValueError(
+                        "Component cache clearing requires an owned integer controller"
+                    )
+                clearers = bind(self.config.precision)
+                head = self._model.action_head
+                forward_clears = [
+                    (module, clearers[name])
+                    for module, name in (
+                        (self._model.backbone, "vlm"),
+                        (head.vl_self_attention, "s1_feature"),
+                        (head.model, "dit"),
+                    )
+                    if any(module is root for root in self._roots)
+                ]
+                self.cache_clear_policy = {
+                    "mode": "active_precision_per_root",
+                    "precision": self.config.precision,
+                    "groups": {
+                        name: len(clear.groups) for name, clear in clearers.items()
+                    },
+                    "full_clear": "reset, mode change, teardown",
+                }
             self.boundary = SerialForwardBoundary(
-                self._roots, self._clear_cache, reset_modules=self._resets
+                self._roots,
+                self._clear_cache,
+                reset_modules=self._resets,
+                forward_clears=forward_clears,
             )
             self.runtime_stack.callback(self.boundary.close)
         # Freeze S1 execution only after its submodule serial wrappers exist.
@@ -533,6 +564,7 @@ class GrootOptimizations:
                 if self.operator_profile is None
                 else self.operator_profile.to_dict()
             ),
+            "cache_clear_policy": self.cache_clear_policy,
             "scope": "Experimental serial inference; replay checks do not establish task quality",
         }
 
