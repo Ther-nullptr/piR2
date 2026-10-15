@@ -544,3 +544,73 @@ def test_replay_rejects_review_reproduction_of_vlm_inside_execution(tmp_path):
     _replace_trace(root, events)
     with pytest.raises(ValueError, match="Synchronous.*stage"):
         build_catalog(model_runs=[], deployments=[root], output=tmp_path / "catalog")
+
+
+@pytest.mark.parametrize(
+    "failure,replace_socket", [(False, False), (True, False), (True, True)]
+)
+def test_warmup_rpc_timeout_restores_client_and_current_socket(
+    monkeypatch, failure, replace_socket
+):
+    import sys
+
+    from coexecution.libero import synchronous
+
+    zmq = SimpleNamespace(RCVTIMEO=27, SNDTIMEO=28)
+    monkeypatch.setitem(sys.modules, "zmq", zmq)
+
+    class Socket:
+        def __init__(self, receive=120000, send=130000):
+            self.options = {27: receive, 28: send}
+
+        def getsockopt(self, option):
+            return self.options[option]
+
+        def setsockopt(self, option, value):
+            self.options[option] = value
+
+    original = Socket()
+    client = SimpleNamespace(timeout_ms=120000, socket=original)
+    assert hasattr(synchronous, "warmup_rpc_timeout")
+    try:
+        with synchronous.warmup_rpc_timeout(client, 900000):
+            assert client.timeout_ms == 900000
+            assert client.socket.options == {27: 900000, 28: 900000}
+            if replace_socket:
+                # PolicyClient recreates the invalid REQ socket using timeout_ms.
+                client.socket = Socket(client.timeout_ms, client.timeout_ms)
+            if failure:
+                raise TimeoutError("warmup failed")
+    except TimeoutError:
+        assert failure
+    assert client.timeout_ms == 120000
+    assert client.socket.options == {27: 120000, 28: 130000}
+    assert (client.socket is original) is not replace_socket
+
+
+def test_warmup_timeout_control_is_bounded_and_only_sync_uses_it():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from evaluate_libero_protocol import build_parser, validate_deployment_controls
+
+    base = [
+        "--protocol",
+        "deployment",
+        "--variant",
+        "flow",
+        "--output",
+        "unused",
+        "--execution-coupling",
+        "synchronous",
+    ]
+    args = build_parser().parse_args(base)
+    assert args.synchronous_warmup_timeout_seconds == 900
+    for value in ("0", "-1", "2147484"):
+        with pytest.raises(ValueError, match="warmup.*timeout"):
+            validate_deployment_controls(
+                build_parser().parse_args(
+                    base + ["--synchronous-warmup-timeout-seconds", value]
+                )
+            )

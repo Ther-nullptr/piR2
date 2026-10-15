@@ -661,3 +661,18 @@ def test_uuid_admission_returns_verified_role_mapping(plan, monkeypatch):
     assert mapping == {
         role: {"physical_index": 0, "uuid": uuid} for role in plan["gpus"]
     }
+
+
+def test_synchronous_warmup_timeout_reaches_evaluator(plan):
+    plan.update(
+        execution_coupling="synchronous", synchronous_warmup_timeout_seconds=600
+    )
+    m = module()
+    m.validate_plan(plan)
+    command = m.build_commands(plan, plan["conditions"][0], "deployment", Path("/out"))[
+        "evaluate"
+    ]
+    assert command[command.index("--synchronous-warmup-timeout-seconds") + 1] == "600"
+    plan["conditions"][0]["synchronous_warmup_timeout_seconds"] = -1
+    with pytest.raises(ValueError, match="warmup.*timeout"):
+        m.validate_plan(plan)

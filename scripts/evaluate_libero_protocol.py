@@ -305,6 +305,12 @@ def build_parser():
     )
     parser.add_argument("--synchronous-chunk-steps", type=int, default=8)
     parser.add_argument(
+        "--synchronous-warmup-timeout-seconds",
+        type=int,
+        default=900,
+        help="Synchronous cold-JIT warmup socket timeout; scored RPC timeout is unchanged",
+    )
+    parser.add_argument(
         "--execution-clock",
         choices=("paced", "ready"),
         default="paced",

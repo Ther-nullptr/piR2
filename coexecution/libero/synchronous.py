@@ -7,6 +7,7 @@ model worker or fixed global control deadline exists in this protocol.
 
 import hashlib
 import math
+from contextlib import contextmanager
 from itertools import pairwise
 
 import numpy as np
@@ -23,6 +24,11 @@ def validate_synchronous_controls(args):
     chunk = getattr(args, "synchronous_chunk_steps", 8)
     if type(chunk) is not int or chunk < 1:
         raise ValueError("Synchronous chunk steps must be a positive integer")
+    timeout = getattr(args, "synchronous_warmup_timeout_seconds", 900)
+    if type(timeout) is not int or not 1 <= timeout <= (2**31 - 1) // 1000:
+        raise ValueError(
+            "Synchronous warmup RPC timeout must be positive and fit socket milliseconds"
+        )
     if coupling != "synchronous":
         return
     if args.protocol != "deployment" or args.variant != "flow":
@@ -449,6 +455,30 @@ def run_synchronous_loop(
     return result, frames
 
 
+@contextmanager
+def warmup_rpc_timeout(client, timeout_ms):
+    """Bound cold compilation separately; restore even a timeout-recreated socket."""
+    import zmq
+
+    if type(timeout_ms) is not int or not 1 <= timeout_ms <= 2**31 - 1:
+        raise ValueError("Warmup RPC timeout must fit positive socket milliseconds")
+    previous_timeout = client.timeout_ms
+    previous_options = {
+        option: client.socket.getsockopt(option)
+        for option in (zmq.RCVTIMEO, zmq.SNDTIMEO)
+    }
+    try:
+        # PolicyClient uses this attribute when recreating a timed-out REQ socket.
+        client.timeout_ms = timeout_ms
+        for option in previous_options:
+            client.socket.setsockopt(option, timeout_ms)
+        yield
+    finally:
+        client.timeout_ms = previous_timeout
+        for option, value in previous_options.items():
+            client.socket.setsockopt(option, value)
+
+
 def synchronous_episode(env, observation, client, args, seed, trace):
     """Existing evaluator adapter; warmup never advances physics or scored RNG."""
     from coexecution.replay.recording import ReplayRecorder
@@ -459,16 +489,18 @@ def synchronous_episode(env, observation, client, args, seed, trace):
     # Each task can change its text/image graph bucket. Warm it in this exact
     # endpoint, then reset the RNG only once before scored requests.
     warmup = []
-    for _ in range(args.slow_warmup_calls):
-        result = client.call_endpoint(
-            "synchronous_plan",
-            {
-                "observation": nested(observation),
-                "capture_s": clock.now(),
-                "source_tick": 0,
-            },
-        )
-        warmup.append(result["audit"])
+    timeout_seconds = getattr(args, "synchronous_warmup_timeout_seconds", 900)
+    with warmup_rpc_timeout(client, timeout_seconds * 1000):
+        for _ in range(args.slow_warmup_calls):
+            result = client.call_endpoint(
+                "synchronous_plan",
+                {
+                    "observation": nested(observation),
+                    "capture_s": clock.now(),
+                    "source_tick": 0,
+                },
+            )
+            warmup.append(result["audit"])
     client.call_endpoint("reset", {"options": {"seed": seed}})
     recorder = (
         ReplayRecorder(max_frames=args.replay_max_frames)
@@ -510,6 +542,8 @@ def synchronous_episode(env, observation, client, args, seed, trace):
     )
     result["warmup"] = {
         "scope": "before scored control and episode RNG reset; no physics steps",
+        "rpc_timeout_seconds": timeout_seconds,
+        "rpc_timeout_scope": "per-send/per-receive socket timeout during warmup only; original timeout restored before reset and scored inference",
         "calls": warmup,
     }
     return result, frames

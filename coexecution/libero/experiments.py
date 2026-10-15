@@ -135,6 +135,7 @@ def validate_plan(plan):
             defaults = {
                 "execution_coupling": "asynchronous",
                 "synchronous_chunk_steps": 8,
+                "synchronous_warmup_timeout_seconds": 900,
                 "server_layout": "split",
                 "feature_transport": "numpy_fp32",
                 "feature_rpc": "separate",
@@ -223,6 +224,13 @@ def build_commands(plan, case, protocol, output):
                     case.get(
                         "synchronous_chunk_steps",
                         plan.get("synchronous_chunk_steps", 8),
+                    )
+                ),
+                "--synchronous-warmup-timeout-seconds",
+                str(
+                    case.get(
+                        "synchronous_warmup_timeout_seconds",
+                        plan.get("synchronous_warmup_timeout_seconds", 900),
                     )
                 ),
             ]

@@ -193,6 +193,10 @@ python scripts/evaluate_libero_protocol.py \
 只启动 action worker。同步模式拒绝 πR²、algorithm protocol、paired/resident
 feature exchange、服务时长下限、视觉限频和 fixed-delay 控制。每任务先做本 endpoint
 完整 warmup，再重置一次 episode RNG；正式周期不调用会重新设 seed 的 bootstrap。
+同步 warmup 的 socket 超时默认 900 秒，可用
+`--synchronous-warmup-timeout-seconds` 或 plan 中同名下划线字段调整；只覆盖冷启动
+JIT/预热调用，结束或异常时恢复原客户端及当前 socket 的超时。reset 与正式推理仍用
+原来的 120 秒设置，预热耗时不计入 scored control。
 可选 `gpu_uuids` 必须提供 action/vlm/simulation 的完整 GPU UUID，准入先核对实际
 `nvidia-smi` index/UUID，保留 `gpu-admission.json` 与 hardware 中的 verified mapping。
 
@@ -202,6 +206,10 @@ feature exchange、服务时长下限、视觉限频和 fixed-delay 控制。每
 区间标为 `server_action_stage` / `server_vlm_stage`，不是两条独立 RPC，也不是 GPU
 kernel 时间。`inference_wall_seconds` 是单次 VLM+Flow4 RPC 的完整客户端 wall；
 `action_stage_seconds` 和 `vlm_stage_seconds` 是服务端 stream 完成边界。
+完整同步调用使用 `synchronous_rpc_started_s` / `synchronous_rpc_completed_s`，
+不与单独 action RPC 的提交边界混用。导入器兼容第一批记录中的旧字段名称，但保留
+原文件并在规范化输出中明确完整同步 RPC 的范围；显示的各阶段事件必须逐一匹配
+同周期 audit、source IDs 和执行动作。
 
 ```bash
 python -m coexecution.replay build \
