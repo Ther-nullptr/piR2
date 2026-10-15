@@ -416,3 +416,131 @@ def test_synchronous_report_does_not_call_server_stages_independent_rpcs(tmp_pat
     assert report["summary"]["s1_rpc_p50_ms"] is None
     assert report["summary"]["s1_stage_p50_ms"] == pytest.approx(70)
     assert report["summary"]["control_rate_valid_episodes"] is None
+
+
+def _replace_trace(root, events):
+    (root / "task0-episode0-trace.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events)
+    )
+
+
+@pytest.mark.parametrize(
+    "kind,field,value",
+    [
+        ("vision_request", "started_s", 10.2),
+        ("vision_request", "completed_s", 10.23),
+        ("vision_request", "source_tick", 5),
+        ("vision_request", "capture_s", 9.0),
+        ("feature_published", "feature_sequence", 7),
+        ("feature_published", "rpc_completed_s", 10.24),
+        ("action_submitted", "t_s", 10.2),
+        ("action_submitted", "feature_source_tick", 5),
+        ("action_started", "t_s", 10.2),
+        ("action_completed", "t_s", 10.3),
+        ("action_completed", "feature_capture_s", 9.0),
+        ("action_completed", "valid_end_tick", 99),
+        ("action_adopted", "installed_slots", 99),
+        ("action_adopted", "t_s", 10.2),
+    ],
+)
+def test_replay_rejects_stage_events_that_disagree_with_cycle_audit(
+    tmp_path, kind, field, value
+):
+    from coexecution.replay.catalog import build_catalog
+
+    root, events = synchronous_recording(tmp_path)
+    row = next(row for row in events if row["kind"] == kind)
+    row[field] = value
+    _replace_trace(root, events)
+    with pytest.raises(ValueError, match="Synchronous.*stage"):
+        build_catalog(model_runs=[], deployments=[root], output=tmp_path / "catalog")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "vision_request",
+        "feature_published",
+        "action_submitted",
+        "action_started",
+        "action_completed",
+        "request_completed",
+        "action_adopted",
+    ],
+)
+@pytest.mark.parametrize("mutation", ["missing", "duplicate"])
+def test_replay_requires_exactly_one_stage_event_per_cycle(tmp_path, kind, mutation):
+    from coexecution.replay.catalog import build_catalog
+
+    root, events = synchronous_recording(tmp_path)
+    row = next(row for row in events if row["kind"] == kind)
+    if mutation == "missing":
+        events.remove(row)
+    else:
+        events.append(dict(row))
+    _replace_trace(root, events)
+    with pytest.raises(ValueError, match="Synchronous.*stage"):
+        build_catalog(model_runs=[], deployments=[root], output=tmp_path / "catalog")
+
+
+def test_replay_rejects_contradictory_stage_audit_and_executed_source(tmp_path):
+    from coexecution.replay.catalog import build_catalog
+
+    root, events = synchronous_recording(tmp_path)
+    request = next(row for row in events if row["kind"] == "request_completed")
+    request["audit"]["forward_counts"]["dit"] = 8
+    _replace_trace(root, events)
+    with pytest.raises(ValueError, match="Synchronous.*stage"):
+        build_catalog(model_runs=[], deployments=[root], output=tmp_path / "catalog")
+
+
+def test_full_synchronous_rpc_does_not_reuse_independent_action_rpc_start():
+    _result, events, *_ = scenario()
+    timing = next(
+        row["client_timing"] for row in events if row["kind"] == "request_completed"
+    )
+    assert "plan_rpc_started_s" not in timing
+    assert timing["timing_scope"] == "server_action_stage"
+    assert timing["synchronous_rpc_started_s"] < timing["submitted_s"]
+    assert timing["synchronous_rpc_completed_s"] >= timing["completed_s"]
+
+
+def test_replay_normalizes_legacy_full_rpc_name_without_rewriting_source(tmp_path):
+    from coexecution.replay.catalog import build_catalog
+
+    root, events = synchronous_recording(tmp_path)
+    for row in events:
+        timing = row if row["kind"] == "action_completed" else row.get("client_timing")
+        if timing is not None:
+            timing["plan_rpc_started_s"] = timing.pop(
+                "synchronous_rpc_started_s",
+                10.0
+                if row.get("request_tick", row.get("audit", {}).get("request_tick"))
+                == 0
+                else 10.5,
+            )
+            timing.pop("synchronous_rpc_completed_s", None)
+            timing.pop("timing_scope", None)
+    _replace_trace(root, events)
+    path = root / "task0-episode0-trace.jsonl"
+    raw = path.read_bytes()
+    output = tmp_path / "catalog"
+    catalog = build_catalog(model_runs=[], deployments=[root], output=output)
+    run = json.loads((output / catalog["runs"][0]["path"]).read_text())
+    request = run["episodes"][0]["queue"]["requests"][0]
+    assert request["plan_rpc_started_s"] is None
+    assert request["synchronous_rpc_started_s"] == 0
+    assert request["synchronous_rpc_completed_s"] == pytest.approx(0.1)
+    assert request["timing_scope"] == "server_action_stage"
+    assert path.read_bytes() == raw
+
+
+def test_replay_rejects_review_reproduction_of_vlm_inside_execution(tmp_path):
+    from coexecution.replay.catalog import build_catalog
+
+    root, events = synchronous_recording(tmp_path)
+    vision = next(row for row in events if row["kind"] == "vision_request")
+    vision.update(started_s=10.2, completed_s=10.23, t_s=10.23, rpc_seconds=0.03)
+    _replace_trace(root, events)
+    with pytest.raises(ValueError, match="Synchronous.*stage"):
+        build_catalog(model_runs=[], deployments=[root], output=tmp_path / "catalog")

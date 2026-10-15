@@ -258,7 +258,23 @@ def summarize_episode(events, metadata):
                 "use_s": relative(use_time),
                 "use_boundary": use_boundary,
                 "timing_version": actual.get("timing_version", 1),
-                "plan_rpc_started_s": relative(timing.get("plan_rpc_started_s")),
+                "plan_rpc_started_s": relative(timing.get("plan_rpc_started_s"))
+                if execution_coupling == "asynchronous"
+                else None,
+                "synchronous_rpc_started_s": relative(
+                    timing.get(
+                        "synchronous_rpc_started_s", timing.get("plan_rpc_started_s")
+                    )
+                )
+                if execution_coupling == "synchronous"
+                else None,
+                "synchronous_rpc_completed_s": relative(
+                    timing.get(
+                        "synchronous_rpc_completed_s", consumed.get(k, {}).get("t_s")
+                    )
+                )
+                if execution_coupling == "synchronous"
+                else None,
                 "server_install_started_s": relative(
                     actual.get("server_install_started_s")
                 ),

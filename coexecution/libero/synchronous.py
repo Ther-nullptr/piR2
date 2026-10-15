@@ -147,7 +147,9 @@ def _plan_events(
     timing = {
         "submitted_s": aa,
         "completed_s": ab,
-        "plan_rpc_started_s": submitted,
+        "synchronous_rpc_started_s": submitted,
+        "synchronous_rpc_completed_s": completed,
+        "timing_scope": "server_action_stage",
         "server_plan_started_s": aa,
         "timing_version": 2,
         "cache_age_at_server_plan_ms": (aa - capture) * 1000,

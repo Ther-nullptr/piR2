@@ -97,6 +97,195 @@ def _robot(root, metadata, start, ticks, media):
     return {**data, "frames": frames, "media": assets}, [source(path)]
 
 
+def _stage_matches(row, expected):
+    if not isinstance(row, dict) or any(
+        key not in row or row[key] != value for key, value in expected.items()
+    ):
+        raise ValueError(
+            "Synchronous stage events disagree with cycle audit or source identity"
+        )
+
+
+def _synchronous_stage_events(groups, cycle, inference, execution, ticks):
+    """Bind every displayed stage and lineage join to the same measured cycle."""
+    tick, sequence, audit = cycle["request_tick"], cycle["cycle"], cycle["audit"]
+
+    def one(kind):
+        rows = [
+            row
+            for row in groups[kind]
+            if (
+                row.get("source_tick")
+                if kind in ("vision_request", "feature_published")
+                else row.get("audit", {}).get("request_tick")
+                if kind == "request_completed"
+                else row.get("request_tick")
+            )
+            == tick
+        ]
+        if len(rows) != 1:
+            raise ValueError(
+                f"Synchronous stage {kind} requires one matching source per cycle"
+            )
+        return rows[0]
+
+    capture = audit["capture_s"]
+    va, vb, aa, ab = (
+        audit[key]
+        for key in (
+            "vlm_started_s",
+            "vlm_completed_s",
+            "action_started_s",
+            "action_completed_s",
+        )
+    )
+    _stage_matches(audit, {"source_tick": tick, "forward_counts": {"vlm": 1, "dit": 4}})
+    _stage_matches(
+        cycle,
+        {
+            "submitted_s": inference["start_s"],
+            "completed_s": inference["end_s"],
+            "executed_steps": len(ticks),
+        },
+    )
+    _stage_matches(
+        inference,
+        {
+            "request_tick": tick,
+            "physics_start_tick": tick,
+            "source_capture_s": capture,
+            "frame_hashes": audit["frame_hashes"],
+        },
+    )
+    _stage_matches(execution, {"request_tick": tick, "physics_start_tick": tick})
+    if vb > aa or capture > va:
+        raise ValueError("Synchronous stage source or VLM/DiT ordering is invalid")
+    source = {"source_tick": tick, "capture_s": capture}
+    dependency = {
+        "feature_sequence": sequence,
+        "feature_source_tick": tick,
+        "feature_capture_s": capture,
+        "state_tick": tick,
+        "state_capture_s": capture,
+    }
+    _stage_matches(
+        one("vision_request"),
+        {
+            **source,
+            "t_s": vb,
+            "started_s": va,
+            "completed_s": vb,
+            "rpc_seconds": vb - va,
+            "timing_scope": "server_vlm_stage",
+        },
+    )
+    _stage_matches(
+        one("feature_published"),
+        {
+            **source,
+            "t_s": vb,
+            "rpc_completed_s": vb,
+            "feature_sequence": sequence,
+        },
+    )
+    _stage_matches(
+        one("action_submitted"),
+        {
+            **dependency,
+            "t_s": aa,
+            "request_tick": tick,
+            "deadline_s": None,
+            "delay_ticks": 0,
+            "timing_scope": "server_action_stage",
+        },
+    )
+    _stage_matches(one("action_started"), {"t_s": aa, "request_tick": tick})
+    adopted = one("action_adopted")
+    accepted = adopted.get("installed_slots")
+    native = cycle["native_decoded_actions"]
+    if (
+        type(accepted) is not int
+        or not len(ticks) <= accepted <= len(native)
+        or audit["decoded_horizon"] != len(native)
+        or cycle["unused_plan_suffix_slots"] != len(native) - len(ticks)
+    ):
+        raise ValueError("Synchronous stage action counts disagree with the cycle")
+    _stage_matches(
+        adopted,
+        {
+            "t_s": cycle["completed_s"],
+            "request_tick": tick,
+            "expired_slots": 0,
+            "protected_slots": 0,
+            "ready_to_adopt_seconds": cycle["completed_s"] - ab,
+        },
+    )
+    completed = one("action_completed")
+    _stage_matches(
+        completed,
+        {
+            **dependency,
+            "t_s": ab,
+            "request_tick": tick,
+            "request_elapsed_s": ab - aa,
+            "valid_start_tick": tick,
+            "valid_end_tick": tick + accepted,
+        },
+    )
+    consumed = one("request_completed")
+    _stage_matches(
+        consumed,
+        {"t_s": cycle["completed_s"], "audit": {**audit, "request_tick": tick}},
+    )
+    for timing in (completed, consumed["client_timing"]):
+        _stage_matches(
+            timing,
+            {
+                **dependency,
+                "submitted_s": aa,
+                "completed_s": ab,
+                "server_plan_started_s": aa,
+                "timing_version": 2,
+                "cache_age_at_server_plan_ms": (aa - capture) * 1000,
+            },
+        )
+        if "synchronous_rpc_started_s" in timing:
+            _stage_matches(
+                timing,
+                {
+                    "synchronous_rpc_started_s": cycle["submitted_s"],
+                    "synchronous_rpc_completed_s": cycle["completed_s"],
+                    "timing_scope": "server_action_stage",
+                },
+            )
+            if "plan_rpc_started_s" in timing:
+                raise ValueError("Synchronous stage contains conflicting RPC scopes")
+        else:
+            # The first frozen recordings used this legacy name for the whole
+            # call. Its meaning is verified here; the raw evidence stays intact.
+            _stage_matches(timing, {"plan_rpc_started_s": cycle["submitted_s"]})
+            if (
+                timing.get("timing_scope", "server_action_stage")
+                != "server_action_stage"
+            ):
+                raise ValueError("Synchronous stage contains an invalid timing scope")
+    for offset, row in enumerate(ticks):
+        _stage_matches(
+            row,
+            {
+                "feature_sequence": sequence,
+                "feature_source_tick": tick,
+                "feature_capture_s": capture,
+                "state_capture_s": capture,
+                "action": native[offset],
+            },
+        )
+        _stage_matches(
+            row["executed_slot"],
+            {"producer_kind": "request", "producer_request_tick": tick},
+        )
+
+
 def _synchronous_phases(events, ticks, start, stop, episode_id):
     """Accept actual mutually exclusive phases; never derive them from video FPS."""
     phases = sorted(
@@ -106,6 +295,20 @@ def _synchronous_phases(events, ticks, start, stop, episode_id):
     cycles = [row for row in events if row.get("kind") == "synchronous_cycle"]
     if not phases or len(phases) != 2 * len(cycles):
         raise ValueError("Synchronous episode requires two actual phases per cycle")
+    stage_groups = {
+        kind: [row for row in events if row.get("kind") == kind]
+        for kind in (
+            "vision_request",
+            "feature_published",
+            "action_submitted",
+            "action_started",
+            "action_completed",
+            "request_completed",
+            "action_adopted",
+        )
+    }
+    if any(len(rows) != len(cycles) for rows in stage_groups.values()):
+        raise ValueError("Synchronous stage event count must match the cycle count")
     previous, next_tick, normalized = start, 0, []
     for index, cycle in enumerate(cycles):
         inference, execution = phases[2 * index : 2 * index + 2]
@@ -163,6 +366,7 @@ def _synchronous_phases(events, ticks, start, stop, episode_id):
                 raise ValueError(
                     "Neural stage lies outside its synchronous inference phase"
                 )
+        _synchronous_stage_events(stage_groups, cycle, inference, execution, selected)
         next_tick += len(selected)
     if next_tick != len(ticks):
         raise ValueError(
