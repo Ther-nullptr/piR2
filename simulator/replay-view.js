@@ -676,24 +676,38 @@
         metrics.innerHTML = metricsHTML([
           [
             synchronous ? "DiT stage P50" : "S1 RPC P50",
-            (synchronous ? meta.action_stage_seconds : meta.action_rpc_seconds)
-              ?.p50 * 1000,
+            R.scaleMetric(
+              (synchronous
+                ? meta.action_stage_seconds
+                : meta.action_rpc_seconds
+              )?.p50,
+              1000,
+            ),
             "ms",
           ],
           [
             synchronous ? "DiT stage P95" : "S1 RPC P95",
-            (synchronous ? meta.action_stage_seconds : meta.action_rpc_seconds)
-              ?.p95 * 1000,
+            R.scaleMetric(
+              (synchronous
+                ? meta.action_stage_seconds
+                : meta.action_rpc_seconds
+              )?.p95,
+              1000,
+            ),
             "ms",
           ],
           ...(synchronous
             ? [
                 [
                   "Inference RPC P50",
-                  meta.inference_wall_seconds?.p50 * 1000,
+                  R.scaleMetric(meta.inference_wall_seconds?.p50, 1000),
                   "ms",
                 ],
-                ["Inference wait", meta.inference_wait_fraction * 100, "%"],
+                [
+                  "Inference wait",
+                  R.scaleMetric(meta.inference_wait_fraction, 100),
+                  "%",
+                ],
               ]
             : []),
           ["Wall clock", Math.min(state.clock, at.end ?? state.clock), "s"],

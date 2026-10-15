@@ -6,6 +6,11 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
+  function scaleMetric(value, factor) {
+    if (!finite(value) || !finite(factor)) return null;
+    const scaled = value * factor;
+    return finite(scaled) ? scaled : null;
+  }
   function lastAt(rows, time, key) {
     let found = null;
     for (const row of rows ?? [])
@@ -221,8 +226,20 @@
     );
   }
   function physicsAt(episode, time) {
-    if (!finite(episode?.controlled_start_s)) return null;
-    const completed = (episode.ticks ?? []).filter(
+    const ticks = episode?.ticks;
+    if (
+      !finite(episode?.controlled_start_s) ||
+      !finite(time) ||
+      !Array.isArray(ticks) ||
+      !ticks.length ||
+      !ticks.every(
+        (tick) =>
+          finite(tick.next_observation_computed_s) &&
+          finite(tick.simulated_elapsed_seconds),
+      )
+    )
+      return null;
+    const completed = ticks.filter(
       (tick) =>
         finite(tick.next_observation_computed_s) &&
         tick.next_observation_computed_s - episode.controlled_start_s <= time,
@@ -313,6 +330,7 @@
     replayDescriptors,
     playableEpisode,
     finite,
+    scaleMetric,
     lastAt,
     records,
     alignModel,
