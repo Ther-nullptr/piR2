@@ -108,7 +108,7 @@ def load_core(checkpoint, output, device):
     return core
 
 
-def serve(backend, spec, identity, optimization=None):
+def serve(backend, spec, identity, optimization=None, record_runtime_receipt=False):
     import torch
     from gr00t.policy.server_client import PolicyServer
 
@@ -140,6 +140,16 @@ def serve(backend, spec, identity, optimization=None):
             observed = dict(identity)
             if getattr(backend, "feature_exchange", None) is not None:
                 observed["feature_exchange"] = backend.feature_exchange.evidence()
+            if record_runtime_receipt:
+                from coexecution.libero.runtime_receipt import capture_runtime_receipt
+
+                with submission():
+                    observed["runtime_receipt"] = capture_runtime_receipt(
+                        optimized,
+                        variant=identity["variant"],
+                        measurement_boundary="deployment",
+                        torch_module=torch,
+                    )
             return observed
 
         server.register_endpoint("identity", current_identity, requires_input=False)
@@ -176,9 +186,15 @@ def serve(backend, spec, identity, optimization=None):
         try:
             server.run()
         finally:
-            if hasattr(server, "socket"):
-                server.socket.close()
-                server.context.term()
+            try:
+                if record_runtime_receipt:
+                    (backend.output / "identity.json").write_text(
+                        json.dumps(current_identity(), indent=2) + "\n"
+                    )
+            finally:
+                if hasattr(server, "socket"):
+                    server.socket.close()
+                    server.context.term()
 
 
 def supervise_workers(workers, worker_fn=serve):
@@ -220,6 +236,11 @@ def main():
     parser.add_argument("--torch-threads", type=int, default=2)
     parser.add_argument("--server-layout", choices=("split", "paired"))
     parser.add_argument("--feature-max-leases", type=int, default=16)
+    parser.add_argument(
+        "--runtime-receipt",
+        action="store_true",
+        help="Record actual loaded runtime/operator identities outside request timers",
+    )
     add_feature_arguments(parser)
     add_optimization_arguments(parser)
     args = parser.parse_args()
@@ -344,7 +365,8 @@ def main():
                 "installation": "producer event wait and record_stream; independent consumer tensor references",
             }
         (output / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
-        workers.append((backend, spec, identity, optimization))
+        worker = (backend, spec, identity, optimization)
+        workers.append((*worker, True) if args.runtime_receipt else worker)
     try:
         if len(workers) == 1:
             serve(*workers[0])

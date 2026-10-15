@@ -140,14 +140,15 @@ shared cursor and event inspector of the VLM realtime-caption viewer. It contain
 no external assets or framework dependency. `replay-model.js` interprets evidence;
 `replay-view.js` renders it. `replay-media.js` owns bounded media decoding and
 keeps the last decoded frame visible during forward playback; backwards seeks
-hide any frame newer than the cursor. `replay-lineage.js` uses the existing measured
-queue dependency aliases and only recorded source/publication/consumption IDs. The server imports only standard-library evidence
+hide any frame newer than the cursor. `replay-timeline.js` uses measured task
+intervals and the existing S2/S1 source aliases; it does not guess component
+durations from a complete request's wall time. The server imports only standard-library evidence
 helpers, never Torch, NumPy archives, a simulator or a model.
 
 - **Independent model**: select a measurement boundary, real input and seed.
   `policy` includes raw-input preparation and action decoding;
   `preparation_transfer` only prepares/transfers inputs and shows no neural
-  dependency arrows; `prepared_model` measures the resident-input model body.
+  task blocks; `prepared_model` measures the resident-input model body.
   Profile preparation+model calls explicitly exclude decoding and are a separate
   `preparation_model` boundary. Statistics and cross-precision matches never mix
   scopes. Unknown boundaries remain inspectable without inferred neural stages.
@@ -175,13 +176,35 @@ helpers, never Torch, NumPy archives, a simulator or a model.
   Selecting a command exposes its request, source frame/feature and cache/image/
   state AoI through the existing measured-queue helper. Diverged robot trajectories
   are never presented as the same-input numerical comparison.
-- The always-visible dependency diagram connects observation → S2/VLM → published
-  feature/cache → S1/DiT → action buffer → executed control tick. Each precision
-  follows its own actual consumed feature, rather than whichever cache is newest.
-  Click a request, action or diagram node to pin its lineage; “跟随时间游标” restores
-  the currently executed action. Unknown/bootstrap links remain marked unknown.
-  In model view, dashed arrows identify the recorded full-model invocation path;
-  they do not invent unmeasured component times.
+- The primary timeline has separate VLM/S2 and DiT/S1 tracks for each precision.
+  Thin task bars move through a following time window, with explicit not-started,
+  running, completed and failed/unknown states. `S1[n].k` names the actual consumed
+  S2 feature, never the newest cache by proximity. Click a bar to inspect its
+  source and timestamps; recorded upstream tasks are highlighted with a dashed
+  outline. Detailed kernels remain in the expandable section.
+  Asynchronous deployment bars are RPC intervals. Synchronous VLM/DiT bars are
+  server stages within one full inference RPC, not separate RPCs or GPU kernel
+  durations. A third `Inference / Execution` track uses only recorded
+  `episode.phases` intervals on the control wall clock: inference pauses physics;
+  execution includes the configured action-phase pacing. Execution source links
+  use the phase's recorded producer request identity, never the closest task in
+  time. Missing phases or producer identities stay unavailable. The coupling
+  selector is independent of cadence; synchronous `paced` means 20 Hz within
+  execution phases only, not a global fixed control frequency. Cards show the
+  current phase, wall/physics clocks and retained episode outcome. Videos continue
+  to use recorded frame timestamps, including held frames during inference.
+  Model Profile bars span the actual first
+  and last attributed CUDA activity, including gaps; host-submission intervals
+  remain explicitly labelled. Clean records without component timestamps show
+  unavailable tracks. Bar shading follows the recorded playback cursor, not an
+  estimated fraction of neural work. There is no separate dependency diagram.
+- Declared live streams use `replay-stream.js`: snapshot first, then ordered SSE
+  events, duplicate/gap checks, resnapshot and explicit terminal closure. Live
+  updates preserve media, cursor and user selection; following the latest event
+  is opt-in. Catalog refresh discovers newly recorded runs without starting them.
+  Missing clocks, recorder loss and failures remain visible; browser receipt
+  time does not replace an observation, GPU or execution timestamp. Catalogs may
+  set `default_view` and `default_record_type`; explicit URL choices take priority.
 - Incomplete/unavailable controller traces keep their task identity, status and
   reason. They cannot play a normal control episode even if metadata contains a
   success flag. All secondary controls are disabled while a new run set loads.
@@ -197,7 +220,8 @@ files through `/api/replay/catalog`, `/api/replay/run/<id>` and
 paths and MIME types are validated; absolute paths, traversal, symlinks and
 unlisted files are rejected. Directory listings are disabled. APIs and HTML/JS/CSS use no-store (static conditional requests return fresh
 content); media can be privately cached for one hour. Keep configured artifacts unchanged
-while viewing them. The preview binds to loopback; it is not a public artifact
+for immutable completed runs. Registered stream snapshots/journals and their
+media manifests may grow through the explicit recorder protocol. The preview binds to loopback; it is not a public artifact
 hosting service.
 
 ```bash
@@ -207,6 +231,8 @@ python -m pytest -q simulator/test_serve.py
 node simulator/replay-browser-check.cjs --catalog=/path/to/catalog.json
 # Or against an existing preview:
 node simulator/replay-browser-check.cjs --url=http://127.0.0.1:8765/simulator/replay.html
+# Desktop transport contracts using protocol fixtures, not measured model data:
+node simulator/replay-stream-browser-check.cjs
 ```
 
 The optional browser check expects a three-precision model/robot debug catalog

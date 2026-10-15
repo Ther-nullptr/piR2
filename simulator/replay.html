@@ -7,8 +7,9 @@
     <link rel="stylesheet" href="replay.css" />
     <script defer src="measured-model.js"></script>
     <script defer src="replay-model.js"></script>
-    <script defer src="replay-lineage.js"></script>
+    <script defer src="replay-timeline.js"></script>
     <script defer src="replay-media.js"></script>
+    <script defer src="replay-stream.js"></script>
     <script defer src="replay-view.js"></script>
   </head>
   <body>
@@ -104,28 +105,28 @@
           </select></label
         ><label
           >窗口<select id="window">
-            <option value="all">全部</option>
+            <option value="auto" selected>自动滚动</option>
+            <option value="all">全程概览</option>
             <option value="0.1">10%</option>
             <option value="0.25">25%</option>
             <option value="0.5">50%</option>
           </select></label
         >
       </section>
-      <section class="lineage-section" aria-label="真实观测与动作依赖">
-        <div class="section-heading">
-          <div>
-            <h2 id="lineage-title">观测 → VLM → 缓存 → DiT → 动作 → 机器人</h2>
-            <p id="lineage-note">按记录中的来源 ID 连接，缺失链路留空。</p>
-          </div>
-          <button id="lineage-follow" class="secondary">跟随时间游标</button>
-        </div>
-        <div id="lineage"></div>
-      </section>
       <section class="timeline-section">
+        <div class="task-legend inline-controls" aria-label="实时记录状态">
+          <label title="按已记录的事件和快照跟随最新证据"
+            ><input id="follow-latest" type="checkbox" />跟随最新</label
+          ><output id="stream-status" role="status" data-state="historical"
+            >历史记录 · 无实时订阅</output
+          >
+        </div>
         <div class="section-heading">
           <div>
-            <h2>共享时间线</h2>
-            <p id="timeline-note">每条轨道保留自己的执行记录</p>
+            <h2>VLM / DiT · 运行时间线</h2>
+            <p id="timeline-note">
+              任务块按真实起止时间移动；S1[xx].k 使用 S2-xx 的特征。
+            </p>
           </div>
           <div class="inline-controls">
             <label
@@ -137,14 +138,37 @@
                 <option value="control">Control</option>
               </select></label
             ><label
-              >类别<select id="category">
+              >内核类别<select id="category">
                 <option value="all">全部类别</option>
               </select></label
             >
           </div>
         </div>
-        <div id="legend" class="legend"></div>
-        <div id="timeline" class="timeline" aria-label="组件时间线"></div>
+        <div class="task-legend" aria-label="任务状态图例">
+          <span data-phase="future">尚未开始</span
+          ><span data-phase="running">运行中</span>
+          <span data-phase="completed">已完成</span
+          ><span data-phase="failed">失败 / 缺失</span>
+          <button id="timeline-follow" class="secondary">
+            取消选中 · 跟随游标
+          </button>
+          <output id="timeline-range"></output>
+        </div>
+        <div
+          id="timeline"
+          class="task-timeline"
+          aria-label="VLM 和 DiT 的流动任务块"
+        ></div>
+        <details id="kernel-details" class="kernel-details">
+          <summary>算子与原始事件明细</summary>
+          <p id="kernel-note" class="small-note"></p>
+          <div id="kernel-legend" class="legend"></div>
+          <div
+            id="kernel-timeline"
+            class="timeline"
+            aria-label="实际内核与请求明细"
+          ></div>
+        </details>
       </section>
       <section class="plots">
         <article>
@@ -180,6 +204,15 @@
           >
         </article>
       </section>
+      <details id="stream-details" class="kernel-details">
+        <summary>实时事件与连接明细</summary>
+        <p class="small-note">
+          按事件发生时钟记录；主机提交不代表 GPU 完成。明细保留每个运行最近 512
+          条事件，完整数据以运行快照和记录文件为准。
+        </p>
+        <pre id="stream-metadata"></pre>
+        <div id="stream-event-list" class="event-list"></div>
+      </details>
       <footer>
         <span id="catalog-meta"></span
         ><a href="/api/replay/catalog" target="_blank" rel="noopener"

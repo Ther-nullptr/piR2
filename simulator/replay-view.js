@@ -44,6 +44,14 @@
     selected: null,
     mediaEpoch: 0,
     loading: false,
+    streams: new Map(),
+    streamEpoch: 0,
+    followLatest: false,
+    streamRefresh: null,
+    latestStreamRun: null,
+    catalogTimer: null,
+    catalogEpoch: 0,
+    suspended: false,
   };
   const loader = R.latestLoader();
   const esc = (v) =>
@@ -82,10 +90,25 @@
         : "执行段无额外等待 · 推理期间暂停仿真";
     return cadenceLabels[mode] ?? mode;
   }
+  function configureCouplings(preferred = state.executionCoupling) {
+    const couplings = [
+      ...new Set(
+        [...state.descriptors, ...state.runs]
+          .filter((run) => run.kind === "deployment")
+          .map(R.deploymentCoupling),
+      ),
+    ];
+    options(
+      $("execution-coupling"),
+      couplings.map((mode) => [mode, couplingLabels[mode] ?? mode]),
+      preferred,
+    );
+    state.executionCoupling = $("execution-coupling").value || "asynchronous";
+  }
   function configureCadences(preferred = state.executionClock) {
     const cadences = [
       ...new Set(
-        state.descriptors
+        [...state.descriptors, ...state.runs]
           .filter(
             (run) =>
               run.kind === "deployment" &&
@@ -121,6 +144,254 @@
       (r) => state.precision === "all" || r.precision === state.precision,
     );
   }
+  const streamLabels = {
+    loading: "正在读取快照",
+    live: "实时连接",
+    reconnecting: "断线重连中",
+    resnapshotting: "补取快照",
+    historical: "历史记录",
+    ended: "运行已结束",
+    failed: "记录报告失败",
+    error: "连接错误",
+    closed: "连接已关闭",
+  };
+  function declaredStream(id) {
+    return (state.catalog?.streams ?? []).some((entry) => entry.run_id === id);
+  }
+  function normalizeRun(run, descriptor) {
+    return {
+      ...run,
+      descriptor,
+      episodes: Array.isArray(run.episodes)
+        ? run.episodes.map(R.normalizeEpisode)
+        : [],
+    };
+  }
+  function closeStreams() {
+    state.streamEpoch++;
+    const previous = [...state.streams.values()];
+    state.streams.clear();
+    for (const entry of previous) entry.connection.close();
+    if (state.streamRefresh != null) cancelAnimationFrame(state.streamRefresh);
+    state.streamRefresh = null;
+    state.latestStreamRun = null;
+    renderStreamStatus();
+  }
+  function renderStreamStatus() {
+    const entries = [...state.streams.values()].filter(
+      ({ descriptor }) =>
+        state.precision === "all" || descriptor.precision === state.precision,
+    );
+    const status = $("stream-status");
+    $("follow-latest").disabled = !entries.length;
+    if (!entries.length) {
+      status.dataset.state = "historical";
+      status.textContent = "历史记录 · 无实时订阅";
+    } else {
+      const priority = [
+        "error",
+        "failed",
+        "resnapshotting",
+        "reconnecting",
+        "loading",
+        "live",
+        "ended",
+        "historical",
+        "closed",
+      ];
+      status.dataset.state =
+        priority.find((value) =>
+          entries.some((entry) => entry.status.status === value),
+        ) ?? "loading";
+      status.textContent = entries
+        .map(({ descriptor, connection, status: value }) => {
+          const store = connection.store;
+          const failure =
+            value.scope === "event_recording"
+              ? "记录失败"
+              : (streamLabels[value.status] ?? value.status);
+          return `${label(descriptor.precision)} ${failure} · #${store?.last_sequence ?? 0}${store?.state?.dropped_events ? ` · 丢弃 ${store.state.dropped_events}` : ""}${value.error ? ` · ${value.error}` : ""}`;
+        })
+        .join(" / ");
+    }
+    if (!$("stream-details").open) return;
+    $("stream-metadata").textContent = JSON.stringify(
+      entries.map(({ descriptor, connection, status: value }) => ({
+        run_id: descriptor.id,
+        connection: value,
+        last_sequence: connection.store?.last_sequence,
+        state: connection.store?.state,
+        clocks: connection.store?.clocks,
+        snapshot_url: `/api/replay/snapshot/${encodeURIComponent(descriptor.id)}`,
+      })),
+      null,
+      2,
+    );
+    const events = entries.flatMap(({ descriptor, connection }) =>
+      (connection.store?.events ?? []).map((event) => ({ descriptor, event })),
+    );
+    $("stream-event-list").innerHTML =
+      events
+        .map(
+          ({ descriptor, event }, index) =>
+            `<button class="event-row" data-stream-index="${index}" style="--precision:${color(descriptor.precision)}"><span class="precision">${esc(label(descriptor.precision))}</span><span>#${event.sequence}</span><span>${esc(event.type)}${event.payload?.timing_boundary === "host_submission" ? " · 主机提交" : ""}</span><span>${esc(event.occurrence.value ?? "未知")} ${esc(event.occurrence.unit)} · ${esc(event.occurrence.clock_id)}</span></button>`,
+        )
+        .join("") ||
+      '<p class="small-note">此连接尚未收到增量事件；快照中的记录可在回放区检查。</p>';
+    for (const button of $("stream-event-list").querySelectorAll("button"))
+      button.addEventListener("click", () => {
+        $("inspector").textContent = JSON.stringify(
+          events[Number(button.dataset.streamIndex)].event,
+          null,
+          2,
+        );
+      });
+  }
+  function refreshStreamProjection(runId) {
+    state.latestStreamRun = runId;
+    if (state.loading || state.streamRefresh != null) return;
+    const epoch = state.streamEpoch;
+    state.streamRefresh = requestAnimationFrame(() => {
+      state.streamRefresh = null;
+      if (epoch !== state.streamEpoch || state.loading) return;
+      let changed = false;
+      state.runs = state.runs.map((run) => {
+        const entry = state.streams.get(run.id),
+          next = entry?.connection.store?.run;
+        if (!next || next === entry.appliedRun) return run;
+        changed = true;
+        entry.appliedRun = next;
+        return normalizeRun(next, entry.descriptor);
+      });
+      if (changed) {
+        taskBoardKey = "";
+        timelineKey = "";
+        configureSamples({ preserve: true });
+      }
+      renderStreamStatus();
+    });
+  }
+  function streamConnection(descriptor, epoch) {
+    const entry = {
+      descriptor,
+      status: { status: "loading" },
+      appliedRun: null,
+    };
+    const active = () =>
+      epoch === state.streamEpoch && state.streams.get(descriptor.id) === entry;
+    entry.connection = new window.ReplayStream.StreamConnection({
+      onSnapshot: () => {
+        if (active()) refreshStreamProjection(descriptor.id);
+      },
+      onEvent: (event) => {
+        if (!active()) return;
+        if (event.projection) refreshStreamProjection(descriptor.id);
+        renderStreamStatus();
+      },
+      onStatus: (value) => {
+        if (!active()) return;
+        entry.status = value;
+        renderStreamStatus();
+      },
+    });
+    state.streams.set(descriptor.id, entry);
+    return entry;
+  }
+  function updateRunOptions() {
+    for (const element of document.querySelectorAll(".run-select")) {
+      const run = state.rows[Number(element.dataset.index)]?.run;
+      if (!run) continue;
+      const descriptors = R.replayDescriptors(
+        state.descriptors,
+        state.kind,
+        state.executionClock,
+        state.executionCoupling,
+      ).filter((descriptor) => descriptor.precision === run.precision);
+      if (!descriptors.some((descriptor) => descriptor.id === run.id))
+        descriptors.unshift(run.descriptor ?? run);
+      options(
+        element,
+        descriptors.map((descriptor) => [
+          descriptor.id,
+          descriptor.mode ?? descriptor.label ?? descriptor.id,
+        ]),
+        run.id,
+      );
+    }
+  }
+  function showCatalogMetadata() {
+    $("catalog-meta").textContent =
+      `${state.catalog.created_at ?? "创建时间未知"} · ${state.catalog.clock_cohort ?? "clock cohort 未声明"}`;
+  }
+  function connectSelectedStreams() {
+    for (const run of state.runs) {
+      if (!declaredStream(run.id) || state.streams.has(run.id)) continue;
+      const entry = streamConnection(run.descriptor ?? run, state.streamEpoch);
+      void entry.connection.start(run.id);
+    }
+  }
+  async function refreshCatalog() {
+    const epoch = state.catalogEpoch;
+    try {
+      const catalog = await json("/api/replay/catalog");
+      if (state.suspended || epoch !== state.catalogEpoch) return;
+      if (
+        !state.loading &&
+        catalog.schema === "pir2.replay.catalog" &&
+        catalog.version === 1 &&
+        JSON.stringify(catalog) !== JSON.stringify(state.catalog)
+      ) {
+        state.catalog = catalog;
+        state.descriptors = catalog.runs ?? [];
+        showCatalogMetadata();
+        configureCouplings();
+        configureCadences();
+        if (
+          !state.runs.length &&
+          R.replayDescriptors(
+            state.descriptors,
+            state.kind,
+            state.executionClock,
+            state.executionCoupling,
+          ).length
+        ) {
+          await loadRuns();
+          return;
+        }
+        updateRunOptions();
+        const precisions = [
+          ...new Set(
+            R.replayDescriptors(
+              [...state.descriptors, ...state.runs],
+              state.kind,
+              state.executionClock,
+              state.executionCoupling,
+            ).map((run) => run.precision),
+          ),
+        ];
+        options(
+          $("precision"),
+          [
+            ["all", "同步比较"],
+            ...precisions.map((precision) => [precision, label(precision)]),
+          ],
+          state.precision,
+        );
+        for (const [id, entry] of state.streams) {
+          if (declaredStream(id)) continue;
+          state.streams.delete(id);
+          entry.connection.close();
+        }
+        connectSelectedStreams();
+        renderStreamStatus();
+      }
+    } catch {
+      // Keep the loaded evidence and active stream during a catalog replacement.
+    } finally {
+      if (!state.suspended && epoch === state.catalogEpoch)
+        state.catalogTimer = setTimeout(refreshCatalog, 3000);
+    }
+  }
   const secondaryControls = [
     "record-type",
     "execution-clock",
@@ -151,6 +422,8 @@
   }
   async function loadRuns() {
     stop();
+    closeStreams();
+    const epoch = state.streamEpoch;
     state.mediaEpoch++;
     state.rows = [];
     state.runs = [];
@@ -159,7 +432,6 @@
     state.selected = null;
     $("precision-cards").innerHTML = '<p class="loading">正在切换实验记录…</p>';
     $("timeline").replaceChildren();
-    $("lineage").replaceChildren();
     $("curve").replaceChildren();
     $("projection").replaceChildren();
     $("event-list").replaceChildren();
@@ -187,6 +459,13 @@
       Promise.all(
         selected.map(async (d) => {
           try {
+            if (declaredStream(d.id)) {
+              const entry = streamConnection(d, epoch);
+              const store = await entry.connection.start(d.id);
+              if (store?.run) return { ...store.run, descriptor: d };
+              if (entry.status.status !== "historical")
+                throw new Error(entry.status.error ?? "实时快照不可用");
+            }
             return {
               ...(await json("/api/replay/run/" + encodeURIComponent(d.id))),
               descriptor: d,
@@ -209,12 +488,15 @@
       notice(result.error.message, true);
       return;
     }
-    state.runs = result.value.map((run) => ({
-      ...run,
-      episodes: Array.isArray(run.episodes)
-        ? run.episodes.map(R.normalizeEpisode)
-        : [],
-    }));
+    state.runs = result.value.map((run) => {
+      const entry = state.streams.get(run.id),
+        latest = entry?.connection.store?.run;
+      if (entry) entry.appliedRun = latest;
+      return normalizeRun(
+        latest ?? run,
+        run.descriptor ?? selected.find((d) => d.id === run.id),
+      );
+    });
     loadingControls(false);
     state.runs.forEach((r) =>
       state.selection.set(kind + ":" + r.precision, r.id),
@@ -226,9 +508,10 @@
     );
     state.precision = $("precision").value;
     configureSamples();
+    renderStreamStatus();
     notice(`${state.runs.length} 个精度 · 本地记录已连接`);
   }
-  function configureSamples() {
+  function configureSamples({ preserve = false } = {}) {
     if (state.loading) return;
     const previous = state.sample;
     const runs = visibleRuns();
@@ -277,6 +560,15 @@
         ]),
         previous?.id,
       );
+      if (preserve && state.followLatest) {
+        const latest = R.scopedRecords(
+          runs.find((run) => run.id === state.latestStreamRun),
+          state.type,
+          state.scope,
+        ).at(-1);
+        if (latest && samples.some((sample) => sample.id === latest.id))
+          $("sample").value = latest.id;
+      }
       state.sample = samples.find((r) => r.id === $("sample").value) ?? null;
     } else {
       const unique = new Map();
@@ -298,6 +590,17 @@
           ? [previous.task_id, previous.episode_id, previous.seed].join("/")
           : null,
       );
+      if (preserve && state.followLatest) {
+        const latest = runs
+          .find((run) => run.id === state.latestStreamRun)
+          ?.episodes?.at(-1);
+        if (latest)
+          $("sample").value = [
+            latest.task_id,
+            latest.episode_id,
+            latest.seed,
+          ].join("/");
+      }
       state.sample = unique.get($("sample").value) ?? null;
     }
     $("record-label").hidden = state.kind !== "model";
@@ -334,13 +637,15 @@
       state.kind === "model" ? modelChannels : robotChannels,
       $("channel").value,
     );
-    selectSample();
+    selectSample({ preserve });
   }
-  function selectSample() {
+  function selectSample({ preserve = false } = {}) {
     if (state.loading) return;
-    stop();
-    state.selected = null;
-    state.mediaEpoch++;
+    if (!preserve) {
+      stop();
+      state.selected = null;
+      state.mediaEpoch++;
+    }
     const runs = visibleRuns();
     if (state.kind === "model") {
       state.sample =
@@ -353,8 +658,8 @@
       state.rows = R.alignModel(runs, state.type, state.sample, owner?.id);
       state.end = Math.max(
         1,
-        ...state.rows.map(
-          ({ record }) => record?.host_wall_ms ?? record?.wall_ms ?? 0,
+        ...state.rows.map(({ record }) =>
+          window.ReplayTimeline.observedModelEnd(record),
         ),
       );
       $("evidence-note").textContent =
@@ -393,9 +698,13 @@
         : state.rows.some((row) => R.playableEpisode(row.episode));
     for (const id of ["play", "seek", "previous", "next"])
       $(id).disabled = !canPlay;
-    state.clock = Math.min(state.clock, state.end);
+    state.clock =
+      preserve && state.followLatest
+        ? state.end
+        : Math.min(state.clock, state.end);
     $("seek").max = state.end;
     state.events = buildEvents();
+    state.taskTracks = window.ReplayTimeline.tracks(state.rows, state.kind);
     options(
       $("category"),
       [
@@ -406,9 +715,11 @@
       ],
       $("category").value,
     );
-    renderCards();
-    $("inspector").textContent =
-      "点击内核、请求或控制动作，查看来源与实际时间戳。";
+    if (!preserve) {
+      renderCards();
+      $("inspector").textContent =
+        "点击内核、请求或控制动作，查看来源与实际时间戳。";
+    }
     render();
   }
   function buildEvents() {
@@ -462,7 +773,9 @@
             run,
             episode,
             request,
-            kind: "rpc",
+            kind: request.timing_scope?.startsWith("server_")
+              ? "server_stage"
+              : "rpc",
             time: request.start_s,
             end: request.end_s ?? request.completed_s ?? request.start_s,
             stage: request.role === "S2" ? "vlm" : "action",
@@ -505,7 +818,7 @@
               )
               .map(
                 (d) =>
-                  `<option value="${esc(d.id)}" ${d.id === run.id ? "selected" : ""}>${esc(d.mode ?? d.label ?? d.id)}</option>`,
+                  `<option value="${esc(d.id)}" ${d.id === run.id ? "selected" : ""}>${esc(d.label ?? d.mode ?? d.id)}</option>`,
               )
               .join(
                 "",
@@ -750,12 +1063,22 @@
         ($("category").value === "all" || e.category === $("category").value),
     );
   }
+  function taskViewport() {
+    const mode = $("window").value;
+    const span =
+      mode === "all"
+        ? state.end
+        : mode === "auto"
+          ? Math.min(
+              state.end,
+              state.kind === "model" ? Math.max(5, state.end * 0.45) : 0.3,
+            )
+          : state.end * Number(mode);
+    return window.ReplayTimeline.viewport(state.clock, state.end, span);
+  }
   function windowBounds() {
-    const fraction =
-        $("window").value === "all" ? 1 : Number($("window").value),
-      span = state.end * fraction,
-      left = Math.max(0, Math.min(state.clock - span / 2, state.end - span));
-    return [left, left + span];
+    const view = taskViewport();
+    return [view.start, view.end];
   }
   function inspect(event) {
     if (!event) return;
@@ -838,6 +1161,8 @@
         boundaries: run.boundaries,
         validation: run.validation,
         retained_outputs: run.retained_outputs,
+        source_evidence: run.source_evidence,
+        runtime_receipt: run.runtime_receipt,
         warnings: run.warnings,
         provenance: run.provenance,
         episode: episode
@@ -855,78 +1180,157 @@
             }
           : null,
       }));
+    if (event.id && !Array.isArray(data)) {
+      const T = window.ReplayTimeline;
+      const block = state.taskTracks
+        ?.flatMap((track) => track.blocks)
+        .find((candidate) => candidate.id === event.id);
+      if (block) {
+        data.timing_basis = T.basisLabel(block.basis);
+        data.clock_id = block.clockId ?? null;
+        data.source_tasks = T.sourceBlocks(state.taskTracks, block.id).map(
+          (source) => ({
+            id: source.id,
+            label: source.label,
+            timing_basis: T.basisLabel(source.basis),
+            request: source.event.request ?? null,
+          }),
+        );
+      }
+    }
     $("inspector").textContent = JSON.stringify(data, null, 2);
     renderEventList();
-    renderLineage();
+    renderTimeline();
   }
-  function renderLineage() {
+  let taskBoardKey = "";
+  let taskLanes = [];
+  function renderTimeline() {
     if (state.loading) return;
-    const selected = state.events.find((e) => e.id === state.selected);
-    const graphs = state.rows.map((row) => ({
-      ...row,
-      graph:
-        state.kind === "model"
-          ? window.ReplayLineage.model(row.run, row.record, state.clock)
-          : window.ReplayLineage.deployment(
-              row.episode,
-              Math.min(state.clock, R.episodeEnd(row.episode) ?? state.clock),
-              selected?.precision === row.run.precision ? selected : null,
-            ),
-    }));
-    $("lineage-title").textContent =
-      state.kind === "deployment"
-        ? "观测 → VLM → 缓存 → DiT → 动作 → 机器人"
-        : state.scope === "preparation_transfer"
-          ? "输入准备与传输 · 本次记录未执行 VLM / DiT"
-          : ["policy", "prepared_model", "preparation_model"].includes(
-                state.scope,
-              )
-            ? "本请求 · VLM → 视觉特征 → DiT → 动作"
-            : "未知测量边界 · 不推断组件执行";
-    $("lineage-note").textContent =
-      state.kind === "model"
-        ? `${R.scopeInfo(state.scope).note} 虚线只说明记录中已知的执行路径，不编造未记录组件耗时。`
-        : selected
-          ? "当前高亮所选事件的真实来源；点击“跟随时间游标”恢复当前执行动作。S1[n].k 中 n 是实际消费的 S2 特征。"
-          : "跟随当前实际执行动作：连线只采用 source tick、feature sequence、缓存发布、实际读取与 executed_slot；不会把最新缓存误当成已消费缓存。";
-    $("lineage").innerHTML = graphs
-      .map(({ run, graph }, row) => {
-        const marker = "lineage-arrow-" + row;
-        const arrows = graph.edges
-          .map((edge) => {
-            const i = graph.nodes.findIndex((n) => n.key === edge.from),
-              j = graph.nodes.findIndex((n) => n.key === edge.to);
-            return `<path class="lineage-arrow" data-from="${edge.from}" data-to="${edge.to}" d="M${i * 200 + 178},47 H${j * 200 + 16}" marker-end="url(#${marker})" stroke="${color(run.precision)}" stroke-width="2" ${edge.declared ? 'stroke-dasharray="4 3"' : ""}><title>${esc(edge.basis)}</title></path>`;
-          })
-          .join("");
-        return `<div class="lineage-row ${selected?.precision === run.precision ? "selected" : ""}" data-precision="${esc(run.precision)}" style="--precision:${color(run.precision)}"><strong class="lineage-precision">${esc(label(run.precision))}</strong><div class="lineage-track"><svg viewBox="0 0 1200 104" preserveAspectRatio="none" aria-hidden="true"><defs><marker id="${marker}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="${color(run.precision)}"/></marker></defs>${arrows}</svg>${graph.nodes.map((node, index) => `<button class="lineage-node ${node.known ? "known" : "unknown"}" data-lineage-row="${row}" data-node="${index}" data-kind="${node.key}"><strong>${esc(node.title)}</strong>${node.lines.map((text) => `<span>${esc(text)}</span>`).join("")}</button>`).join("")}</div></div>`;
-      })
-      .join("");
-    for (const button of $("lineage").querySelectorAll(".lineage-node"))
-      button.addEventListener("click", () => {
-        const row = graphs[Number(button.dataset.lineageRow)],
-          node = row.graph.nodes[Number(button.dataset.node)];
-        const event = node.tick
-          ? state.events.find((e) => e.tick?.id === node.tick.id)
-          : node.request
-            ? state.events.find(
-                (e) =>
-                  e.request?.id === node.request.id ||
-                  (e.record?.id === node.request.id &&
-                    (!node.stage || e.stage === node.stage)),
-              )
-            : null;
-        if (event) inspect(event);
-        else
-          $("inspector").textContent = JSON.stringify(
-            { precision: row.run.precision, ...node },
-            null,
-            2,
-          );
+    const T = window.ReplayTimeline;
+    const view = taskViewport();
+    const tracks = (state.taskTracks ?? []).filter(
+      (track) => $("stage").value === "all" || track.stage === $("stage").value,
+    );
+    const sourceIds = new Set(
+      T.sourceBlocks(state.taskTracks ?? [], state.selected).map(
+        (block) => block.id,
+      ),
+    );
+    const key = JSON.stringify([
+      state.mediaEpoch,
+      tracks.map((t) => t.id),
+      $("stage").value,
+    ]);
+    if (key !== taskBoardKey) {
+      taskBoardKey = key;
+      $("timeline").innerHTML =
+        `<div class="task-axis"><span>精度 / 模块</span><div class="task-scale"></div></div>`;
+      taskLanes = tracks.map((track) => {
+        const lane = document.createElement("section");
+        lane.className = "task-lane";
+        lane.dataset.precision = track.precision;
+        lane.dataset.stage = track.stage;
+        lane.dataset.clock = track.clockId ?? "unknown";
+        lane.style.setProperty("--precision", color(track.precision));
+        lane.innerHTML = `<header class="task-lane-label"><strong>${esc(label(track.precision))} <span>${esc(track.title)}</span></strong><span class="task-phase"></span></header><div class="task-rail"><div class="task-blocks"></div><div class="task-playhead" aria-hidden="true"></div><p class="task-unavailable"></p></div>`;
+        $("timeline").appendChild(lane);
+        return {
+          lane,
+          track,
+          buttons: new Map(),
+          rail: lane.querySelector(".task-rail"),
+          blocks: lane.querySelector(".task-blocks"),
+          phase: lane.querySelector(".task-phase"),
+          cursor: lane.querySelector(".task-playhead"),
+          unavailable: lane.querySelector(".task-unavailable"),
+        };
       });
+    }
+    const unit = state.kind === "model" ? "ms" : "s";
+    const scale = $("timeline").querySelector(".task-scale");
+    if (scale)
+      scale.innerHTML = Array.from(
+        { length: 6 },
+        (_, i) =>
+          `<span style="left:${i * 20}%">${fmt(view.start + (view.span * i) / 5, unit === "ms" ? 1 : 2)} ${unit}</span>`,
+      ).join("");
+    $("timeline-range").textContent =
+      `${fmt(view.start, 2)} – ${fmt(view.end, 2)} ${unit}`;
+    for (const item of taskLanes) {
+      const { track } = item;
+      const current = T.laneState(track, state.clock);
+      item.phase.textContent =
+        current.label + (current.block ? " · " + current.block.label : "");
+      item.phase.dataset.phase = current.key;
+      item.unavailable.textContent =
+        track.unavailable ?? (track.blocks.length ? "" : "该窗口暂无记录");
+      item.unavailable.hidden = !item.unavailable.textContent;
+      item.cursor.style.left =
+        ((state.clock - view.start) / view.span) * 100 + "%";
+      const width = item.rail.clientWidth;
+      const visible = new Set();
+      for (const block of track.blocks) {
+        const geometry = T.geometry(block, view);
+        if (!geometry.visible) continue;
+        visible.add(block.id);
+        let button = item.buttons.get(block.id);
+        if (!button) {
+          button = document.createElement("button");
+          button.type = "button";
+          button.className = "task-block";
+          button.dataset.block = block.id;
+          button.dataset.basis = block.basis;
+          if (block.phaseKind) button.dataset.phaseKind = block.phaseKind;
+          if (block.sourceId) button.dataset.source = block.sourceId;
+          button.innerHTML = `<strong>${esc(block.label)}</strong><span>${esc(block.sourceLabel ? "← " + block.sourceLabel : (block.description ?? (block.stage === "vlm" ? "视觉特征" : "来源未记录")))}</span><small></small>`;
+          button.addEventListener("click", () =>
+            inspect({
+              ...block.event,
+              id: block.id,
+              precision: track.precision,
+            }),
+          );
+          item.blocks.appendChild(button);
+          item.buttons.set(block.id, button);
+        }
+        const status = T.phase(block, state.clock);
+        button.dataset.phase = status.key;
+        button.querySelector("small").textContent = R.finite(block.end)
+          ? `${fmt(block.end - block.start, unit === "s" ? 3 : 1)} ${unit}`
+          : "结束待记录";
+        button.classList.toggle("open-ended", geometry.open);
+        button.classList.toggle("selected", state.selected === block.id);
+        button.classList.toggle("source-selected", sourceIds.has(block.id));
+        button.style.transform = `translate3d(${(geometry.left / 100) * width}px,0,0)`;
+        button.style.width = Math.max(8, (geometry.width / 100) * width) + "px";
+        button.dataset.wide = String((geometry.width / 100) * width >= 155);
+        button.style.setProperty(
+          "--elapsed",
+          (status.progress ?? 0) * 100 + "%",
+        );
+        const basis = T.basisLabel(block.basis);
+        button.title = `${label(track.precision)} · ${block.label}\n${status.label} · ${fmt(block.start, 3)} → ${R.finite(block.end) ? fmt(block.end, 3) : "结束未知"} ${unit}\n${basis}${block.sourceLabel ? "\n实际使用 " + block.sourceLabel : ""}`;
+        button.setAttribute("aria-label", button.title.replaceAll("\n", "；"));
+      }
+      for (const [id, button] of item.buttons)
+        if (!visible.has(id)) {
+          button.remove();
+          item.buttons.delete(id);
+        }
+    }
+    $("timeline-note").textContent =
+      state.kind === "deployment"
+        ? (state.executionCoupling === "synchronous"
+            ? "控制墙钟：VLM / DiT 为同一次同步 RPC 内的服务端分段，非独立 RPC 或 GPU kernel 时间。Inference / Execution 显示真实互斥阶段；执行段包含节拍等待。"
+            : "控制墙钟：VLM / DiT 任务块为完整请求区间。") +
+          " S1[xx].k 实际使用 S2-xx 的特征；点击高亮已记录来源，随游标向左流动。"
+        : tracks.some((track) => track.blocks.length)
+          ? "按该次真实模块时间移动；CUDA 跨度含内核间隙。点击任务块或展开算子明细。"
+          : "这次记录只有完整调用耗时，没有 VLM / DiT 分段时间；切换 Profile 查看实际轨道。";
   }
   let timelineKey = "";
-  function renderTimeline() {
+  function renderKernelTimeline() {
+    if (!$("kernel-details").open) return;
     const events = filteredEvents(),
       [a, b] = windowBounds(),
       W = 1200,
@@ -976,8 +1380,11 @@
       a,
       b,
     ]);
-    if (key === timelineKey && $("timeline").querySelector(".time-cursor")) {
-      const cursor = $("timeline").querySelector(".time-cursor");
+    if (
+      key === timelineKey &&
+      $("kernel-timeline").querySelector(".time-cursor")
+    ) {
+      const cursor = $("kernel-timeline").querySelector(".time-cursor");
       cursor.setAttribute("x1", x(state.clock));
       cursor.setAttribute("x2", x(state.clock));
       return;
@@ -1007,9 +1414,9 @@
       svg += `<rect class="hit" data-hit="${index}" data-event-kind="${event.kind}" x="${xx}" y="${lane * rowH + 12}" width="${width}" height="17" rx="1" fill="${fill}" opacity=".86"><title>${esc(label(event.precision) + " " + event.name + " · " + fmt(event.time, 4) + " → " + fmt(event.end, 4) + (state.kind === "model" ? " ms" : " s"))}</title></rect>`;
     }
     svg += `<line class="time-cursor" x1="${x(state.clock)}" y1="6" x2="${x(state.clock)}" y2="${H - 25}" stroke="#b64d44" stroke-width="1.6"/>`;
-    $("timeline").innerHTML =
+    $("kernel-timeline").innerHTML =
       `<svg viewBox="0 0 ${W} ${Math.max(85, H)}" role="img" aria-label="实际请求与组件时间线">${svg}</svg>`;
-    $("timeline-note").textContent =
+    $("kernel-note").textContent =
       state.kind === "deployment"
         ? state.executionCoupling === "synchronous"
           ? "Synchronous：VLM / DiT 为实际服务端分段；Phase 为完整推理 RPC 与动作执行段。Control 是实际命令时刻，均非 GPU kernel timeline。"
@@ -1018,13 +1425,13 @@
           ? "实际 CUDA 设备事件；同一行内的多 stream 可能重叠，点击查看。"
           : `${R.scopeInfo(state.scope).label} · 仅有请求 wall；本 Clean 调用未采集 GPU timeline。`;
     const used = [...new Set(events.map((e) => e.category).filter(Boolean))];
-    $("legend").innerHTML = used
+    $("kernel-legend").innerHTML = used
       .map(
         (k) =>
           `<span style="--key:${categories[k] ?? "#9b8eab"}">${esc(k)}</span>`,
       )
       .join("");
-    $("timeline")
+    $("kernel-timeline")
       .querySelector("svg")
       .addEventListener("click", (event) => {
         const target = event.target.closest("[data-hit]");
@@ -1201,12 +1608,14 @@
     $("clock").textContent =
       `${fmt(state.clock, state.kind === "model" ? 2 : 3)} / ${fmt(state.end, state.kind === "model" ? 1 : 2)} ${state.kind === "model" ? "ms" : "s"}`;
     renderCardState();
-    renderLineage();
     renderTimeline();
+    renderKernelTimeline();
     renderPlots();
     renderEventList();
   }
   function setClock(t) {
+    state.followLatest = false;
+    $("follow-latest").checked = false;
     state.clock = Math.max(0, Math.min(state.end, t));
     render();
   }
@@ -1227,7 +1636,7 @@
   }
   let lastDraw = 0;
   function animate(now) {
-    if (state.playing && now - lastDraw >= 50) {
+    if (state.playing && !state.suspended && now - lastDraw >= 50) {
       lastDraw = now;
       if (state.lastWall != null) {
         state.clock +=
@@ -1244,11 +1653,36 @@
     requestAnimationFrame(animate);
   }
   function bind() {
-    $("lineage-follow").addEventListener("click", () => {
+    $("stream-details").addEventListener("toggle", renderStreamStatus);
+    $("follow-latest").addEventListener("change", () => {
+      state.followLatest = $("follow-latest").checked;
+      if (state.followLatest) {
+        state.latestStreamRun ??= visibleRuns().find((run) =>
+          state.streams.has(run.id),
+        )?.id;
+        configureSamples({ preserve: true });
+      }
+    });
+    window.addEventListener("pagehide", () => {
+      state.suspended = true;
+      state.catalogEpoch++;
+      clearTimeout(state.catalogTimer);
+      closeStreams();
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted || !state.suspended) return;
+      state.suspended = false;
+      state.lastWall = null;
+      if (state.loading) void loadRuns();
+      else connectSelectedStreams();
+      state.catalogTimer = setTimeout(refreshCatalog, 3000);
+    });
+    $("timeline-follow").addEventListener("click", () => {
       state.selected = null;
-      renderLineage();
+      renderTimeline();
       renderEventList();
     });
+    $("kernel-details").addEventListener("toggle", renderKernelTimeline);
     for (const kind of ["model", "deployment"])
       $("mode-" + kind).addEventListener("click", () => {
         $("evidence-mode").value = kind;
@@ -1282,10 +1716,28 @@
       state.type = $("record-type").value;
       configureSamples();
     });
-    $("sample").addEventListener("change", selectSample);
+    $("sample").addEventListener("change", () => {
+      state.followLatest = false;
+      $("follow-latest").checked = false;
+      selectSample();
+    });
     $("precision").addEventListener("change", () => {
       state.precision = $("precision").value;
-      configureSamples();
+      const descriptors = R.replayDescriptors(
+        state.descriptors,
+        state.kind,
+        state.executionClock,
+        state.executionCoupling,
+      );
+      const missing = descriptors.some(
+        (descriptor) =>
+          (state.precision === "all" ||
+            descriptor.precision === state.precision) &&
+          !state.runs.some((run) => run.precision === descriptor.precision),
+      );
+      if (missing) loadRuns();
+      else configureSamples();
+      renderStreamStatus();
     });
     $("camera").addEventListener("change", () => {
       state.mediaEpoch++;
@@ -1302,6 +1754,8 @@
     $("next").addEventListener("click", () => step(1));
     $("play").addEventListener("click", () => {
       if (state.loading || $("play").disabled) return;
+      state.followLatest = false;
+      $("follow-latest").checked = false;
       if (state.playing) stop();
       else {
         if (state.clock >= state.end) state.clock = 0;
@@ -1323,12 +1777,22 @@
         cursor: state.clock,
         cursor_unit: state.kind === "model" ? "ms" : "control_wall_s",
         camera: $("camera").value,
+        streams: [...state.streams.values()].map(({ connection, status }) => ({
+          run_id: connection.store?.run_id,
+          last_sequence: connection.store?.last_sequence,
+          state: connection.store?.state,
+          clocks: connection.store?.clocks,
+          connection: status,
+          recent_events: connection.store?.events,
+        })),
         runs: state.rows.map(({ run, record, episode }) => ({
           id: run.id,
           precision: run.precision,
           error: run.error,
           source_url: "/api/replay/run/" + run.id,
           provenance: run.provenance,
+          source_evidence: run.source_evidence,
+          runtime_receipt: run.runtime_receipt,
           record_id: record?.id,
           observation_id: record?.observation_id,
           seed: record?.seed,
@@ -1368,22 +1832,18 @@
       state.catalog = catalog;
       state.descriptors = catalog.runs ?? [];
       const query = new URLSearchParams(location.search),
-        requestedView = query.get("view");
-      const couplings = [
-        ...new Set(
-          state.descriptors
-            .filter((run) => run.kind === "deployment")
-            .map(R.deploymentCoupling),
-        ),
-      ];
-      options(
-        $("execution-coupling"),
-        couplings.map((mode) => [mode, couplingLabels[mode] ?? mode]),
+        requestedView = query.get("view") ?? catalog.default_view;
+      const requestedType =
+        query.get("record_type") ?? catalog.default_record_type;
+      if (["clean", "profile"].includes(requestedType)) {
+        state.type = requestedType;
+        $("record-type").value = requestedType;
+      }
+      configureCouplings(
         query.get("execution_coupling") ??
           catalog.default_execution_coupling ??
           "asynchronous",
       );
-      state.executionCoupling = $("execution-coupling").value || "asynchronous";
       configureCadences(
         query.get("execution_clock") ??
           catalog.default_execution_clock ??
@@ -1401,9 +1861,10 @@
             : "model";
       $("evidence-mode").value = state.kind;
       $("speed").value = state.kind === "model" ? "0.01" : "1";
-      $("catalog-meta").textContent =
-        `${catalog.created_at ?? "创建时间未知"} · ${catalog.clock_cohort ?? "clock cohort 未声明"}`;
+      showCatalogMetadata();
       await loadRuns();
+      if (!state.suspended)
+        state.catalogTimer = setTimeout(refreshCatalog, 3000);
     } catch (error) {
       notice("未连接回放数据", true);
       $("error-banner").hidden = false;

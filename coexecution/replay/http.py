@@ -4,7 +4,17 @@ import json
 import os
 import re
 import stat
+import threading
 from pathlib import Path
+
+from .stream import (
+    MAX_EVENT_BYTES,
+    StreamTail,
+    apply_event,
+    event_byte_limit,
+    initial_snapshot,
+    validate_snapshot,
+)
 
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
 MIMES = {"video/webm", "image/png"}
@@ -19,16 +29,146 @@ class ReplayFiles:
             path = path / "catalog.json"
         path = path.resolve(strict=True)
         self.root = path.parent
-        self.catalog = json.loads(path.read_text())
-        if (
-            self.catalog.get("schema") != "pir2.replay.catalog"
-            or self.catalog.get("version") != 1
-        ):
-            raise ValueError("Unsupported replay catalog schema/version")
-        self.runs = self._index(self.catalog.get("runs", []))
-        manifest = self._relative(self.catalog["media_manifest"])
-        with self.open(manifest) as stream:
-            self.media = self._index(json.load(stream).get("assets", []), media=True)
+        self._catalog_path = Path(path.name)
+        self._lock = threading.RLock()
+        self._indexes = ({}, {}, {}, {})
+        self._fingerprints = None
+        self.refresh()
+
+    @property
+    def catalog(self):
+        return self._indexes[0]
+
+    @property
+    def runs(self):
+        return self._indexes[1]
+
+    @property
+    def media(self):
+        return self._indexes[2]
+
+    @property
+    def streams(self):
+        return self._indexes[3]
+
+    @staticmethod
+    def _fingerprint(source):
+        metadata = os.fstat(source.fileno())
+        return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
+
+    def refresh(self):
+        """Atomically reload changed allowlists, never paths supplied by HTTP."""
+        with self._lock:
+            with self.open(self._catalog_path) as source:
+                catalog_stamp = self._fingerprint(source)
+                catalog = (
+                    self.catalog
+                    if self._fingerprints and catalog_stamp == self._fingerprints[0]
+                    else json.load(source)
+                )
+            if (
+                not isinstance(catalog, dict)
+                or catalog.get("schema") != "pir2.replay.catalog"
+                or catalog.get("version") != 1
+            ):
+                raise ValueError("Unsupported replay catalog schema/version")
+            manifest = self._relative(catalog["media_manifest"])
+            with self.open(manifest) as source:
+                stamps = catalog_stamp, self._fingerprint(source)
+                if stamps == self._fingerprints:
+                    return False
+                media_manifest = json.load(source)
+                if not isinstance(media_manifest, dict):
+                    raise TypeError("Replay media manifest must be an object")
+                media_rows = media_manifest.get("assets", [])
+            indexes = self._build_indexes(catalog, media_rows)
+            self._indexes = indexes
+            self._fingerprints = stamps
+            return True
+
+    def _build_indexes(self, catalog, media_rows):
+        runs = self._index(catalog.get("runs", []))
+        media = self._index(media_rows, media=True)
+        streams = {}
+        for row in self._rows(catalog.get("streams", [])):
+            identifier = row.get("run_id")
+            if (
+                not isinstance(identifier, str)
+                or identifier not in runs
+                or identifier in streams
+            ):
+                raise ValueError("Stream ID must name one unique registered replay run")
+            streams[identifier] = (
+                self._relative(row["snapshot_path"]),
+                self._relative(row["journal_path"]),
+                event_byte_limit(row.get("max_event_bytes", MAX_EVENT_BYTES)),
+            )
+        return catalog, runs, media, streams
+
+    def snapshot(self, identifier):
+        self.refresh()
+        return self._snapshot(identifier, self._indexes)
+
+    def _snapshot(self, identifier, indexes):
+        _, runs, _, streams = indexes
+        if identifier not in runs:
+            raise KeyError("Unknown replay run")
+        if identifier not in streams:
+            with self.open(runs[identifier][0]) as source:
+                return validate_snapshot(
+                    initial_snapshot(json.load(source), {}, available=False), identifier
+                )
+        snapshot_path, journal_path, max_event_bytes = streams[identifier]
+        with self.open(snapshot_path) as source:
+            snapshot = validate_snapshot(json.load(source), identifier)
+        if not snapshot["stream_available"]:
+            raise ValueError("Registered live stream must declare availability")
+        # A committed JSONL suffix may be newer than its atomic checkpoint. The
+        # read-only server reconciles it in memory without modifying artifacts.
+        tail = StreamTail(
+            lambda: self.open(journal_path),
+            identifier,
+            snapshot["clocks"],
+            after=snapshot["last_sequence"],
+            max_event_bytes=max_event_bytes,
+        )
+        while True:
+            events = tail.poll()
+            if not events:
+                break
+            for event in events:
+                snapshot = apply_event(snapshot, event)
+        return snapshot
+
+    def stream_tail(self, identifier, *, after=0, clocks=None):
+        self.refresh()
+        indexes = self._indexes
+        if clocks is None:
+            clocks = self._snapshot(identifier, indexes)["clocks"]
+        return self._stream_tail(identifier, indexes, after=after, clocks=clocks)
+
+    def stream_session(self, identifier, *, after=0):
+        """Bind initial snapshot and cursor to the same allowlist generation."""
+        self.refresh()
+        indexes = self._indexes
+        snapshot = self._snapshot(identifier, indexes)
+        tail = self._stream_tail(
+            identifier, indexes, after=after, clocks=snapshot["clocks"]
+        )
+        return snapshot, tail
+
+    def _stream_tail(self, identifier, indexes, *, after, clocks):
+        streams = indexes[3]
+        if identifier not in streams:
+            raise KeyError("Replay run has no registered live stream")
+        _, journal_path, max_event_bytes = streams[identifier]
+        return StreamTail(
+            lambda: self.open(journal_path),
+            identifier,
+            clocks,
+            after=after,
+            max_event_bytes=max_event_bytes,
+        )
 
     def _relative(self, value):
         path = Path(value)
@@ -47,7 +187,7 @@ class ReplayFiles:
 
     def _index(self, rows, media=False):
         out = {}
-        for row in rows:
+        for row in self._rows(rows):
             identifier = row.get("id", "")
             if (
                 not isinstance(identifier, str)
@@ -60,6 +200,12 @@ class ReplayFiles:
                 raise ValueError("Unsupported replay media type")
             out[identifier] = (self._relative(row["path"]), mime)
         return out
+
+    @staticmethod
+    def _rows(rows):
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise TypeError("Replay manifest rows must be a list of objects")
+        return rows
 
     def open(self, path):
         # openat + O_NOFOLLOW on every component also closes a symlink-swap race.

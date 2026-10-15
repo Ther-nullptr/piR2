@@ -1,8 +1,9 @@
 # Measured model and robot replay
 
-This package builds local evidence for a debugger. It does not run a model or
-simulate a robot. Neural inference remains in the prepared CUDA engine; the
-browser/server reads prebuilt JSON and an explicit media manifest. Importing the
+The catalog builder and browser/server read recorded evidence; neither starts a
+model or simulator. The separate, explicit `record-model` command runs the
+existing prepared CUDA measurement engine and publishes a bounded event stream.
+Importing the
 catalog needs only the standard library. Building a model catalog lazily reads
 NumPy action archives; it never sends an NPZ archive to the browser.
 
@@ -67,6 +68,58 @@ that is absent from the evidence. The frontend's execution-clock selector
 switches all precisions together; `?execution_clock=paced` or `ready` overrides
 the catalog default. Legacy catalogs remain paced. Each video keeps its own
 frame-to-wall mapping; the selector never retimes an old trajectory.
+
+## Explicit recording and incremental delivery
+
+Use the PR28 recipes in [platform-handoff.md](../../docs/platform-handoff.md)
+for the current official Spatial runtime, including Flow4/H40 and optional
+intra-call K/V reuse. Keep independent processes and output directories for
+different operator profiles. For example, a manually launched BF16 recording is:
+
+```bash
+python -m coexecution.replay record-model \
+  --catalog-output /path/to/live-catalog \
+  --checkpoint /path/to/libero_spatial --dataset /path/to/groot-libero-spatial \
+  --upstream /path/to/Isaac-GR00T --output /path/to/new-measurement \
+  --precisions bf16 --modes kv_reuse --action-cuda-graph --operator-fusion \
+  --measurement-boundary model-only --observations 3 --rounds 3 \
+  --warmup 2 --profile-rounds 1 --replay-assets
+```
+
+This command delegates all model options and numerical/Graph checks to the
+existing measurement entrypoint and enables runtime identity receipts for the
+recording. Ordinary `coexecution.libero.measurement` captures those additional
+source and loaded-binary identities only with `--runtime-receipt`, outside its
+measurement timers. Recording requires exactly one runtime mode. The
+catalog and one journal per precision are registered before inference; actual
+inputs and completed outputs are appended, and final canonical evidence replaces
+the partial run. A separate caller may attest a runtime receipt only with
+matching identity and retained GPU validation evidence. A new date, filename or
+loaded profile alone is not such an attestation.
+
+The optional catalog `streams` list registers `run_id`, `snapshot_path`,
+`journal_path` and `max_event_bytes` as allowlisted relative resources. The server
+exposes `/api/replay/snapshot/<id>` and `/api/replay/events/<id>?after=N` in addition
+to the original APIs. Snapshots use `pir2.replay.snapshot` v1 and retain the v1
+normalized run, `last_sequence`, stream state and explicit clocks. SSE `replay`
+events use `pir2.replay.event` v1, a monotonically increasing sequence, occurrence
+clock/unit/domain, type, source IDs and an optional append/replace projection.
+`Last-Event-ID` takes precedence over the query cursor. Gaps or stale cursors
+require a new snapshot; `end` closes a terminal stream. Browser receipt time is
+never an inference timestamp or an AoI input.
+
+The writer has event-count and byte bounds; loss and recorder errors remain
+visible. The default event limit is 1 MiB, explicit registrations support up to
+8 MiB, and tail batches are bounded to 16 MiB. `flush()` is an untimed
+finalization barrier, including pending loss records. Partial trailing JSONL is
+not delivered. Catalog/media refresh retains the path/MIME/NOFOLLOW allowlist.
+Model and video generation still require explicit external commands.
+
+Instrumented live host-stage events describe submission, not individual GPU
+completion. Real kernel intervals become available only from the correlated
+profile export. Clean requests retain their own wall/output evidence and do not
+acquire an invented VLM/DiT split. Robot sink hooks announce owned frame groups
+and encoding completion; the standard recorder still encodes after control.
 
 ## Version 1 contract
 
