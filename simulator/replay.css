@@ -686,3 +686,12 @@ footer {
   box-shadow: 0 0 0 1px var(--precision);
   background: #fffce9;
 }
+
+.coupling-badge {
+  font-size: 10px;
+  padding: 3px 6px;
+  border: 1px solid #d6ddd6;
+  border-radius: 4px;
+  color: #40564a;
+  white-space: nowrap;
+}

@@ -332,3 +332,87 @@ def test_synchronous_identity_rejects_stale_capability_or_small_native_chunk():
     ]:
         with pytest.raises(ValueError):
             validate_synchronous_identity(identity | replacement, 8)
+
+
+def synchronous_recording(tmp_path):
+    result, events, *_ = scenario()
+    root = tmp_path / "bf16-sync" / "deployment"
+    root.mkdir(parents=True)
+    config = {
+        "protocol": "deployment",
+        "execution_coupling": "synchronous",
+        "execution_clock": "paced",
+        "checkpoint": {"inference_optimization": {"config": {"precision": "bf16"}}},
+        "task_ids": [0],
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    (root / "episodes.jsonl").write_text(
+        json.dumps({**result, "task_id": 0, "episode_id": 0}) + "\n"
+    )
+    (root / "task0-episode0-trace.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events)
+    )
+    return root, events
+
+
+def test_replay_preserves_coupling_real_phases_and_lineage(tmp_path):
+    from coexecution.replay.catalog import build_catalog
+
+    root, _ = synchronous_recording(tmp_path)
+    output = tmp_path / "catalog"
+    catalog = build_catalog(
+        model_runs=[],
+        deployments=[root],
+        output=output,
+        default_execution_coupling="synchronous",
+    )
+    assert catalog["default_execution_coupling"] == "synchronous"
+    assert catalog["runs"][0]["execution_coupling"] == "synchronous"
+    run = json.loads((output / catalog["runs"][0]["path"]).read_text())
+    assert run["execution_coupling"] == "synchronous"
+    episode = run["episodes"][0]
+    assert len(episode["phases"]) == 4
+    assert episode["phases"][0]["start_s"] == 0
+    assert episode["phases"][-1]["end_s"] == pytest.approx(0.7)
+    assert episode["phases"][0]["simulation_paused"] is True
+    assert episode["cycles"][1]["unused_plan_suffix_slots"] == 14
+    assert episode["ticks"][-1]["request_id"].endswith("/S1-8")
+    assert episode["queue"]["requests"][0]["timing_scope"] == "server_action_stage"
+
+
+@pytest.mark.parametrize(
+    "fault", ["overlap", "wrong_physics", "missing_phase", "config_disagreement"]
+)
+def test_replay_rejects_false_synchronous_phase_evidence(tmp_path, fault):
+    from coexecution.replay.catalog import build_catalog
+
+    root, events = synchronous_recording(tmp_path)
+    phases = [row for row in events if row["kind"] == "cycle_phase"]
+    if fault == "overlap":
+        phases[1]["start_s"] = phases[0]["start_s"]
+    elif fault == "wrong_physics":
+        phases[0]["physics_end_tick"] = 1
+    elif fault == "missing_phase":
+        events.remove(phases[1])
+    else:
+        events[0]["execution_coupling"] = "asynchronous"
+    (root / "task0-episode0-trace.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events)
+    )
+    with pytest.raises(ValueError, match="coupling|phase|physics"):
+        build_catalog(model_runs=[], deployments=[root], output=tmp_path / "catalog")
+
+
+def test_synchronous_report_does_not_call_server_stages_independent_rpcs(tmp_path):
+    from coexecution.queue_report import condition_report
+
+    root, _ = synchronous_recording(tmp_path)
+    report = condition_report(root)
+    metrics = report["episodes"][0]["metrics"]
+    assert metrics["action_rpc_ms"]["count"] == 0
+    assert metrics["vision_rpc_ms"]["count"] == 0
+    assert metrics["action_stage_ms"]["p50"] == pytest.approx(70)
+    assert metrics["vision_stage_ms"]["p50"] == pytest.approx(30)
+    assert report["summary"]["s1_rpc_p50_ms"] is None
+    assert report["summary"]["s1_stage_p50_ms"] == pytest.approx(70)
+    assert report["summary"]["control_rate_valid_episodes"] is None

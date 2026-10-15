@@ -437,8 +437,18 @@ def summarize_episode(events, metadata):
         "ticks": len(ticks),
         "success": metadata.get("success"),
         "termination_reason": end.get("reason"),
-        "action_rpc_ms": summary(action_durations),
-        "vision_rpc_ms": summary(vision_durations),
+        "action_rpc_ms": summary(
+            action_durations if execution_coupling == "asynchronous" else []
+        ),
+        "vision_rpc_ms": summary(
+            vision_durations if execution_coupling == "asynchronous" else []
+        ),
+        "action_stage_ms": summary(
+            action_durations if execution_coupling == "synchronous" else []
+        ),
+        "vision_stage_ms": summary(
+            vision_durations if execution_coupling == "synchronous" else []
+        ),
         "cache_age_ms": summary(r["age_ms"] for r in cache_samples),
         "clean_slots": summary(r["clean_slots"] for r in tick_rows),
         "fresh_slots": summary(r["fresh_slots"] for r in tick_rows),
@@ -608,11 +618,19 @@ def condition_report(directory):
             for r in e["requests"]
             if r["role"] == role and not r["censored"]
         ]
-        stats = summary(values)
+        synchronous = flat["execution_coupling"] == "synchronous"
+        stats = summary([] if synchronous else values)
         for p in ["count", "mean", "p50", "p95"]:
             flat[
                 f"{name}_rpc_{p}_ms" if p != "count" else f"{name}_complete_requests"
             ] = stats[p]
+        if synchronous:
+            for p, value in summary(values).items():
+                flat[
+                    f"{name}_stage_{p}_ms"
+                    if p != "count"
+                    else f"{name}_complete_stage_requests"
+                ] = value
         flat[f"{name}_censored_requests"] = sum(
             r["censored"] for e in episodes for r in e["requests"] if r["role"] == role
         )

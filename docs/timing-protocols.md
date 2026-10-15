@@ -160,3 +160,60 @@ The action floor starts at submission and includes worker queueing, feature inst
 `raw_completed_s` and `raw_service_seconds` precede the hold. `released_s`/`completed_s` are timestamps recorded just after the hold, **before** metadata recording, Future completion or the VLM publication lock. They are not exact consumer-visible availability timestamps. Use `feature_published` for cache visibility and `action_adopted` for actual controller adoption; S1 Future completion is not separately timestamped. `added_wait_seconds` includes bookkeeping and scheduling as well as sleeping.
 
 This intervention controls a minimum recorded release duration, not raw GPU computation, GPU frequency, or a hardware/quantization speedup. Sleeping releases CPU/GPU execution resources, so its contention pattern differs from slowing down an executing GPU kernel. Report raw and recorded-release durations, floor overruns, actual clocks, control validity, source lineage and AoI coverage separately. Failed or timing-invalid attempts remain evidence and do not silently increase paired-repeat counts.
+
+### Synchronous inference and action execution / 同步推理与动作执行
+
+`--execution-coupling synchronous` 与 `--execution-clock paced|ready` 独立。
+默认仍为 `asynchronous`。同步模式使用一个普通 Flow action server：每周期
+采集当前真实观测，依次完成真实 VLM 和 Flow4，然后执行至多
+`--synchronous-chunk-steps 8` 个干净动作。推理期间不调用 `env.step`，执行段不
+启动神经推理；首次成功或环境终止立即停止后续动作。每步仍推进 0.05 秒物理时间。
+
+`paced` 只在执行段内按 20 Hz 节拍运行，包含最终动作的完整 dwell；下一轮推理
+从该执行段结束后开始。`ready` 不增加等待。两者的全局控制频率都会反映真实推理、
+环境和记录成本；同步模式不声明全局 20 Hz deadline，有效性字段为 null。
+`actual_control_hz = control_steps / controlled_wall_seconds` 包含首轮推理等待。
+原生解码长度保持模型配置，必须覆盖请求的执行段长度；未执行的计划后缀显式记录，
+不挪用为下一周期的动作。
+
+启动单个模型服务（CUDA 环境、checkpoint 与优化参数按已有环境文档配置），然后
+使用仿真环境运行现有 evaluator；无需第二个 VLM 服务：
+
+```bash
+python scripts/evaluate_libero_protocol.py \
+  --protocol deployment --variant flow --port 5570 \
+  --execution-coupling synchronous --execution-clock paced \
+  --synchronous-chunk-steps 8 --task-ids 0 3 --episodes-per-task 1 \
+  --max-steps 300 --record-replay --replay-max-frames 301 \
+  --output .local/synchronous-examples/deployment
+```
+
+现有 `coexecution.libero.experiments` plan 支持全局或逐 condition 的
+`execution_coupling`、`execution_clock`、`synchronous_chunk_steps`，同步 condition
+只启动 action worker。同步模式拒绝 πR²、algorithm protocol、paired/resident
+feature exchange、服务时长下限、视觉限频和 fixed-delay 控制。每任务先做本 endpoint
+完整 warmup，再重置一次 episode RNG；正式周期不调用会重新设 seed 的 bootstrap。
+可选 `gpu_uuids` 必须提供 action/vlm/simulation 的完整 GPU UUID，准入先核对实际
+`nvidia-smi` index/UUID，保留 `gpu-admission.json` 与 hardware 中的 verified mapping。
+
+每轮 `cycle_phase` 保存真实 inference/execution 起止、物理步范围与暂停状态，
+`synchronous_cycle` 保存原生解码动作、源图像 hash、VLM/DiT 分段时间、forward/graph
+计数和丢弃后缀。兼容现有 feature→request→executed-slot 的来源审计；同步的 S1/S2
+区间标为 `server_action_stage` / `server_vlm_stage`，不是两条独立 RPC，也不是 GPU
+kernel 时间。`inference_wall_seconds` 是单次 VLM+Flow4 RPC 的完整客户端 wall；
+`action_stage_seconds` 和 `vlm_stage_seconds` 是服务端 stream 完成边界。
+
+```bash
+python -m coexecution.replay build \
+  --deployment .local/synchronous-examples/deployment \
+  --default-execution-coupling synchronous --default-execution-clock paced \
+  --output .local/synchronous-replay
+python simulator/serve.py --replay .local/synchronous-replay/catalog.json
+```
+
+回放按 execution coupling 和 clock 筛选匹配运行，显示 `Synchronous`、真实 Phase
+轨道以及 `Inference / simulation paused` / `Executing` 状态。不同精度共用 wall
+游标，各自 physics clock 仅在实际 `env.step` 完成后前进。视频只使用记录的 wall→frame
+映射，推理期间保持已有帧，不伪造运动；VLM→DiT→已执行动作仍可追溯。
+相机拷贝与 trace 收集属于 instrumented debug 成本，视频编码在控制结束后执行。
+少量任务样例不代表完整 Spatial 套件成功率。

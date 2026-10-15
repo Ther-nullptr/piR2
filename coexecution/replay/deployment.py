@@ -97,6 +97,80 @@ def _robot(root, metadata, start, ticks, media):
     return {**data, "frames": frames, "media": assets}, [source(path)]
 
 
+def _synchronous_phases(events, ticks, start, stop, episode_id):
+    """Accept actual mutually exclusive phases; never derive them from video FPS."""
+    phases = sorted(
+        (row for row in events if row.get("kind") == "cycle_phase"),
+        key=lambda row: row["start_s"],
+    )
+    cycles = [row for row in events if row.get("kind") == "synchronous_cycle"]
+    if not phases or len(phases) != 2 * len(cycles):
+        raise ValueError("Synchronous episode requires two actual phases per cycle")
+    previous, next_tick, normalized = start, 0, []
+    for index, cycle in enumerate(cycles):
+        inference, execution = phases[2 * index : 2 * index + 2]
+        if (
+            cycle.get("cycle") != index
+            or inference.get("cycle") != index
+            or execution.get("cycle") != index
+            or inference.get("phase") != "inference"
+            or execution.get("phase") != "execution"
+            or inference.get("simulation_paused") is not True
+            or execution.get("simulation_paused") is not False
+        ):
+            raise ValueError("Invalid synchronous phase order or identity")
+        for phase in (inference, execution):
+            a, b = interval(phase["start_s"], phase["end_s"])
+            if a < previous or b > stop:
+                raise ValueError(
+                    "Synchronous phases overlap or escape the control window"
+                )
+            previous = b
+            normalized.append(
+                {
+                    **phase,
+                    "id": f"{episode_id}/cycle-{index}/{phase['phase']}",
+                    "start_s": a - start,
+                    "end_s": b - start,
+                }
+            )
+        selected = [row for row in ticks if row.get("cycle") == index]
+        if (
+            inference.get("physics_start_tick") != next_tick
+            or inference.get("physics_end_tick") != next_tick
+            or execution.get("physics_start_tick") != next_tick
+            or execution.get("physics_end_tick") != next_tick + len(selected)
+            or not selected
+            or [row["tick"] for row in selected]
+            != list(range(next_tick, next_tick + len(selected)))
+        ):
+            raise ValueError(
+                "Synchronous phase physics progression disagrees with actual ticks"
+            )
+        for row in selected:
+            a, b = interval(row["applied_s"], row["next_observation_computed_s"])
+            if a < execution["start_s"] or b > execution["end_s"]:
+                raise ValueError(
+                    "Physical step lies outside its synchronous execution phase"
+                )
+        audit = cycle["audit"]
+        for a, b in (
+            ("vlm_started_s", "vlm_completed_s"),
+            ("action_started_s", "action_completed_s"),
+        ):
+            low, high = interval(audit[a], audit[b])
+            if low < inference["start_s"] or high > inference["end_s"]:
+                raise ValueError(
+                    "Neural stage lies outside its synchronous inference phase"
+                )
+        next_tick += len(selected)
+    if next_tick != len(ticks):
+        raise ValueError(
+            "Synchronous phase coverage does not include every physics step"
+        )
+    return normalized, cycles
+
+
 def deployment_run(root, media):
     root = Path(root).resolve()
     config = read_json(root / "config.json")
@@ -105,6 +179,9 @@ def deployment_run(root, media):
     execution_clock = config.get("execution_clock", "paced")
     if execution_clock not in ("paced", "ready"):
         raise ValueError("Unknown deployment execution clock")
+    execution_coupling = config.get("execution_coupling", "asynchronous")
+    if execution_coupling not in ("asynchronous", "synchronous"):
+        raise ValueError("Unknown deployment execution coupling")
     metadata = read_jsonl(root / "episodes.jsonl")
     run_id = "deployment-" + digest(str(root))[:20]
     episodes, identities = [], set()
@@ -112,6 +189,8 @@ def deployment_run(root, media):
     for episode in metadata:
         if episode.get("execution_clock", execution_clock) != execution_clock:
             raise ValueError("Episode and configuration execution clocks disagree")
+        if episode.get("execution_coupling", execution_coupling) != execution_coupling:
+            raise ValueError("Episode and configuration execution coupling disagree")
         task, number = episode.get("task_id"), episode.get("episode_id")
         if type(task) is not int or task not in range(10):
             raise ValueError("Deployment task_id must be an integer in 0..9")
@@ -187,6 +266,13 @@ def deployment_run(root, media):
             raise ValueError(
                 "Controller trace and configuration execution clocks disagree"
             )
+        if queue["execution_coupling"] != execution_coupling:
+            raise ValueError(
+                "Controller trace and configuration execution coupling disagree"
+            )
+        phases, cycles = [], []
+        if execution_coupling == "synchronous":
+            phases, cycles = _synchronous_phases(events, ticks, start, stop, episode_id)
         for request in queue["requests"]:
             sequence = (
                 request.get("request_tick")
@@ -236,6 +322,8 @@ def deployment_run(root, media):
                 "same_input_comparison": False,
                 "queue": queue,
                 "ticks": ticks,
+                "phases": phases,
+                "cycles": cycles,
                 "robot": robot,
             }
         )
@@ -245,6 +333,7 @@ def deployment_run(root, media):
         "id": run_id,
         "kind": "deployment",
         "execution_clock": execution_clock,
+        "execution_coupling": execution_coupling,
         "label": root.parent.name,
         "precision": _precision(config),
         "mode": root.parent.name,

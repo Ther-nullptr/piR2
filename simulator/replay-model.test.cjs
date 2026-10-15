@@ -354,3 +354,60 @@ test("unknown instrumentation blocks cross-run pairing even with a matching key 
     assert.equal(aligned[1].record, null);
   }
 });
+
+test("coupling filters prevent mixing synchronous and asynchronous robot evidence", () => {
+  const runs = [
+    { id: "legacy", kind: "deployment", execution_clock: "paced" },
+    {
+      id: "sync",
+      kind: "deployment",
+      execution_clock: "paced",
+      execution_coupling: "synchronous",
+    },
+    {
+      id: "ready",
+      kind: "deployment",
+      execution_clock: "ready",
+      execution_coupling: "synchronous",
+    },
+  ];
+  assert.equal(typeof R.deploymentCoupling, "function");
+  assert.equal(R.deploymentCoupling(runs[0]), "asynchronous");
+  assert.deepEqual(
+    R.replayDescriptors(runs, "deployment", "paced", "synchronous").map(
+      (r) => r.id,
+    ),
+    ["sync"],
+  );
+  assert.deepEqual(
+    R.replayDescriptors(runs, "deployment", "paced").map((r) => r.id),
+    ["legacy"],
+  );
+});
+
+test("synchronous phase and physics cursor follow recorded intervals and completed steps", () => {
+  const measured = {
+    ...episode,
+    phases: [
+      { phase: "inference", start_s: 0, end_s: 0.1 },
+      { phase: "execution", start_s: 0.1, end_s: 0.9 },
+      { phase: "inference", start_s: 0.9, end_s: 2 },
+    ],
+    ticks: episode.ticks.map((row, i) => ({
+      ...row,
+      next_observation_computed_s: i === 0 ? 100.2 : 100.8,
+      simulated_elapsed_seconds: (i + 1) * 0.05,
+    })),
+  };
+  assert.equal(typeof R.phaseAt, "function");
+  assert.equal(typeof R.physicsAt, "function");
+  assert.equal(R.phaseAt(measured, 0.05).phase, "inference");
+  assert.equal(R.phaseAt(measured, 0.1).phase, "execution");
+  assert.equal(R.phaseAt(measured, 0.95).phase, "inference");
+  assert.equal(R.phaseAt(measured, 2), null);
+  assert.equal(R.physicsAt(measured, 0.15), 0);
+  assert.equal(R.physicsAt(measured, 0.21), 0.05);
+  assert.equal(R.physicsAt(measured, 0.95), 0.1);
+  assert.equal(R.robotAt(measured, 0.95, "image").frame.frame_id, "b");
+  assert.equal(R.robotAt(measured, 1.95, "image").frame.frame_id, "b");
+});

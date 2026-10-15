@@ -165,11 +165,25 @@
   function deploymentCadence(run) {
     return run.execution_clock ?? run.configuration?.execution_clock ?? "paced";
   }
-  function replayDescriptors(descriptors, kind, cadence) {
+  function deploymentCoupling(run) {
+    return (
+      run.execution_coupling ??
+      run.configuration?.execution_coupling ??
+      "asynchronous"
+    );
+  }
+  function replayDescriptors(
+    descriptors,
+    kind,
+    cadence,
+    coupling = "asynchronous",
+  ) {
     return descriptors.filter(
       (run) =>
         run.kind === kind &&
-        (kind !== "deployment" || deploymentCadence(run) === cadence),
+        (kind !== "deployment" ||
+          (deploymentCadence(run) === cadence &&
+            deploymentCoupling(run) === coupling)),
     );
   }
   function playableEpisode(episode) {
@@ -194,6 +208,28 @@
       ended: finite(end) && time >= end,
       end,
     };
+  }
+  function phaseAt(episode, time) {
+    return (
+      episode?.phases?.find(
+        (phase) =>
+          finite(phase.start_s) &&
+          finite(phase.end_s) &&
+          phase.start_s <= time &&
+          time < phase.end_s,
+      ) ?? null
+    );
+  }
+  function physicsAt(episode, time) {
+    if (!finite(episode?.controlled_start_s)) return null;
+    const completed = (episode.ticks ?? []).filter(
+      (tick) =>
+        finite(tick.next_observation_computed_s) &&
+        tick.next_observation_computed_s - episode.controlled_start_s <= time,
+    );
+    return completed.length
+      ? (completed.at(-1).simulated_elapsed_seconds ?? null)
+      : 0;
   }
   const channels = {
     x: ["position_xyz_m", 0, "m"],
@@ -271,6 +307,9 @@
     scopedRecords,
     normalizeEpisode,
     deploymentCadence,
+    deploymentCoupling,
+    phaseAt,
+    physicsAt,
     replayDescriptors,
     playableEpisode,
     finite,
