@@ -491,6 +491,30 @@ class OwnedProcesses:
 
 
 def _admit_devices(plan):
+    verified = {}
+    if "gpu_uuids" in plan:
+        observed = {}
+        for gpu in set(plan["gpus"].values()):
+            result = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "-i",
+                    str(gpu),
+                    "--query-gpu=index,uuid",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+            )
+            index, uuid = (value.strip() for value in result.strip().split(","))
+            if int(index) != gpu:
+                raise RuntimeError("GPU UUID/index mismatch during admission")
+            observed[gpu] = uuid
+        for role, gpu in plan["gpus"].items():
+            if observed[gpu].lower() != plan["gpu_uuids"][role].lower():
+                raise RuntimeError(
+                    f"GPU UUID/index mismatch for {role}: physical {gpu} is {observed[gpu]}"
+                )
+            verified[role] = {"physical_index": gpu, "uuid": observed[gpu]}
     for gpu in set(plan["gpus"].values()):
         # A completed condition can leave a briefly nonzero resource sample.
         # Recheck without launching anything; visible compute jobs reject at once.
@@ -530,6 +554,7 @@ def _admit_devices(plan):
     for port in plan["ports"].values():
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
+    return verified
 
 
 def deployment_report(plan, output, *, report_output=None):
@@ -610,7 +635,12 @@ def run(plan, output):
             condition_output = output / case["name"]
             owned = OwnedProcesses(plan)
             try:
-                _admit_devices(plan)
+                verified_gpus = _admit_devices(plan)
+                condition_output.mkdir(parents=True, exist_ok=True)
+                _write(
+                    condition_output / "gpu-admission.json",
+                    {"verified_role_mapping": verified_gpus},
+                )
                 commands = build_commands(
                     plan, case, plan["protocols"][0], condition_output
                 )
@@ -671,6 +701,7 @@ def run(plan, output):
                                 }
                             ),
                             "renderer_gpu": plan["gpus"]["simulation"],
+                            "verified_role_mapping": verified_gpus,
                             "returncode": process.returncode,
                         },
                     )

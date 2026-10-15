@@ -624,3 +624,40 @@ def test_declared_uuid_mask_wins_over_physical_ordinal(plan):
         plan["gpu_uuids"] = wrong
         with pytest.raises(ValueError, match="UUID"):
             module().validate_plan(plan)
+
+
+def test_uuid_index_mismatch_rejects_before_resource_admission(plan, monkeypatch):
+    m = module()
+    declared = "GPU-a96bcf12-94d7-95fc-c078-b597412cdd63"
+    observed = "GPU-4a56586b-2b20-8158-2085-c97765614e2c"
+    plan["gpu_uuids"] = dict.fromkeys(plan["gpus"], declared)
+    calls = []
+
+    def query(command, **kwargs):
+        calls.append(command)
+        assert "--query-gpu=index,uuid" in command
+        return f"0, {observed}\n"
+
+    monkeypatch.setattr(m.subprocess, "check_output", query)
+    with pytest.raises(RuntimeError, match="UUID.*mismatch"):
+        m._admit_devices(plan)
+    assert len(calls) == 1
+
+
+def test_uuid_admission_returns_verified_role_mapping(plan, monkeypatch):
+    m = module()
+    uuid = "GPU-a96bcf12-94d7-95fc-c078-b597412cdd63"
+    plan["gpu_uuids"] = dict.fromkeys(plan["gpus"], uuid)
+
+    def query(command, **kwargs):
+        if "--query-gpu=index,uuid" in command:
+            return f"0, {uuid}\n"
+        if "--query-gpu=memory.used,utilization.gpu" in command:
+            return "0, 0"
+        return ""
+
+    monkeypatch.setattr(m.subprocess, "check_output", query)
+    mapping = m._admit_devices(plan)
+    assert mapping == {
+        role: {"physical_index": 0, "uuid": uuid} for role in plan["gpus"]
+    }
