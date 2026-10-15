@@ -10,11 +10,13 @@ import fcntl
 import json
 import math
 import os
+import re
 import signal
 import socket
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from coexecution.libero.features import validate_feature_options
 from coexecution.libero.scheduling import (
@@ -80,6 +82,18 @@ def validate_plan(plan):
         type(value) is not int or value < 0 for value in plan["gpus"].values()
     ):
         raise ValueError("Declare physical CUDA devices for all three roles")
+    if "gpu_uuids" in plan and (
+        not isinstance(plan["gpu_uuids"], dict)
+        or set(plan["gpu_uuids"]) != set(plan["gpus"])
+        or any(
+            not isinstance(value, str)
+            or not re.fullmatch(
+                r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value
+            )
+            for value in plan["gpu_uuids"].values()
+        )
+    ):
+        raise ValueError("Declare a full GPU UUID for each role")
     if (
         set(plan["ports"]) != {"action", "vlm"}
         or any(
@@ -116,6 +130,30 @@ def validate_plan(plan):
     add_optimization_arguments(parser)
     for case in plan["conditions"]:
         for protocol in plan["protocols"]:
+            from coexecution.libero.synchronous import validate_synchronous_controls
+
+            defaults = {
+                "execution_coupling": "asynchronous",
+                "synchronous_chunk_steps": 8,
+                "server_layout": "split",
+                "feature_transport": "numpy_fp32",
+                "feature_rpc": "separate",
+                "action_min_service_ms": 0,
+                "vision_min_service_ms": 0,
+                "vision_max_hz": 0,
+                "deployment_fixed_delay": None,
+                "artificial_compute_wait": 0,
+            }
+            validate_synchronous_controls(
+                SimpleNamespace(
+                    **{
+                        key: case.get(key, plan.get(key, value))
+                        for key, value in defaults.items()
+                    },
+                    protocol=protocol,
+                    variant=case["variant"],
+                )
+            )
             validate_execution_clock(
                 case.get("execution_clock", plan.get("execution_clock", "paced")),
                 protocol=protocol,
@@ -162,6 +200,9 @@ def build_commands(plan, case, protocol, output):
     )
     feature_rpc = case.get("feature_rpc", plan.get("feature_rpc", "separate"))
     layout = case.get("server_layout", plan.get("server_layout", "split"))
+    coupling = case.get(
+        "execution_coupling", plan.get("execution_coupling", "asynchronous")
+    )
     feature_controls = []
     if "feature_transport" in case or "feature_transport" in plan:
         feature_controls = ["--feature-transport", feature_transport]
@@ -175,6 +216,15 @@ def build_commands(plan, case, protocol, output):
             [
                 "--execution-clock",
                 case.get("execution_clock", plan.get("execution_clock", "paced")),
+                "--execution-coupling",
+                coupling,
+                "--synchronous-chunk-steps",
+                str(
+                    case.get(
+                        "synchronous_chunk_steps",
+                        plan.get("synchronous_chunk_steps", 8),
+                    )
+                ),
             ]
         )
         fixed_delay = case.get(
@@ -182,7 +232,7 @@ def build_commands(plan, case, protocol, output):
         )
         if fixed_delay is not None:
             deployment_controls.extend(["--deployment-fixed-delay", str(fixed_delay)])
-    for role in ("action", "vlm"):
+    for role in ("action",) if coupling == "synchronous" else ("action", "vlm"):
         commands[role] = [
             str(plan["model_python"]),
             "-m",
@@ -341,7 +391,7 @@ def environment(plan, role):
     root = Path(plan["runtime_root"])
     gpu = plan["gpus"][role]
     env.update(
-        CUDA_VISIBLE_DEVICES=str(gpu),
+        CUDA_VISIBLE_DEVICES=plan.get("gpu_uuids", {}).get(role, str(gpu)),
         PYTHONUNBUFFERED="1",
         OMP_NUM_THREADS="2",
         MAX_JOBS="2",
@@ -564,7 +614,7 @@ def run(plan, output):
                 commands = build_commands(
                     plan, case, plan["protocols"][0], condition_output
                 )
-                for role in ("paired",) if "paired" in commands else ("action", "vlm"):
+                for role in (name for name in commands if name != "evaluate"):
                     worker_output = condition_output / (role + "-server")
                     owned.start(
                         role,
@@ -606,10 +656,19 @@ def run(plan, output):
                             "condition": protocol,
                             "role_gpus": {
                                 "S1": plan["gpus"]["action"],
-                                "S2": plan["gpus"]["vlm"],
+                                "S2": plan["gpus"]["vlm"]
+                                if "vlm" in commands or "paired" in commands
+                                else plan["gpus"]["action"],
                             },
                             "inference_gpus": sorted(
-                                {plan["gpus"]["action"], plan["gpus"]["vlm"]}
+                                {
+                                    plan["gpus"]["action"],
+                                    *(
+                                        [plan["gpus"]["vlm"]]
+                                        if "vlm" in commands or "paired" in commands
+                                        else []
+                                    ),
+                                }
                             ),
                             "renderer_gpu": plan["gpus"]["simulation"],
                             "returncode": process.returncode,

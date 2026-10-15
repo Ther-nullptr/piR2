@@ -597,3 +597,30 @@ def test_subset_deployment_report_reads_actual_trace_and_reports_selected_scope(
     assert "subset" in report["scope"] and "Full Spatial" not in report["scope"]
     assert len(report["conditions"][0]["episodes"]) == 1
     assert (tmp_path / "feature-usage.json").is_file()
+
+
+def test_synchronous_plan_owns_only_one_worker_and_propagates_coupling(plan):
+    plan.update(execution_coupling="synchronous", synchronous_chunk_steps=8)
+    module().validate_plan(plan)
+    commands = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/out")
+    )
+    assert set(commands) == {"action", "evaluate"}
+    evaluate = commands["evaluate"]
+    assert evaluate[evaluate.index("--execution-coupling") + 1] == "synchronous"
+    assert evaluate[evaluate.index("--synchronous-chunk-steps") + 1] == "8"
+    plan["conditions"][1]["server_layout"] = "paired"
+    with pytest.raises(ValueError, match="Synchronous"):
+        module().validate_plan(plan)
+
+
+def test_declared_uuid_mask_wins_over_physical_ordinal(plan):
+    uuid = "GPU-a96bcf12-94d7-95fc-c078-b597412cdd63"
+    plan["gpu_uuids"] = {role: uuid for role in plan["gpus"]}
+    module().validate_plan(plan)
+    assert module().environment(plan, "action")["CUDA_VISIBLE_DEVICES"] == uuid
+    assert module().environment(plan, "simulation")["MUJOCO_EGL_DEVICE_ID"] == "0"
+    for wrong in [{"action": uuid}, dict.fromkeys(plan["gpus"], "GPU-a96b")]:
+        plan["gpu_uuids"] = wrong
+        with pytest.raises(ValueError, match="UUID"):
+            module().validate_plan(plan)

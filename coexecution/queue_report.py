@@ -174,7 +174,10 @@ def summarize_episode(events, metadata):
     execution_clock = begin.get(
         "execution_clock", metadata.get("execution_clock", "paced")
     )
-    paced = execution_clock == "paced"
+    execution_coupling = begin.get(
+        "execution_coupling", metadata.get("execution_coupling", "asynchronous")
+    )
+    paced = execution_clock == "paced" and execution_coupling == "asynchronous"
     inside = [r for r in events if start <= r["t_s"] <= stop]
     ticks = [r for r in inside if r["kind"] == "control_tick"]
     by_kind = defaultdict(list)
@@ -235,6 +238,7 @@ def summarize_episode(events, metadata):
         requests.append(
             {
                 "role": "S1",
+                "timing_scope": row.get("timing_scope", "client_rpc"),
                 "request_tick": k,
                 "start_s": row["t_s"] - start,
                 "worker_start_s": started.get(k, row)["t_s"] - start,
@@ -279,6 +283,7 @@ def summarize_episode(events, metadata):
         requests.append(
             {
                 "role": "S2",
+                "timing_scope": row.get("timing_scope", "client_rpc"),
                 "source_tick": row.get("source_tick"),
                 "capture_s": relative(row.get("capture_s")),
                 "feature_sequence": publication.get("feature_sequence"),
@@ -421,6 +426,7 @@ def summarize_episode(events, metadata):
         delay = after
     metrics = {
         "execution_clock": execution_clock,
+        "execution_coupling": execution_coupling,
         "fixed_rate_timing_applicable": paced,
         "physics_step_seconds": begin.get(
             "physics_step_seconds", begin.get("period_s", 0.05)
@@ -468,6 +474,7 @@ def summarize_episode(events, metadata):
     ]
     provenance_fields = [
         "execution_clock",
+        "execution_coupling",
         "actual_control_hz",
         "action_request_hz",
         "effective_plan_update_hz",
@@ -485,6 +492,7 @@ def summarize_episode(events, metadata):
     ]
     return {
         "execution_clock": execution_clock,
+        "execution_coupling": execution_coupling,
         "start_s": start,
         "end_s": stop,
         "duration_s": stop - start,
@@ -549,6 +557,7 @@ def condition_report(directory):
     duration = sum(m["controlled_seconds"] for m in metrics)
     flat = {
         "execution_clock": episodes[0]["execution_clock"],
+        "execution_coupling": episodes[0]["execution_coupling"],
         "layout": hardware.get("layout", directory.parent.name),
         "condition": hardware.get("condition", directory.name),
         "episodes": len(episodes),
@@ -576,7 +585,7 @@ def condition_report(directory):
         "control_rate_valid_episodes": sum(
             e["metadata"].get("control_rate_valid") is True for e in episodes
         )
-        if all(e["execution_clock"] == "paced" for e in episodes)
+        if all(e["metrics"]["fixed_rate_timing_applicable"] for e in episodes)
         else None,
     }
     role_gpus = hardware.get("role_gpus") or {

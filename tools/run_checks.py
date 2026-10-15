@@ -36,6 +36,7 @@ def main():
         "tests/contracts/test_libero_profiling.py",
         "tests/contracts/test_replay_evidence.py",
         "tests/contracts/test_libero_experiments.py",
+        "tests/contracts/test_synchronous_execution.py",
         "tests/contracts/test_feature_transport.py",
         "tests/contracts/test_resident_features.py",
         "tests/contracts/test_cuda_submission.py",
