@@ -425,3 +425,69 @@ test("partial and invalid phase records do not invent completion", () => {
   assert.equal(blocks[0].end, null);
   assert.equal(T.phase(blocks[0], 2).progress, null);
 });
+
+function completeSynchronousCycles() {
+  const row = synchronousRow();
+  row.episode.phases = [0, 1, 2].flatMap((cycle) => {
+    const start = cycle * 0.45;
+    return [
+      {
+        id: `i${cycle}`,
+        cycle,
+        phase: "inference",
+        start_s: start,
+        end_s: start + 0.04,
+      },
+      {
+        id: `e${cycle}`,
+        cycle,
+        phase: "execution",
+        start_s: start + 0.04,
+        end_s: start + 0.44,
+      },
+    ];
+  });
+  return row;
+}
+
+test("synchronous auto window fits two recorded cycles and keeps the current execution producers visible", () => {
+  const row = completeSynchronousCycles(),
+    before = JSON.stringify(row);
+  const span = T.synchronousSpan([row], 1.34);
+  assert.ok(Math.abs(span - 0.89) < 1e-9);
+  const start = T.viewport(0.1, 1.34, span);
+  assert.ok(start.start <= 0 && start.end >= 0.89);
+  const executing = T.viewport(0.7, 1.34, span);
+  for (const block of [
+    { start: 0.45, end: 0.47 }, // observed VLM producer
+    { start: 0.47, end: 0.49 }, // observed DiT producer
+    { start: 0.49, end: 0.89 }, // execution phase
+  ]) {
+    const geometry = T.geometry(block, executing);
+    assert.equal(geometry.visible, true);
+    assert.ok(geometry.left >= 0 && geometry.left + geometry.width <= 100);
+  }
+  assert.equal(JSON.stringify(row), before);
+  assert.equal(T.synchronousSpan([row], 0.2), 0.2);
+});
+
+test("synchronous auto window falls back for missing or incomplete cycles without estimating their duration", () => {
+  assert.equal(T.synchronousSpan([], 3), 0.3);
+  for (const status of ["unknown", "incomplete", "running"]) {
+    const row = completeSynchronousCycles();
+    row.episode.phases[3].status = status;
+    // Neither complete cycle on either side is adjacent to another complete one.
+    assert.equal(T.synchronousSpan([row], 3), 0.3);
+  }
+  for (const end of [null, undefined, NaN, -1]) {
+    const row = completeSynchronousCycles();
+    row.episode.phases[3].end_s = end;
+    assert.equal(T.synchronousSpan([row], 3), 0.3);
+  }
+  const row = completeSynchronousCycles();
+  row.episode.phases = row.episode.phases.slice(0, 2);
+  assert.equal(T.synchronousSpan([row], 3), 0.3);
+  row.run.execution_coupling = "asynchronous";
+  row.episode.phases = completeSynchronousCycles().episode.phases;
+  assert.equal(T.synchronousSpan([row], 3), 0.3);
+});

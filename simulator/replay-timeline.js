@@ -88,6 +88,47 @@
     return { start: left, end: left + span, span };
   }
 
+  function synchronousSpan(rows, end) {
+    let span = 0.3;
+    for (const row of rows) {
+      if (R.deploymentCoupling(row.run) !== "synchronous") continue;
+      const cycles = new Map();
+      for (const p of row.episode?.phases ?? []) {
+        if (!Number.isInteger(p.cycle)) continue;
+        if (!cycles.has(p.cycle)) cycles.set(p.cycle, []);
+        cycles.get(p.cycle).push(p);
+      }
+      const complete = new Map();
+      for (const [cycle, phases] of cycles) {
+        const inference = phases.find((p) => p.phase === "inference");
+        const execution = phases.find((p) => p.phase === "execution");
+        if (
+          phases.length !== 2 ||
+          !inference ||
+          !execution ||
+          phases.some(
+            (p) =>
+              !finite(p.start_s) ||
+              !finite(p.end_s) ||
+              p.end_s < p.start_s ||
+              ["unknown", "incomplete", "running"].includes(p.status),
+          ) ||
+          execution.start_s < inference.end_s
+        )
+          continue;
+        complete.set(cycle, { start: inference.start_s, end: execution.end_s });
+      }
+      // Two actual adjacent cycles, including their recorded inter-cycle gap.
+      // A single cycle or an open/unknown phase is never extrapolated.
+      for (const [cycle, first] of complete) {
+        const second = complete.get(cycle + 1);
+        if (second && second.start >= first.end)
+          span = Math.max(span, second.end - first.start);
+      }
+    }
+    return finite(end) && end >= 0 ? Math.min(span, end) : span;
+  }
+
   function geometry(block, view) {
     const stop = finite(block.end) ? block.end : view.end;
     return {
@@ -392,6 +433,7 @@
     tracks,
     phase,
     viewport,
+    synchronousSpan,
     geometry,
     laneState,
     observedModelEnd,

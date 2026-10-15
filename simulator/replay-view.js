@@ -1065,13 +1065,22 @@
   }
   function taskViewport() {
     const mode = $("window").value;
+    const synchronous =
+      state.kind === "deployment" && state.executionCoupling === "synchronous";
+    $("window").title = synchronous
+      ? "自动窗口覆盖两个已记录的相邻完整周期；缺少完整阶段时使用 0.3 s 窗口。窗口宽度不是推理耗时。"
+      : "按真实记录跟随时间游标";
     const span =
       mode === "all"
         ? state.end
         : mode === "auto"
           ? Math.min(
               state.end,
-              state.kind === "model" ? Math.max(5, state.end * 0.45) : 0.3,
+              state.kind === "model"
+                ? Math.max(5, state.end * 0.45)
+                : synchronous
+                  ? window.ReplayTimeline.synchronousSpan(state.rows, state.end)
+                  : 0.3,
             )
           : state.end * Number(mode);
     return window.ReplayTimeline.viewport(state.clock, state.end, span);
