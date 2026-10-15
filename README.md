@@ -14,6 +14,7 @@ This independently maintained repository studies **NVIDIA GR00T-N1.7-LIBERO** ta
 - [Leap reconstruction](simulation/README.md), SO100 profiling and browser teaching tools are auxiliary historical work, reported separately from the GR00T-LIBERO main line.
 - [Single-GPU execution tools](coexecution/README.md) support auxiliary SO100 replay profiling; their mechanisms require separate LIBERO validation before contributing main-line performance claims.
 - [LIBERO VLM/DiT contention profiling](docs/coexecution.md#libero-vlmdit-contention-profiling) compares isolated, concurrent, priority and cooperative execution with BF16/W8A8/W4A4, keeping response time, hardware counters and task quality distinct.
+- [官方 Spatial Flow4 操作指南](docs/coexecution.md#official-spatial-flow4-scheduling-diagnostic)：环境与空卡预检、同卡/双卡调度、双进程延迟放行及结果读取。
 - [Interactive timing tool](simulator/README.md) explains queueing and cache-age assumptions without predicting task success.
 - [Jetson 与流式回放交接](docs/platform-handoff.md) maps AGX Orin/Thor porting gates, reproducible measurements and the replay integration contract.
 
