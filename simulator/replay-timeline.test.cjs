@@ -491,3 +491,79 @@ test("synchronous auto window falls back for missing or incomplete cycles withou
   row.episode.phases = completeSynchronousCycles().episode.phases;
   assert.equal(T.synchronousSpan([row], 3), 0.3);
 });
+
+test("synchronous auto viewport retains the executing cycle sources near the end of unequal cycles", () => {
+  const row = completeSynchronousCycles();
+  row.episode.phases = [
+    {
+      id: "i0",
+      cycle: 0,
+      request_tick: 5,
+      phase: "inference",
+      start_s: 0,
+      end_s: 0.15,
+    },
+    {
+      id: "e0",
+      cycle: 0,
+      request_tick: 5,
+      phase: "execution",
+      start_s: 0.16,
+      end_s: 0.56,
+    },
+    {
+      id: "i1",
+      cycle: 1,
+      request_tick: 9,
+      phase: "inference",
+      start_s: 0.6,
+      end_s: 0.7,
+    },
+    {
+      id: "e1",
+      cycle: 1,
+      request_tick: 9,
+      phase: "execution",
+      start_s: 0.71,
+      end_s: 3.71,
+    },
+  ];
+  const before = JSON.stringify(row);
+  for (const execution of row.episode.phases.filter(
+    (p) => p.phase === "execution",
+  )) {
+    const cursor = execution.end_s - 1e-7;
+    const view = T.synchronousViewport([row], cursor, 3.71);
+    const inference = row.episode.phases.find(
+      (p) => p.cycle === execution.cycle && p.phase === "inference",
+    );
+    assert.ok(view.start <= inference.start_s);
+    assert.ok(view.end >= cursor && view.end <= 3.71);
+    assert.ok(view.span >= cursor - inference.start_s);
+  }
+  assert.equal(JSON.stringify(row), before);
+});
+
+test("one recorded complete cycle anchors execution history without estimating a second cycle", () => {
+  const row = synchronousRow();
+  row.episode.phases = row.episode.phases.slice(0, 2);
+  assert.equal(T.synchronousSpan([row], 0.56), 0.3);
+  const cursor = 0.56 - 1e-7,
+    view = T.synchronousViewport([row], cursor, 0.56);
+  for (const block of T.sourceBlocks(T.tracks([row], "deployment"), "p1")) {
+    assert.ok(view.start <= block.start);
+    assert.ok(view.end >= block.end);
+  }
+  assert.equal(view.start, 0);
+  assert.equal(view.end, 0.56);
+  row.episode.phases[0].status = "unknown";
+  assert.deepEqual(
+    T.synchronousViewport([row], cursor, 0.56),
+    T.viewport(cursor, 0.56, 0.3),
+  );
+  delete row.episode.phases;
+  assert.deepEqual(
+    T.synchronousViewport([row], cursor, 0.56),
+    T.viewport(cursor, 0.56, 0.3),
+  );
+});

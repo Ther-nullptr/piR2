@@ -88,36 +88,46 @@
     return { start: left, end: left + span, span };
   }
 
+  function synchronousCycles(row) {
+    const complete = new Map();
+    if (R.deploymentCoupling(row.run) !== "synchronous") return complete;
+    const cycles = new Map();
+    for (const p of row.episode?.phases ?? []) {
+      if (!Number.isInteger(p.cycle)) continue;
+      if (!cycles.has(p.cycle)) cycles.set(p.cycle, []);
+      cycles.get(p.cycle).push(p);
+    }
+    for (const [cycle, phases] of cycles) {
+      const inference = phases.find((p) => p.phase === "inference");
+      const execution = phases.find((p) => p.phase === "execution");
+      if (
+        phases.length !== 2 ||
+        !inference ||
+        !execution ||
+        phases.some(
+          (p) =>
+            !finite(p.start_s) ||
+            !finite(p.end_s) ||
+            p.end_s < p.start_s ||
+            ["unknown", "incomplete", "running"].includes(p.status),
+        ) ||
+        execution.start_s < inference.end_s
+      )
+        continue;
+      complete.set(cycle, {
+        start: inference.start_s,
+        end: execution.end_s,
+        executionStart: execution.start_s,
+        requestTick: execution.request_tick,
+      });
+    }
+    return complete;
+  }
+
   function synchronousSpan(rows, end) {
     let span = 0.3;
     for (const row of rows) {
-      if (R.deploymentCoupling(row.run) !== "synchronous") continue;
-      const cycles = new Map();
-      for (const p of row.episode?.phases ?? []) {
-        if (!Number.isInteger(p.cycle)) continue;
-        if (!cycles.has(p.cycle)) cycles.set(p.cycle, []);
-        cycles.get(p.cycle).push(p);
-      }
-      const complete = new Map();
-      for (const [cycle, phases] of cycles) {
-        const inference = phases.find((p) => p.phase === "inference");
-        const execution = phases.find((p) => p.phase === "execution");
-        if (
-          phases.length !== 2 ||
-          !inference ||
-          !execution ||
-          phases.some(
-            (p) =>
-              !finite(p.start_s) ||
-              !finite(p.end_s) ||
-              p.end_s < p.start_s ||
-              ["unknown", "incomplete", "running"].includes(p.status),
-          ) ||
-          execution.start_s < inference.end_s
-        )
-          continue;
-        complete.set(cycle, { start: inference.start_s, end: execution.end_s });
-      }
+      const complete = synchronousCycles(row);
       // Two actual adjacent cycles, including their recorded inter-cycle gap.
       // A single cycle or an open/unknown phase is never extrapolated.
       for (const [cycle, first] of complete) {
@@ -127,6 +137,41 @@
       }
     }
     return finite(end) && end >= 0 ? Math.min(span, end) : span;
+  }
+
+  function synchronousViewport(rows, cursor, end) {
+    const view = viewport(cursor, end, synchronousSpan(rows, end));
+    let left = view.start;
+    for (const row of rows) {
+      for (const cycle of synchronousCycles(row).values()) {
+        if (cursor < cycle.executionStart || cursor >= cycle.end) continue;
+        // Preserve the current execution cycle's complete inference history.
+        // Unequal cycles and a single recorded cycle need no history percentage.
+        left = Math.min(left, cycle.start);
+        const requests = row.episode?.queue?.requests ?? [];
+        const actions =
+          cycle.requestTick == null
+            ? []
+            : requests.filter(
+                (r) => r.role === "S1" && r.request_tick === cycle.requestTick,
+              );
+        if (actions.length !== 1) continue;
+        const action = actions[0];
+        if (finite(action.start_s)) left = Math.min(left, action.start_s);
+        const sources =
+          action.feature_sequence == null
+            ? []
+            : requests.filter(
+                (r) =>
+                  r.role === "S2" &&
+                  r.feature_sequence === action.feature_sequence,
+              );
+        if (sources.length === 1 && finite(sources[0].start_s))
+          left = Math.min(left, sources[0].start_s);
+      }
+    }
+    left = Math.max(0, left);
+    return { start: left, end: view.end, span: view.end - left };
   }
 
   function geometry(block, view) {
@@ -434,6 +479,7 @@
     phase,
     viewport,
     synchronousSpan,
+    synchronousViewport,
     geometry,
     laneState,
     observedModelEnd,
