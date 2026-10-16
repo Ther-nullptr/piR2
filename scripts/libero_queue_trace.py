@@ -9,7 +9,9 @@ import time
 class QueueTrace:
     """Serialize metadata from controller and worker threads; defer all file I/O."""
 
-    def __init__(self, clock=None, max_records=None):
+    def __init__(
+        self, clock=None, max_records=None, *, event_sink=None, source_namespace=""
+    ):
         if max_records is not None and (
             type(max_records) is not int or max_records < 1
         ):
@@ -18,6 +20,9 @@ class QueueTrace:
         self.clock = clock or time.monotonic
         self._lock = threading.Lock()
         self._records = []
+        if event_sink is not None and not callable(event_sink):
+            raise TypeError("event_sink must be callable or None")
+        self.event_sink, self.source_namespace = event_sink, source_namespace
 
     def emit(self, kind, t_s=None, **fields):
         with self._lock:
@@ -32,6 +37,18 @@ class QueueTrace:
                 **copy.deepcopy(fields),
             }
             self._records.append(record)
+            if self.event_sink is not None:
+                from coexecution.replay.producer import emit_event, queue_sources
+
+                # Admission is a bounded in-memory enqueue, never network/file I/O.
+                # Keep source seq order even when occurrences are backdated.
+                emit_event(
+                    self.event_sink,
+                    "queue." + kind,
+                    t_s=record["t_s"],
+                    sources=queue_sources(record, self.source_namespace),
+                    payload=record,
+                )
             return record["seq"]
 
     def status(self):

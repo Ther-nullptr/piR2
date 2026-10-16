@@ -565,6 +565,9 @@ def test_model_only_mode_failure_preserves_failing_gate_and_both_outputs(
     monkeypatch, tmp_path
 ):
     module = measurement()
+    monkeypatch.setattr(
+        module, "_mode_evidence", lambda *_args: {"runtime_receipt": {}}
+    )
     values = {"bf16-graph": np.array([1.0]), "bf16-compiled": np.array([2.0])}
 
     def mode_result(
@@ -612,6 +615,9 @@ def test_model_only_artifacts_accumulate_all_precisions_on_success_or_failure(
     monkeypatch, tmp_path, fail_last
 ):
     module = measurement()
+    monkeypatch.setattr(
+        module, "_mode_evidence", lambda *_args: {"runtime_receipt": {}}
+    )
     output = tmp_path / "replay"
     args = module.build_parser().parse_args(
         [

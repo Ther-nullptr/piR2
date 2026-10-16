@@ -42,7 +42,10 @@ if (!catalog && !external)
       "../artifacts/simulator/replay-browser",
     );
     fs.mkdirSync(output, { recursive: true });
-    browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-gpu"],
+    });
     const page = await browser.newPage({
         viewport: { width: 1440, height: 1100 },
       }),
@@ -113,6 +116,7 @@ if (!catalog && !external)
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
+    await page.selectOption("#record-type", "clean");
     await page.locator("#seek").evaluate((e) => {
       e.value = e.max;
       e.dispatchEvent(new Event("input", { bubbles: true }));
@@ -127,8 +131,29 @@ if (!catalog && !external)
     await page.selectOption("#precision", "all");
     assert.equal(await page.locator(".precision-card").count(), 3);
     await page.selectOption("#record-type", "profile");
+    await page.locator("#kernel-details").evaluate((element) => {
+      element.open = true;
+    });
     await page.waitForSelector('[data-event-kind="kernel"]');
-    await page.locator('[data-event-kind="kernel"]').first().click();
+    await page.locator("#kernel-timeline").scrollIntoViewIfNeeded();
+    const kernelIndex = await page
+      .locator('[data-event-kind="kernel"]')
+      .evaluateAll((elements) =>
+        elements.findIndex((element) => {
+          const rect = element.getBoundingClientRect();
+          return (
+            document.elementFromPoint(
+              rect.x + rect.width / 2,
+              rect.y + rect.height / 2,
+            ) === element
+          );
+        }),
+      );
+    assert.ok(
+      kernelIndex >= 0,
+      "actual kernel trace must expose a clickable event",
+    );
+    await page.locator('[data-event-kind="kernel"]').nth(kernelIndex).click();
     assert.match(await page.locator("#inspector").innerText(), /kernel|Kernel/);
     assert.match(
       await page.locator("#precision-cards").innerText(),
@@ -243,28 +268,55 @@ if (!catalog && !external)
       await page.locator("#precision-cards").innerText(),
       /当前动作的状态年龄/,
     );
-    assert.equal(await page.locator(".lineage-row").count(), 3);
+    assert.equal(await page.locator(".lineage-row").count(), 0);
+    assert.equal(await page.locator(".task-lane").count(), 6);
     assert.ok(
-      (await page
-        .locator('.lineage-arrow[data-from="cache"][data-to="action"]')
-        .count()) >= 3,
+      await page.locator('.task-lane[data-stage="action"] .task-block').count(),
     );
-    await page
-      .locator(".lineage-row")
-      .first()
-      .locator('[data-kind="action"]')
-      .click();
+    const taskChoices = page.locator(
+      '.task-lane[data-stage="action"] .task-block',
+    );
+    const taskIndex = await taskChoices.evaluateAll((elements) =>
+      elements.findIndex((element) => {
+        const block = element.getBoundingClientRect();
+        const rail = element.closest(".task-rail").getBoundingClientRect();
+        return (
+          block.left >= rail.left &&
+          block.right <= rail.right &&
+          block.width >= 8
+        );
+      }),
+    );
+    assert.ok(
+      taskIndex >= 0,
+      "the current window must contain an unclipped task bar",
+    );
+    const task = taskChoices.nth(taskIndex);
+    await task.click();
     assert.match(
       await page.locator("#inspector").innerText(),
       /feature_sequence|feature_id/,
     );
-    assert.equal(await page.locator(".lineage-row.selected").count(), 1);
-    if (!process.argv.includes("--no-screenshots"))
-      await page.screenshot({
-        path: path.join(output, "desktop-lineage-2s.png"),
-        fullPage: true,
-      });
-    await page.locator("#lineage-follow").click();
+    assert.equal(await page.locator(".task-block.selected").count(), 1);
+    const beforeSlide = await task.evaluate((e) => ({
+      id: e.dataset.block,
+      x: e.getBoundingClientRect().x,
+    }));
+    await page.locator("#seek").evaluate((e) => {
+      e.value = "2.1";
+      e.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const afterSlide = await page
+      .locator(".task-block")
+      .evaluateAll((es, id) => {
+        const e = es.find((x) => x.dataset.block === id);
+        return e ? e.getBoundingClientRect().x : null;
+      }, beforeSlide.id);
+    assert.ok(
+      afterSlide == null || afterSlide < beforeSlide.x,
+      "measured blocks should move left as the viewport follows time",
+    );
+    await page.locator("#timeline-follow").click();
     // Rapid backward/forward seek keeps the shared clock authoritative.
     await page.locator("#seek").evaluate((e) => {
       for (const t of [3, 0.4, 2.4, 0.2]) {
@@ -477,14 +529,7 @@ if (!catalog && !external)
         new RegExp(scope),
       );
       if (scope === "preparation_transfer") {
-        assert.equal(
-          await page
-            .locator(
-              '.lineage-arrow[data-to="vlm"], .lineage-arrow[data-to="action"]',
-            )
-            .count(),
-          0,
-        );
+        assert.equal(await page.locator(".task-block").count(), 0);
         assert.match(
           await page.locator("#evidence-note").innerText(),
           /不执行 VLM\/DiT/,
@@ -492,14 +537,7 @@ if (!catalog && !external)
       }
     }
     await page.selectOption("#scope", "custom_unknown");
-    assert.equal(
-      await page
-        .locator(
-          '.lineage-arrow[data-to="vlm"], .lineage-arrow[data-to="action"]',
-        )
-        .count(),
-      0,
-    );
+    assert.equal(await page.locator(".task-block").count(), 0);
     assert.match(await page.locator("#evidence-note").innerText(), /边界未知/);
     withoutPairing = true;
     await page.selectOption("#evidence-mode", "deployment");

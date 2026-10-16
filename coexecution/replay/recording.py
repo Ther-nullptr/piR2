@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from .producer import emit_event, source_id, validate_sink
 from .schema import VERSION, interval, optional_number, write_json
 
 
@@ -35,7 +36,14 @@ class ReplayRecorder:
     physical controller; partial evidence is explicitly labelled.
     """
 
-    def __init__(self, *, max_frames=1024, max_bytes=512 * 1024 * 1024):
+    def __init__(
+        self,
+        *,
+        max_frames=1024,
+        max_bytes=512 * 1024 * 1024,
+        event_sink=None,
+        source_namespace="",
+    ):
         if (
             type(max_frames) is not int
             or max_frames < 1
@@ -49,6 +57,8 @@ class ReplayRecorder:
         self.error = None
         self.initial_state = None
         self._finished = False
+        validate_sink(event_sink)
+        self.event_sink, self.source_namespace = event_sink, source_namespace
 
     def _capture(self, observation, *, tick, phase, wall_s, computed_s):
         import numpy as np
@@ -116,6 +126,26 @@ class ReplayRecorder:
             self.dropped_frames += 1
             return False
         self.frames, self.mapping, self.used_bytes = frames, mapping, used_bytes
+        emit_event(
+            self.event_sink,
+            "robot.frame.recorded",
+            t_s=wall_s,
+            sources={
+                "episode_id": self.source_namespace or None,
+                "frame_id": source_id(self.source_namespace, "frame", len(mapping) - 1),
+                "observation_id": source_id(
+                    self.source_namespace,
+                    "observation",
+                    0 if phase == "initial" else tick + 1,
+                ),
+            },
+            payload={
+                **mapping[-1],
+                "cameras": list(owned),
+                "media_status": "pending_encoding",
+                "recording_status": self.status(),
+            },
+        )
         return True
 
     def initial(self, observation, *, capture_s, computed_s=None):
@@ -207,4 +237,23 @@ class ReplayRecorder:
         }
         path = output / f"{stem}-replay.json"
         write_json(path, data)
+        emit_event(
+            self.event_sink,
+            "robot.recording.failed"
+            if self.error
+            else "robot.media.ready"
+            if media
+            else "robot.media.unavailable",
+            sources={"episode_id": self.source_namespace or None},
+            payload={
+                "cameras": sorted(media),
+                "frame_count": len(self.mapping),
+                "recording_status": self.status(),
+                "media_status": "failed"
+                if self.error
+                else "encoded"
+                if media
+                else "unavailable",
+            },
+        )
         return {"path": path.name, **self.status()}

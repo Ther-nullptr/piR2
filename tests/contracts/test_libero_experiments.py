@@ -77,6 +77,20 @@ def test_execution_clock_plan_default_and_case_override(plan):
         assert command[command.index("--execution-clock") + 1] == expected
 
 
+def test_runtime_receipt_is_explicit_and_reaches_only_model_workers(plan):
+    plan["runtime_receipt"] = True
+    plan["conditions"][1]["runtime_receipt"] = False
+    module().validate_plan(plan)
+    for case, enabled in zip(plan["conditions"], (True, False), strict=True):
+        commands = module().build_commands(plan, case, "deployment", Path("/out"))
+        assert ("--runtime-receipt" in commands["action"]) is enabled
+        assert ("--runtime-receipt" in commands["vlm"]) is enabled
+        assert "--runtime-receipt" not in commands["evaluate"]
+    plan["runtime_receipt"] = "yes"
+    with pytest.raises(ValueError, match="runtime_receipt"):
+        module().validate_plan(plan)
+
+
 @pytest.mark.parametrize("change", ["variant", "protocol", "fixed", "unknown"])
 def test_ready_plan_rejects_incompatible_settings_before_launch(plan, change):
     plan["execution_clock"] = "ready"
