@@ -21,6 +21,11 @@ import sys
 import time
 from pathlib import Path
 
+from coexecution.libero.preprocessing import (
+    ImageResolutionConfig,
+    add_image_arguments,
+)
+
 from .collection import METRICS, postprocess, stage_command, validate_workers
 from .hardware import (
     foreign_pids,
@@ -171,6 +176,7 @@ def validate_plan(plan):
         "dataset",
         "groot_root",
         "frames",
+        "image_resolution",
         "warmup",
         "seed",
         "torch_threads",
@@ -182,6 +188,7 @@ def validate_plan(plan):
         raise ValueError(
             "Worker common options cannot override case/device/capture arguments"
         )
+    ImageResolutionConfig(common.get("image_resolution"))
     for key, minimum in (("frames", 1), ("warmup", 0), ("torch_threads", 1)):
         if type(common.get(key)) is not int or common[key] < minimum:
             raise ValueError(f"Invalid worker {key}")
@@ -669,6 +676,11 @@ def prepare(args):
             "wait_poll_s": 2,
         },
         "worker_common": {
+            **(
+                {"image_resolution": args.image_resolution}
+                if args.image_resolution is not None
+                else {}
+            ),
             "frames": args.frames,
             "warmup": args.warmup,
             "seed": args.seed,
@@ -755,6 +767,7 @@ def main(argv=None):
     create.add_argument("--warmup", type=int, default=10)
     create.add_argument("--iterations", type=int, default=30)
     create.add_argument("--repeats", type=int, default=3)
+    add_image_arguments(create)
     create.add_argument("--frames", type=int, default=8)
     create.add_argument("--seed", type=int, default=1000)
     create.add_argument("--torch-threads", type=int, default=2)
@@ -780,6 +793,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     args.plan = args.plan.resolve()
     if args.command == "prepare":
+        try:
+            ImageResolutionConfig(args.image_resolution)
+        except ValueError as error:
+            parser.error(str(error))
         if (
             any(
                 value < 1

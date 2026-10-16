@@ -413,6 +413,10 @@ def run_group(args):
                     "parameter_object_aliases": 0,
                     "outputs": "Both workers complete before CPU snapshots; the next graph replay cannot overwrite a retained result.",
                     "features": workload.feature_records,
+                    "image_resolution": {
+                        role: scope.evidence()
+                        for role, scope in workload.image_resolutions.items()
+                    },
                 },
                 "placement": {
                     **workload.devices,

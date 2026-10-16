@@ -216,6 +216,7 @@ def complete_graph_interval(before, after):
 
 
 def build_parser():
+    from coexecution.libero.preprocessing import add_image_arguments
     from coexecution.optimization.config import add_optimization_arguments
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -257,6 +258,7 @@ def build_parser():
     parser.add_argument("--video-backend", default="torchcodec")
     parser.add_argument("--seed", type=int, default=127)
     parser.add_argument("--torch-threads", type=int, default=2)
+    add_image_arguments(parser)
     add_optimization_arguments(parser)
     return parser
 
@@ -659,6 +661,7 @@ def run(args):
 
     if args.upstream is not None:
         sys.path.insert(0, str(args.upstream))
+    from coexecution.libero.preprocessing import ImageResolutionScope, image_config
     from coexecution.libero.service import load_core
     from coexecution.optimization.session import GrootOptimizations
     from scripts.libero_experiment_utils import checkpoint_identity
@@ -697,7 +700,9 @@ def run(args):
         for key, value in actions.items():
             retained[f"{label}/{key}"] = value.copy()
 
+    images = ImageResolutionScope(policy, image_config(args))
     with (
+        images,
         torch.cuda.device(args.device),
         torch.inference_mode(),
         (args.output / "samples.jsonl").open("w") as stream,
@@ -964,6 +969,7 @@ def run(args):
         "profiles": profiles,
     }
     np.savez_compressed(args.output / "actions.npz", **retained)
+    result["image_resolution"] = images.evidence()
     _write(args.output / "results.json", result)
     print(json.dumps(result["latency"], indent=2), flush=True)
     return result
@@ -973,6 +979,9 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     try:
+        from coexecution.libero.preprocessing import image_config
+
+        image_config(args)
         reference_mode(args.modes)
         for precision in args.precisions:
             for mode in args.modes:

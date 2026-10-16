@@ -168,6 +168,7 @@ class FlowWorkload:
             prepare_observations,
         )
         from coexecution.libero.measurement import _observations
+        from coexecution.libero.preprocessing import ImageResolutionScope, image_config
         from coexecution.libero.service import load_core
         from coexecution.optimization.session import GrootOptimizations
         from coexecution.replay.assets import export_observations
@@ -203,7 +204,11 @@ class FlowWorkload:
                         lambda _m, _a, _o, name=name: self._boundary(name)
                     )
                 )
+        self.image_resolutions = {}
         for role, policy in self.policies.items():
+            self.image_resolutions[role] = self.stack.enter_context(
+                ImageResolutionScope(policy, image_config(self.args))
+            )
             with torch.cuda.device(self.devices[role]):
                 session = self.stack.enter_context(
                     GrootOptimizations(policy, configuration(self.args, role))
@@ -250,6 +255,8 @@ class FlowWorkload:
             stream = self.streams["vlm"]
             with torch.cuda.device(self.devices["vlm"]), torch.cuda.stream(stream):
                 result = self.engines["vlm"].vlm(inputs.backbone)
+                if self.image_resolutions["vlm"].config.size is not None:
+                    self.image_resolutions["vlm"].record_features(result)
                 source = {key: value.detach().clone() for key, value in result.items()}
             stream.synchronize()
             with torch.cuda.device(self.devices["dit"]):
@@ -258,6 +265,8 @@ class FlowWorkload:
                     for key, value in source.items()
                 }
                 torch.cuda.synchronize(self.devices["dit"])
+            if self.image_resolutions["dit"].config.size is not None:
+                self.image_resolutions["dit"].record_features(resident)
             self.reference_features.append(resident)
             self.feature_records.append(
                 {

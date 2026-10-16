@@ -45,6 +45,26 @@ def valid_plan():
 
 
 class CampaignTests(unittest.TestCase):
+    def test_image_resolution_is_validated_and_forwarded_without_null_cli_values(self):
+        for size in (None, 128, 192):
+            plan = valid_plan()
+            plan.update(python="/python", cpu_affinity=None)
+            plan["worker_common"]["image_resolution"] = size
+            CAMPAIGN.validate_plan(plan)
+            command = COLLECTION.stage_command(
+                plan, plan["cases"][0], "timing", Path("/out"), 0, "GPU-test"
+            )
+            if size is None:
+                self.assertNotIn("--image-resolution", command)
+            else:
+                self.assertEqual(
+                    command[command.index("--image-resolution") + 1], str(size)
+                )
+        for size in (False, 0, -1, "128"):
+            plan["worker_common"]["image_resolution"] = size
+            with self.assertRaises(ValueError):
+                CAMPAIGN.validate_plan(plan)
+
     def test_strict_clean_gate(self):
         sample = {"compute_processes": [], "utilization_gpu": 0, "memory_used_mib": 200}
         self.assertTrue(HARDWARE.is_clean(sample))

@@ -478,6 +478,7 @@ def main():
         "scripts/serve_libero_protocol.py",
         "scripts/libero_inference_backend.py",
         "scripts/libero_model_loading.py",
+        "coexecution/libero/preprocessing.py",
         "coexecution/libero/loading.py",
         "coexecution/libero/backend.py",
         "coexecution/libero/service.py",

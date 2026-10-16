@@ -1,6 +1,7 @@
 """Real LIBERO fixtures and fixed piR2 bootstrap, loaded only by the GPU worker."""
 
 import hashlib
+from contextlib import ExitStack
 
 import torch
 
@@ -9,6 +10,23 @@ from .common import metadata, save, tensor_digest
 
 class LiberoWorkload:
     def __init__(self, args):
+        self.stack = ExitStack()
+        try:
+            self._load(args)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def close(self):
+        self.stack.close()
+
+    def _load(self, args):
         import numpy as np
         from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
         from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
@@ -19,6 +37,11 @@ class LiberoWorkload:
 
         self.BatchFeature = BatchFeature
         self.policy = load_core(args.checkpoint, args.output, "cuda:0")
+        from coexecution.libero.preprocessing import ImageResolutionScope, image_config
+
+        self.image_resolution = self.stack.enter_context(
+            ImageResolutionScope(self.policy, image_config(args))
+        )
         self.model = self.policy.model.eval()
         self.head = self.model.action_head
         if not self.head.config.streaming or self.head.config.action_horizon != 40:
@@ -30,7 +53,9 @@ class LiberoWorkload:
             def count(_module, _inputs, _output, label=label):
                 self.counts[label] += 1
 
-            self.hooks.append(module.register_forward_hook(count))
+            handle = module.register_forward_hook(count)
+            self.hooks.append(handle)
+            self.stack.callback(handle.remove)
         modalities = {
             key: value
             for key, value in self.policy.modality_configs.items()
@@ -134,7 +159,10 @@ class LiberoWorkload:
         torch.cuda.current_stream().synchronize()
 
     def vlm(self, index):
-        return self.model.backbone(self.backbone_inputs[index])
+        features = self.model.backbone(self.backbone_inputs[index])
+        if self.image_resolution.config.size is not None:
+            self.image_resolution.record_features(features)
+        return features
 
     def dit(self, features, index):
         return self.model.forward_dit_action_only(

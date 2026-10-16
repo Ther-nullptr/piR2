@@ -91,7 +91,10 @@ def validate_plan(plan):
         raise ValueError("Declare two distinct valid worker ports")
     if not plan["protocols"] or set(plan["protocols"]) - {"algorithm", "deployment"}:
         raise ValueError("Protocols must be algorithm and/or deployment")
+    from coexecution.libero.preprocessing import ImageResolutionConfig
+
     for settings in (plan, *plan["conditions"]):
+        ImageResolutionConfig(settings.get("image_resolution"))
         transport = settings.get("feature_transport", "numpy_fp32")
         rpc = settings.get("feature_rpc", "separate")
         validate_feature_options(transport, rpc)
@@ -182,6 +185,10 @@ def build_commands(plan, case, protocol, output):
         )
         if fixed_delay is not None:
             deployment_controls.extend(["--deployment-fixed-delay", str(fixed_delay)])
+    image_controls = []
+    resolution = case.get("image_resolution", plan.get("image_resolution"))
+    if resolution is not None:
+        image_controls = ["--image-resolution", str(resolution)]
     for role in ("action", "vlm"):
         commands[role] = [
             str(plan["model_python"]),
@@ -200,6 +207,7 @@ def build_commands(plan, case, protocol, output):
             "--output",
             str(output / (role + "-server")),
             *case["flags"],
+            *image_controls,
             *feature_controls,
         ]
     if layout == "paired":

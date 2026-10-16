@@ -65,6 +65,36 @@ def test_commands_use_declared_ports_full_suite_and_separate_workers(plan):
     assert evaluate[evaluate.index("--task-ids") + 1 :] == [str(i) for i in range(10)]
 
 
+@pytest.mark.parametrize("layout", ["split", "paired"])
+def test_image_resolution_plan_default_override_and_explicit_disable(plan, layout):
+    plan["server_layout"] = layout
+    plan["image_resolution"] = 192
+    plan["conditions"][1]["image_resolution"] = 128
+    module().validate_plan(plan)
+    for case, size in zip(plan["conditions"], (192, 128), strict=True):
+        commands = module().build_commands(plan, case, "deployment", Path("/out"))
+        roles = ("paired",) if layout == "paired" else ("action", "vlm")
+        for role in roles:
+            assert commands[role][
+                commands[role].index("--image-resolution") + 1
+            ] == str(size)
+        assert "--image-resolution" not in commands["evaluate"]
+    plan["conditions"][1]["image_resolution"] = None
+    commands = module().build_commands(
+        plan, plan["conditions"][1], "deployment", Path("/out")
+    )
+    assert all("--image-resolution" not in command for command in commands.values())
+
+
+@pytest.mark.parametrize("size", [False, 0, -32, 128.0, "128"])
+@pytest.mark.parametrize("location", ["plan", "case"])
+def test_invalid_image_resolution_fails_before_worker_launch(plan, size, location):
+    target = plan if location == "plan" else plan["conditions"][0]
+    target["image_resolution"] = size
+    with pytest.raises(ValueError, match="Image resolution"):
+        module().validate_plan(plan)
+
+
 def test_execution_clock_plan_default_and_case_override(plan):
     plan["execution_clock"] = "ready"
     plan["conditions"][1]["execution_clock"] = "paced"

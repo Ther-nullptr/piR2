@@ -28,6 +28,7 @@ def main():
         "tests/contracts/test_input_preparation.py",
         "tests/contracts/test_tokenization.py",
         "tests/contracts/test_image_preparation.py",
+        "tests/contracts/test_image_resolution.py",
         "tests/contracts/test_compiled_host_guards.py",
         "tests/contracts/test_vlm_patching.py",
         "tests/contracts/test_policy_vlm.py",

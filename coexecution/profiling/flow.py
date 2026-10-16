@@ -7,6 +7,7 @@ import re
 import sys
 from pathlib import Path
 
+from coexecution.libero.preprocessing import add_image_arguments, image_config
 from coexecution.optimization.config import OptimizationConfig
 
 from .common import save
@@ -18,6 +19,7 @@ PROFILE_ROOT = ROOT / "configs/quantization/groot-libero-spatial-ada"
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
+    add_image_arguments(result)
     for name in ("checkpoint", "dataset", "output"):
         result.add_argument("--" + name, type=Path, required=True)
     result.add_argument(
@@ -119,6 +121,7 @@ def cases(args):
 
 
 def validate_options(args):
+    image_config(args)
     cases(args)
     validate_start_gate(args.start_gate, args.gate_timeout_s)
     if args.cuda_profiler_range and not args.profile_iterations:
