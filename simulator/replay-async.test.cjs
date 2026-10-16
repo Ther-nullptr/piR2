@@ -196,6 +196,11 @@ test("complete work timeline retains unused tail and distinct bootstrap/prefetch
   assert.equal(tracks[1].blocks[2].sourceId, "v2");
   assert.equal(T.phase(tracks[1].blocks[2], 0.27).key, "unused");
   assert.equal(tracks[2].blocks[1].basis, "async_policy_rpc");
+  assert.equal(
+    tracks[3].blocks.find((b) => b.phaseKind === "execution").basis,
+    "env_step",
+  );
+  assert.match(T.basisLabel("env_step"), /无额外节拍等待/);
   assert.ok(tracks[2].blocks[1].description.includes("Overlap allowed"));
   assert.ok(Math.abs(R.episodeEnd(row.episode) - 0.28) < 1e-10);
   assert.ok(Math.abs(R.controlledEnd(row.episode) - 0.24) < 1e-10);
