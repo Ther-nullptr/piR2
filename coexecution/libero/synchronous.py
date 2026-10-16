@@ -19,7 +19,7 @@ from scripts.libero_queue_trace import QueueTrace
 
 def validate_synchronous_controls(args):
     coupling = getattr(args, "execution_coupling", "asynchronous")
-    if coupling not in ("asynchronous", "synchronous"):
+    if coupling not in ("asynchronous", "synchronous", "one_step_async"):
         raise ValueError("Unknown execution coupling")
     chunk = getattr(args, "synchronous_chunk_steps", 8)
     if type(chunk) is not int or chunk < 1:
@@ -29,10 +29,17 @@ def validate_synchronous_controls(args):
         raise ValueError(
             "Synchronous warmup RPC timeout must be positive and fit socket milliseconds"
         )
-    if coupling != "synchronous":
+    if coupling == "asynchronous":
         return
+    if coupling == "one_step_async" and (
+        chunk != 1 or getattr(args, "execution_clock", "paced") != "ready"
+    ):
+        raise ValueError(
+            "One-step async requires ready execution and exactly one prefix step"
+        )
+    name = "Synchronous" if coupling == "synchronous" else "One-step async"
     if args.protocol != "deployment" or args.variant != "flow":
-        raise ValueError("Synchronous execution requires deployment Flow")
+        raise ValueError(f"{name} execution requires deployment Flow")
     if (
         args.server_layout != "split"
         or args.feature_transport != "numpy_fp32"
@@ -44,7 +51,7 @@ def validate_synchronous_controls(args):
         or args.artificial_compute_wait
     ):
         raise ValueError(
-            "Synchronous Flow requires one ordinary action endpoint without paired/resident "
+            f"{name} Flow requires one ordinary action endpoint without paired/resident "
             "feature exchange, asynchronous scheduling controls or artificial waits"
         )
 

@@ -1,11 +1,11 @@
 # Two timing protocols
 
-Both protocols use real VLM image features, current robot state, the same checkpoint/data identities and paired initial conditions. They answer different questions and their scores must not be pooled.
+Both protocols use real VLM image features, the same checkpoint/data identities and paired initial conditions. Their deployment coupling selects the image/state age and inference/execution relationship; the table describes the original cached-worker deployment baseline. Scores from different protocols or coupling modes must not be pooled.
 
 | Protocol | Observation/action timing | Purpose |
 |---|---|---|
 | Algorithm | Image age fixed at 3 ticks (150ms); action release fixed at 1 tick (50ms); current state | Compare behavior at identical simulated delays |
-| Deployment | Absolute wall-clock 20Hz control; asynchronous real VLM and action workers | Measure behavior with actual processing/transport delays |
+| Deployment (cached asynchronous baseline) | Absolute wall-clock 20Hz control; asynchronous real VLM and action workers | Measure behavior with actual processing/transport delays |
 
 In the algorithm protocol, computation waits do not advance physics. Each method executes the committed prefix, then uses the next legal segment. The initial missing image history is explicitly padded. A GPU contract check adds 100ms wait per call and compares actions and final images; this is a timing check, not a success-rate evaluation.
 
@@ -225,3 +225,63 @@ python simulator/serve.py --replay .local/synchronous-replay/catalog.json
 映射，推理期间保持已有帧，不伪造运动；VLM→DiT→已执行动作仍可追溯。
 相机拷贝与 trace 收集属于 instrumented debug 成本，视频编码在控制结束后执行。
 少量任务样例不代表完整 Spatial 套件成功率。
+
+
+### One-step asynchronous policy/execution / 单步异步策略与动作执行
+
+`--execution-coupling one_step_async --execution-clock ready
+--execution-prefix-steps 1` 是独立协议。它保留一个普通 Flow action server，每次请求
+在同一服务内完整运行真实 VLM 和 Flow4。原有 `asynchronous` 仍指独立 VLM/DiT
+缓存控制器，`synchronous` 仍按推理、执行顺序运行；三者不能混称。
+
+先用观测0完成一次计入 scored control 的 bootstrap 请求，得到动作0。执行动作 k
+之前，主线程复制当前观测 k，将它交给专属模型线程计算动作 k+1；主线程同时执行
+当前结果的**第一个动作**。该原子步结束后，若下一结果未完成，控制器明确等待，
+不补执行旧计划后缀，也不使用 fallback。bootstrap 的源/目标为0/0，随后为0/1、
+1/2等：图像和状态一起滞后一个**物理步**，没有未来状态预测或补偿算法。
+原生解码长度保持 checkpoint 配置，未采纳的动作后缀计入丢弃数量。
+
+每个 `env.step` 仍推进0.05秒仿真时间，但 `ready` 不为它额外等待50ms。
+因此重叠预算来自实际的 `env.step` wall 区间，不等同于50ms；后端渲染和模型同卡
+争用也包含在实测值中。`observation_lag_ticks` 与 capture-to-apply wall AoI 分别
+报告，一个旧物理步不等于额外50ms wall AoI。此实现受
+[The Speedup Paradox §3.1](https://arxiv.org/pdf/2606.28529v3) 启发，但使用真实并发
+RPC/仿真执行；论文中的历史观测抽象和理想周期公式不能替代此处的测量。
+
+```bash
+python scripts/evaluate_libero_protocol.py \
+  --protocol deployment --variant flow --port 5570 \
+  --execution-coupling one_step_async --execution-clock ready \
+  --execution-prefix-steps 1 --task-ids 0 3 --episodes-per-task 1 \
+  --max-steps 300 --record-replay --replay-max-frames 301 \
+  --output .local/one-step-async/deployment
+```
+
+`--execution-prefix-steps` 是 `--synchronous-chunk-steps` 的兼容别名。experiment plan
+支持同名下划线字段，逐 condition 覆盖全局；同层别名冲突会报错。该模式只支持
+`ready`、prefix1、deployment Flow 和单个普通 action endpoint；paced、πR²、paired/
+resident 特征传输、服务等待下限、视觉限频与 fixed-delay 均明确拒绝。
+
+专属后台线程创建、使用并销毁自己的 PolicyClient/ZeroMQ context；主线程独占
+MuJoCo 观测和步进，提交的是独立只读数组。每任务同 endpoint 完整 warmup 后只
+重置一次 RNG；warmup socket 超时默认900秒，正式请求恢复120秒的 send/receive
+各自上限。等待 Future 的上限覆盖两次 socket 上限和30秒余量，关闭线程也有上限。
+超时、模型或仿真异常保留不完整 trace 并令实验失败，不会被当作成功 episode。
+
+`request_id`（兼容 `request_tick`）标识唯一策略请求，`target_tick` 是它可能执行的
+目标步；`source_tick` 独立标识源观测步。bootstrap request0与预取 request1 都可源于
+观测0，VLM feature_sequence 使用唯一 request_id，不能用 source_tick 合并它们。
+`policy_request_submitted`、`policy_rpc_started/completed` 分别记录排队提交和模型线程
+实际 RPC 边界；VLM/DiT 的 server stage 时间另存，均不是 kernel-only 时间。
+`cycle_phase` 包含 inference、execution、wait、drain；异步 inference 不标为全程
+暂停仿真。`one_step_async_request` 保存原生计划和采纳状态，
+`one_step_async_execution` 与 `control_tick` 才证明实际动作执行。
+
+首次成功、环境终止或 max_steps 后不再执行动作。已在飞行的最终推测请求必须排空，
+记录为 unused；已知最后一步达到 max_steps 时不额外预取。`control_end` 截止控制
+窗口，`async_work_end` 截止全部已提交策略工作，末尾 drain 分开报告。`policy_calls`、
+forward_counts 和完整 RPC 分布包含最终未用请求；`adopted_policy_calls`、实际执行
+步数、丢弃后缀另列。queue report 的 `requests` 保留控制窗口的阶段暴露和 censoring，
+`work_requests` 保留整个 bootstrap/推测/排空过程，不把 drain 隐去。
+`measured_inference_execution_overlap_seconds` 是实际 RPC 与实际执行区间的交集；
+服务端 VLM/DiT 交集另列，不能从“提交在步进之前”推断一定存在 GPU 重叠。
