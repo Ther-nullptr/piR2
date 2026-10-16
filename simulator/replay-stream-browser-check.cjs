@@ -870,6 +870,147 @@ async function main() {
       },
     );
 
+    const matrix = [
+      [1, 1],
+      [4, 1],
+      [4, 2],
+      [8, 1],
+      [8, 4],
+    ].flatMap(([k, d]) =>
+      ["bf16", "w8a8", "w4a4"].map((precision) => ({
+        id: `${precision}-k${k}-d${d}`,
+        kind: "deployment",
+        precision,
+        execution_clock: "ready",
+        execution_coupling: "chunked_async",
+        execution_prefix_steps: k,
+        async_overlap_steps: d,
+        path: `runs/${precision}-k${k}-d${d}.json`,
+        episodes: 0,
+        label: fixtureNote,
+      })),
+    );
+    await check(
+      "matrix selectors load one cohort and keep K/D through populated and empty catalog refresh",
+      async ({ page, catalog: data, requests }) => {
+        const ready = () =>
+          page.waitForFunction(
+            () =>
+              document.querySelector("#data-status").dataset.state === "ready",
+          );
+        const ids = () =>
+          page
+            .locator(".run-select")
+            .evaluateAll((xs) => xs.map((x) => x.value));
+        assert.deepEqual(await ids(), [
+          "bf16-k4-d2",
+          "w8a8-k4-d2",
+          "w4a4-k4-d2",
+        ]);
+        assert.equal(
+          requests.filter((p) => p.includes("/api/replay/run/")).length,
+          3,
+          "only the selected schedule is fetched",
+        );
+        await page.selectOption("#execution-prefix-steps", "8");
+        await ready();
+        assert.equal(
+          await page.locator("#async-overlap-steps").inputValue(),
+          "1",
+          "invalid D2 falls back to recorded D1",
+        );
+        await page.selectOption("#async-overlap-steps", "4");
+        await ready();
+        assert.deepEqual(await ids(), [
+          "bf16-k8-d4",
+          "w8a8-k8-d4",
+          "w4a4-k8-d4",
+        ]);
+        assert.equal(
+          requests.filter((p) => p.includes("/api/replay/run/")).length,
+          9,
+        );
+        const before = await selection(page);
+        data.runs.push(
+          ...matrix
+            .filter(
+              (r) =>
+                r.execution_prefix_steps === 8 && r.async_overlap_steps === 4,
+            )
+            .map((r) => ({
+              ...r,
+              id: r.id + "-repeat",
+              path: `runs/${r.id}-repeat.json`,
+            })),
+        );
+        data.created_at = "matrix-repetition-added";
+        await page.waitForSelector(
+          '.run-select option[value="bf16-k8-d4-repeat"]',
+          { state: "attached", timeout: 6500 },
+        );
+        assert.deepEqual(await selection(page), before);
+        assert.equal(
+          requests.filter((p) => p.includes("/api/replay/run/")).length,
+          9,
+          "refresh does not fetch unselected repetitions",
+        );
+        data.runs = [];
+        data.created_at = "matrix-empty-refresh";
+        await page.waitForFunction(
+          () =>
+            document
+              .querySelector("#catalog-meta")
+              .textContent.includes("matrix-empty-refresh"),
+          null,
+          { timeout: 6500 },
+        );
+        assert.equal(
+          await page.locator("#execution-prefix-steps").inputValue(),
+          "8",
+        );
+        assert.equal(
+          await page.locator("#async-overlap-steps").inputValue(),
+          "4",
+        );
+        assert.deepEqual(await selection(page), before);
+        data.runs = matrix.filter((r) => r.execution_prefix_steps === 4);
+        data.created_at = "matrix-selected-schedule-removed";
+        await page.waitForFunction(
+          () =>
+            document.querySelector("#execution-prefix-steps").value === "4" &&
+            document.querySelector("#data-status").dataset.state === "ready",
+          null,
+          { timeout: 6500 },
+        );
+        assert.equal(
+          await page.locator("#async-overlap-steps").inputValue(),
+          "1",
+        );
+        assert.deepEqual(await ids(), [
+          "bf16-k4-d1",
+          "w8a8-k4-d1",
+          "w4a4-k4-d1",
+        ]);
+      },
+      {
+        catalog: {
+          ...catalog(false),
+          default_view: "deployment",
+          default_execution_coupling: "chunked_async",
+          default_execution_clock: "ready",
+          default_execution_prefix_steps: 4,
+          default_async_overlap_steps: 2,
+          runs: matrix,
+        },
+        run: (id) => ({
+          ...run(id),
+          ...matrix.find((r) => r.id === id),
+          episodes: [],
+          clean_requests: [],
+        }),
+      },
+    );
+
     await check(
       "legacy catalogs keep static replay and never probe SSE or snapshots",
       async ({ page, requests }) => {
