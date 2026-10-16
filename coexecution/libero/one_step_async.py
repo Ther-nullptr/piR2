@@ -1,8 +1,8 @@
-"""One-step lookahead with real policy/physics overlap and explicit waiting.
+"""Bounded lookahead with real policy/physics overlap and explicit waiting.
 
-One owned worker computes a complete VLM + Flow4 request from the observation
-before the current command. The simulator owner executes exactly one command,
-then waits for the next result. There is no fallback or extra prefix consumption.
+One owned worker computes a complete VLM + Flow4 request D physical steps before
+the next K-step native prefix. The simulator finishes its committed prefix, then
+adopts or waits. Legacy one_step_async is the version1 K1/D1 compatibility mode.
 """
 
 import copy
@@ -11,6 +11,7 @@ import math
 import queue
 import threading
 from concurrent.futures import Future
+from itertools import pairwise
 
 import numpy as np
 
@@ -175,7 +176,7 @@ def _stage_events(events, request):
         **timing,
         request_elapsed_s=ab - aa,
         valid_start_tick=request["target_tick"],
-        valid_end_tick=request["target_tick"] + 1,
+        valid_end_tick=request["target_tick"] + request.get("prefix_steps", 1),
     )
     return timing
 
@@ -186,12 +187,15 @@ def _intersection_seconds(inference, execution):
     )
 
 
-def run_one_step_async_loop(
+def run_chunked_async_loop(
     step_fn,
     observe_fn,
     planner_factory,
     *,
     max_steps,
+    execution_prefix_steps=1,
+    async_overlap_steps=1,
+    _legacy_one_step=False,
     clock,
     trace,
     recorder=None,
@@ -200,7 +204,7 @@ def run_one_step_async_loop(
     request_timeout_seconds=270,
     shutdown_timeout_seconds=270,
 ):
-    """Execute exactly one command per result, with actual concurrent inference.
+    """Commit native prefixes; prefetch D physical steps before each next boundary.
 
     The factory, optional prepare(), plan() and close() run only on the owned
     worker. initialize(worker) may perform bounded warmup/reset calls before the
@@ -213,6 +217,16 @@ def run_one_step_async_loop(
         for t in (request_timeout_seconds, shutdown_timeout_seconds)
     ):
         raise ValueError("Worker timeouts must be positive and finite")
+    if (
+        type(execution_prefix_steps) is not int
+        or type(async_overlap_steps) is not int
+        or not 1 <= async_overlap_steps <= execution_prefix_steps
+    ):
+        raise ValueError("Require integer 1 <= overlap D <= prefix K")
+    chunk, depth = execution_prefix_steps, async_overlap_steps
+    coupling = "one_step_async" if _legacy_one_step else "chunked_async"
+    if _legacy_one_step and (chunk, depth) != (1, 1):
+        raise ValueError("The version1 one-step protocol requires K=D=1")
     events = QueueTrace(clock=clock.now, max_records=max_steps * 40 + 4096)
     worker = None
     pending = None
@@ -236,6 +250,7 @@ def run_one_step_async_loop(
                 if key.startswith("video.")
             },
             "submitted_s": clock.now(),
+            "prefix_steps": min(chunk, max_steps - target_tick),
         }
         events.emit("policy_request_submitted", t_s=request["submitted_s"], **request)
 
@@ -259,7 +274,7 @@ def run_one_step_async_loop(
                     source_tick=source_tick,
                     started=request["rpc_started_s"],
                     completed=request["rpc_completed_s"],
-                    chunk_steps=1,
+                    chunk_steps=chunk,
                 )
                 if audit["frame_hashes"] != request["frame_hashes"]:
                     raise ValueError(
@@ -284,7 +299,7 @@ def run_one_step_async_loop(
                     simulation_paused=target_tick == 0,
                     source_capture_s=capture_s,
                     frame_hashes=audit["frame_hashes"],
-                    execution_coupling="one_step_async",
+                    execution_coupling=coupling,
                     execution_clock="ready",
                 )
                 return request
@@ -317,35 +332,82 @@ def run_one_step_async_loop(
             unused_reason=unused_reason,
         )
         if adopted:
-            timeline.publish(
+            publication = timeline.publish(
                 request["request_id"],
                 request["target_tick"],
-                request["actions"][:1],
+                request["actions"][: request["prefix_steps"]],
                 next_tick=len(ticks),
             )
+            if (
+                publication.installed != request["prefix_steps"]
+                or publication.expired
+                or publication.protected
+            ):
+                raise RuntimeError("Accepted prefix conflicts with command ownership")
+            if not _legacy_one_step:
+                timeline.reserve(request["target_tick"], request["prefix_steps"])
             events.emit(
                 "action_adopted",
                 t_s=accepted,
                 request_tick=request["request_tick"],
                 request_id=request["request_id"],
                 target_tick=request["target_tick"],
-                installed_slots=1,
+                installed_slots=request["prefix_steps"],
                 expired_slots=0,
                 protected_slots=0,
                 ready_to_adopt_seconds=accepted - request["rpc_completed_s"],
             )
-        request["adopted_s"] = accepted if adopted else None
-        events.emit(
-            "one_step_async_request",
-            t_s=accepted,
-            **{key: value for key, value in request.items() if key != "actions"},
-            native_decoded_actions=request["actions"].tolist(),
-            accepted_prefix_steps=1 if adopted else 0,
-            unused_plan_suffix_slots=len(request["actions"]) - int(adopted),
+        request.update(
+            adopted_s=accepted if adopted else None,
+            received_s=accepted,
+            accepted_prefix_steps=request["prefix_steps"] if adopted else 0,
+            executed_prefix_steps=0,
             disposition="adopted" if adopted else "unused",
             unused_reason=unused_reason,
         )
+        if _legacy_one_step:
+            events.emit(
+                "one_step_async_request",
+                t_s=accepted,
+                **{
+                    key: value
+                    for key, value in request.items()
+                    if key
+                    not in (
+                        "actions",
+                        "prefix_steps",
+                        "received_s",
+                        "executed_prefix_steps",
+                    )
+                },
+                native_decoded_actions=request["actions"].tolist(),
+                unused_plan_suffix_slots=len(request["actions"]) - int(adopted),
+            )
+        elif not adopted:
+            finalize(request)
         return request
+
+    def finalize(request):
+        if _legacy_one_step or request.get("finalized_s") is not None:
+            return
+        request["finalized_s"] = clock.now()
+        accepted = request["accepted_prefix_steps"]
+        executed = request["executed_prefix_steps"]
+        native = len(request["actions"])
+        request.update(
+            unexecuted_accepted_prefix_steps=accepted - executed,
+            discarded_native_suffix_steps=native - accepted,
+            unused_plan_suffix_slots=native - executed,
+        )
+        events.emit(
+            "chunked_async_request",
+            t_s=request["finalized_s"],
+            **{key: value for key, value in request.items() if key != "actions"},
+            native_decoded_actions=request["actions"].tolist(),
+            protocol_version=2,
+            execution_prefix_steps=chunk,
+            async_overlap_steps=depth,
+        )
 
     try:
         worker = OwnedPlanWorker(
@@ -359,14 +421,15 @@ def run_one_step_async_loop(
             t_s=base,
             period_s=0.05,
             physics_step_seconds=0.05,
-            execution_coupling="one_step_async",
+            execution_coupling=coupling,
             execution_clock="ready",
-            execution_prefix_steps=1,
-            synchronous_chunk_steps=1,
+            execution_prefix_steps=chunk,
+            synchronous_chunk_steps=chunk,
+            async_overlap_steps=depth,
             fixed_rate_timing_applicable=False,
             max_steps=max_steps,
             bootstrap_action_slots=0,
-            protocol_version=1,
+            protocol_version=1 if _legacy_one_step else 2,
         )
         current = snapshot_observation(observe_fn())
         capture = clock.now()
@@ -375,27 +438,36 @@ def run_one_step_async_loop(
         pending = submit(current, capture, 0, 0)
         current_request = receive(pending, adopted=True)
         pending = None
+        current_capture = capture
         while len(ticks) < max_steps:
             tick = len(ticks)
-            # Always capture before the atomic environment step; preparation and
-            # transport on the worker may start later and are measured separately.
-            current = snapshot_observation(observe_fn())
-            current_capture = clock.now()
-            if tick + 1 < max_steps:
-                pending = submit(current, current_capture, tick, tick + 1)
+            target = current_request["target_tick"]
+            offset = tick - target
+            next_target = target + chunk
+            # Only observe at the declared capture boundary. Other prefix steps
+            # reuse the preceding step's output; no bookkeeping camera refresh.
+            prefetch = next_target < max_steps and tick == next_target - depth
+            if prefetch or _legacy_one_step:
+                current = snapshot_observation(observe_fn())
+                current_capture = clock.now()
+            if prefetch:
+                pending = submit(current, current_capture, tick, next_target)
             action, fallback, age = timeline.execute(tick)
             if fallback:
-                raise RuntimeError("One-step async cannot execute fallback commands")
+                raise RuntimeError("Lookahead async cannot execute fallback commands")
+            before = snapshot_observation(current) if recorder is not None else current
             applied = clock.now()
             after, success, terminated = step_fn(action)
             computed = clock.now()
             execution.append((applied, computed))
+            current_request["executed_prefix_steps"] += 1
             row = {
                 "tick": tick,
-                "cycle": tick,
+                "cycle": target,
                 "request_id": current_request["request_id"],
                 "source_tick": current_request["source_tick"],
-                "target_tick": tick,
+                "target_tick": target,
+                "executed_offset": offset,
                 "scheduled_s": None,
                 "applied_s": applied,
                 "lateness_s": None,
@@ -403,7 +475,7 @@ def run_one_step_async_loop(
                 "sensor_release_s": applied,
                 "next_observation_computed_s": computed,
                 "execution_clock": "ready",
-                "execution_coupling": "one_step_async",
+                "execution_coupling": coupling,
                 "physics_step_seconds": 0.05,
                 "simulated_elapsed_seconds": (tick + 1) * 0.05,
                 "action": action.tolist(),
@@ -413,7 +485,7 @@ def run_one_step_async_loop(
                 "action_delay_budget_ticks": 0,
                 "command_ready_s": current_request["rpc_completed_s"],
                 "ready_to_apply_seconds": applied - current_request["rpc_completed_s"],
-                "first_application_of_request": True,
+                "first_application_of_request": offset == 0,
                 "environment_step_s": computed - applied,
                 "executed_slot": timeline.last_execution,
                 "action_buffer": timeline.snapshot(),
@@ -430,18 +502,25 @@ def run_one_step_async_loop(
                 "action_request_pending": pending is not None,
             }
             if recorder is not None:
-                row["robot_response"] = recorder.step(current, after, row)
+                row["robot_response"] = recorder.step(before, after, row)
             ticks.append(row)
             events.emit("control_tick", t_s=applied, **row)
+            execution_identity = {
+                "request_id": target,
+                "request_tick": target,
+                "source_tick": current_request["source_tick"],
+                "target_tick": target,
+            }
+            if not _legacy_one_step:
+                execution_identity.update(
+                    execution_id=tick, tick=tick, executed_offset=offset
+                )
             events.emit(
                 "cycle_phase",
                 t_s=computed,
-                cycle=tick,
+                cycle=target,
                 phase="execution",
-                request_id=current_request["request_id"],
-                request_tick=current_request["request_tick"],
-                source_tick=current_request["source_tick"],
-                target_tick=tick,
+                **execution_identity,
                 start_s=applied,
                 end_s=computed,
                 simulation_paused=False,
@@ -450,12 +529,11 @@ def run_one_step_async_loop(
                 execution_clock="ready",
             )
             events.emit(
-                "one_step_async_execution",
+                "one_step_async_execution"
+                if _legacy_one_step
+                else "chunked_async_execution",
                 t_s=computed,
-                request_id=current_request["request_id"],
-                request_tick=current_request["request_tick"],
-                source_tick=current_request["source_tick"],
-                target_tick=tick,
+                **execution_identity,
                 applied_s=applied,
                 completed_s=computed,
                 executed_steps=1,
@@ -464,6 +542,7 @@ def run_one_step_async_loop(
             if record_video:
                 frames.append(after["video.image"].copy())
             current = after
+            current_capture = computed
             if success or terminated or len(ticks) == max_steps:
                 reason = (
                     "success"
@@ -479,19 +558,25 @@ def run_one_step_async_loop(
                     control_steps=len(ticks),
                     reason=reason,
                 )
+                finalize(current_request)
                 if pending is not None:
-                    receive(pending, adopted=False, unused_reason=reason)
+                    unused = receive(pending, adopted=False, unused_reason=reason)
                     pending = None
                     drained = clock.now()
                     events.emit(
                         "cycle_phase",
                         t_s=drained,
-                        cycle=tick + 1,
+                        cycle=unused["target_tick"],
                         phase="drain",
-                        request_id=tick + 1,
-                        request_tick=tick + 1,
-                        source_tick=tick,
-                        target_tick=tick + 1,
+                        **{
+                            key: unused[key]
+                            for key in (
+                                "request_id",
+                                "request_tick",
+                                "source_tick",
+                                "target_tick",
+                            )
+                        },
                         start_s=controlled_end,
                         end_s=drained,
                         simulation_paused=True,
@@ -500,8 +585,22 @@ def run_one_step_async_loop(
                         execution_clock="ready",
                     )
                 break
+            if len(ticks) != next_target:
+                continue
+            finalize(current_request)
+            if pending is None:
+                raise RuntimeError("Missing declared boundary prefetch")
             waiting = not pending.done()
             waiting_start = clock.now()
+            if not _legacy_one_step:
+                events.emit(
+                    "chunked_async_boundary",
+                    t_s=waiting_start,
+                    request_id=next_target,
+                    target_tick=next_target,
+                    physical_tick=len(ticks),
+                    result_ready=not waiting,
+                )
             current_request = receive(pending, adopted=True)
             pending = None
             waiting_end = clock.now()
@@ -510,12 +609,17 @@ def run_one_step_async_loop(
                 events.emit(
                     "cycle_phase",
                     t_s=waiting_end,
-                    cycle=tick + 1,
+                    cycle=next_target,
                     phase="wait",
-                    request_id=tick + 1,
-                    request_tick=tick + 1,
-                    source_tick=tick,
-                    target_tick=tick + 1,
+                    **{
+                        key: current_request[key]
+                        for key in (
+                            "request_id",
+                            "request_tick",
+                            "source_tick",
+                            "target_tick",
+                        )
+                    },
                     start_s=waiting_start,
                     end_s=waiting_end,
                     simulation_paused=True,
@@ -529,6 +633,8 @@ def run_one_step_async_loop(
         events.emit(
             "control_error", error_type=type(error).__name__, message=str(error)
         )
+        for request in requests:
+            finalize(request)
         # A simulator failure can leave valid work in flight. Drain and preserve
         # it without executing or replacing the original failure.
         if pending is not None:
@@ -562,14 +668,23 @@ def run_one_step_async_loop(
     audits = [r["audit"] for r in requests]
     rpc_intervals = [(r["rpc_started_s"], r["rpc_completed_s"]) for r in requests]
     overlap = _intersection_seconds(rpc_intervals, execution)
+    adopted_count = sum(r["adopted_s"] is not None for r in requests)
+    adjacent_gaps = [b["applied_s"] - a["applied_s"] for a, b in pairwise(ticks)]
+    boundary_gaps = [
+        b["applied_s"] - a["next_observation_computed_s"]
+        for a, b in pairwise(ticks)
+        if b["first_application_of_request"]
+    ]
     result = {
         "success": bool(success),
         "termination_reason": reason,
         "measurement_mode": "success_terminated_closed_loop",
-        "execution_coupling": "one_step_async",
+        "execution_coupling": coupling,
         "execution_clock": "ready",
-        "execution_prefix_steps": 1,
-        "synchronous_chunk_steps": 1,
+        "execution_prefix_steps": chunk,
+        "synchronous_chunk_steps": chunk,
+        "async_overlap_steps": depth,
+        "protocol_version": 1 if _legacy_one_step else 2,
         "control_steps": len(ticks),
         "physics_step_seconds": 0.05,
         "nominal_physics_hz": 20,
@@ -595,10 +710,10 @@ def run_one_step_async_loop(
         "first_success_tick": len(ticks) - 1 if success else None,
         "policy_calls": len(requests),
         "action_requests": len(requests),
-        "adopted_policy_calls": len(ticks),
-        "unused_policy_calls": len(requests) - len(ticks),
+        "adopted_policy_calls": adopted_count,
+        "unused_policy_calls": len(requests) - adopted_count,
         "action_request_hz": len(requests) / wall if wall else None,
-        "effective_plan_update_hz": len(ticks) / wall if wall else None,
+        "effective_plan_update_hz": adopted_count / wall if wall else None,
         "total_policy_rpc_seconds": sum(b - a for a, b in rpc_intervals),
         "total_policy_request_seconds": sum(
             r["rpc_completed_s"] - r["submitted_s"] for r in requests
@@ -628,7 +743,11 @@ def run_one_step_async_loop(
             [a["vlm_completed_s"] - a["vlm_started_s"] for a in audits]
         ),
         "action_ready_to_first_apply_seconds": summarize_values(
-            [t["ready_to_apply_seconds"] for t in ticks]
+            [
+                t["ready_to_apply_seconds"]
+                for t in ticks
+                if t["first_application_of_request"]
+            ]
         ),
         "executed_image_age_ms": summarize_values(
             [t["executed_image_age_ms"] for t in ticks]
@@ -642,6 +761,21 @@ def run_one_step_async_loop(
         ),
         "unused_plan_suffix_slots": sum(a["decoded_horizon"] for a in audits)
         - len(ticks),
+        "accepted_prefix_steps": sum(r["accepted_prefix_steps"] for r in requests),
+        "executed_prefix_steps": len(ticks),
+        "unexecuted_accepted_prefix_steps": sum(
+            r["accepted_prefix_steps"] for r in requests
+        )
+        - len(ticks),
+        "discarded_native_suffix_steps": sum(
+            len(r["actions"]) - r["accepted_prefix_steps"] for r in requests
+        ),
+        "adjacent_action_gap_seconds": summarize_values(adjacent_gaps),
+        "total_adjacent_action_gap_seconds": sum(adjacent_gaps),
+        "boundary_gap_seconds": summarize_values(boundary_gaps),
+        "total_boundary_gap_seconds": sum(boundary_gaps),
+        "amortized_wall_seconds_per_action": wall / len(ticks),
+        "total_environment_step_seconds": sum(b - a for a, b in execution),
         "fallback_ticks": 0,
         "action_trace_sha256": hashlib.sha256(
             np.asarray([r["action"] for r in ticks], np.float32).tobytes()
@@ -658,13 +792,20 @@ def run_one_step_async_loop(
         "async_work_end",
         t_s=work_end,
         policy_calls=len(requests),
-        adopted_policy_calls=len(ticks),
-        unused_policy_calls=len(requests) - len(ticks),
+        adopted_policy_calls=adopted_count,
+        unused_policy_calls=len(requests) - adopted_count,
     )
     result["replay_trace"] = events.status()
     # Completion is published only after all requests and worker cleanup succeed.
     events.flush(trace)
     return result, frames
+
+
+def run_one_step_async_loop(step_fn, observe_fn, planner_factory, **kwargs):
+    """Compatibility wrapper preserving the original v1 evidence and K=D=1."""
+    return run_chunked_async_loop(
+        step_fn, observe_fn, planner_factory, _legacy_one_step=True, **kwargs
+    )
 
 
 class _PolicyPlanner:
@@ -742,7 +883,17 @@ def one_step_async_episode(env, observation, args, seed, trace):
         obs, _, done, truncated, info = checked_env_step(env, action)
         return obs, bool(info["success"]), bool(done or truncated)
 
-    return run_one_step_async_loop(
+    chunked = getattr(args, "execution_coupling", "one_step_async") == "chunked_async"
+    loop = run_chunked_async_loop if chunked else run_one_step_async_loop
+    settings = (
+        {
+            "execution_prefix_steps": args.synchronous_chunk_steps,
+            "async_overlap_steps": args.async_overlap_steps,
+        }
+        if chunked
+        else {}
+    )
+    return loop(
         step,
         observe,
         lambda: _PolicyPlanner(args.port),
@@ -752,4 +903,5 @@ def one_step_async_episode(env, observation, args, seed, trace):
         recorder=recorder,
         record_video=args.record_video,
         initialize=initialize,
+        **settings,
     )

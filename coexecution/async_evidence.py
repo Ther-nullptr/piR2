@@ -19,7 +19,7 @@ IDENTITY = ("request_id", "request_tick", "source_tick", "target_tick")
 
 def _require(condition, message):
     if not condition:
-        raise ValueError("One-step async evidence: " + message)
+        raise ValueError("Lookahead async evidence: " + message)
 
 
 def _number(value):
@@ -69,7 +69,7 @@ def _index(rows, key, label):
     return result
 
 
-def validate_one_step_async_work(events, normalized=None, metadata=None):
+def _validate_lookahead_work(events, normalized=None, metadata=None, *, chunked=False):
     """Cross-check full normalized work against submissions, stages and execution.
 
     Returns audited relative work rows and absolute phases. Never clips terminal
@@ -93,36 +93,52 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
     )
     start, stop, work_end = begin["t_s"], end["t_s"], finish["t_s"]
     _ordered((start, stop, work_end), "work boundaries")
+    coupling = "chunked_async" if chunked else "one_step_async"
+    chunk = begin.get("execution_prefix_steps") if chunked else 1
+    depth = begin.get("async_overlap_steps") if chunked else 1
+    maximum = begin.get("max_steps")
+    _require(
+        type(chunk) is int and type(depth) is int and 1 <= depth <= chunk, "invalid K/D"
+    )
+    _require(type(maximum) is int and maximum >= 1, "invalid maximum")
+    if chunked:
+        _same(
+            begin,
+            {"protocol_version": 2, "synchronous_chunk_steps": chunk},
+            "version2 protocol",
+        )
     _same(
         begin,
         {
-            "execution_coupling": "one_step_async",
+            "execution_coupling": coupling,
             "execution_clock": "ready",
-            "execution_prefix_steps": 1,
+            "execution_prefix_steps": chunk,
         },
         "protocol",
     )
-    requests = _index(groups["one_step_async_request"], "request_id", "work")
+    requests = _index(
+        groups["chunked_async_request" if chunked else "one_step_async_request"],
+        "request_id",
+        "work",
+    )
     ticks = _index(groups["control_tick"], "tick", "execution")
     _require(
         bool(ticks) and sorted(ticks) == list(range(len(ticks))),
         "noncontiguous physical ticks",
     )
-    _require(
-        sorted(requests) == list(range(len(requests))),
-        "noncontiguous request IDs",
-    )
-    _require(
-        len(requests) in (len(ticks), len(ticks) + 1),
-        "invalid request/execution counts",
-    )
+    adopted_ids = set(range(0, len(ticks), chunk))
+    expected_ids = {0} | {
+        target for target in range(chunk, maximum, chunk) if target - depth < len(ticks)
+    }
+    _require(set(requests) == expected_ids, "missing/extra declared request targets")
+    _require(len(ticks) <= maximum, "physical step cap exceeded")
     _same(end, {"control_steps": len(ticks)}, "control end")
     _same(
         finish,
         {
             "policy_calls": len(requests),
-            "adopted_policy_calls": len(ticks),
-            "unused_policy_calls": len(requests) - len(ticks),
+            "adopted_policy_calls": len(adopted_ids),
+            "unused_policy_calls": len(requests) - len(adopted_ids),
         },
         "work end",
     )
@@ -147,10 +163,12 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
     _require(received.keys() == requests.keys(), "missing result disposition")
     adopted = _index(groups["action_adopted"], "request_id", "adoption")
     executed = _index(
-        groups["one_step_async_execution"], "request_id", "physical execution"
+        groups["chunked_async_execution" if chunked else "one_step_async_execution"],
+        "execution_id" if chunked else "request_id",
+        "physical execution",
     )
     _require(
-        adopted.keys() == ticks.keys() == executed.keys(),
+        set(adopted) == adopted_ids and executed.keys() == ticks.keys(),
         "adoption/execution IDs disagree",
     )
     phases = groups["cycle_phase"]
@@ -162,19 +180,33 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
         "unknown phase",
     )
     by_phase = {
-        name: _index([p for p in phases if p["phase"] == name], "request_id", name)
+        name: _index(
+            [p for p in phases if p["phase"] == name],
+            "execution_id" if chunked and name == "execution" else "request_id",
+            name,
+        )
         for name in ("inference", "execution", "wait", "drain")
     }
     _require(by_phase["inference"].keys() == requests.keys(), "missing inference phase")
     _require(by_phase["execution"].keys() == ticks.keys(), "missing execution phase")
-    _require(set(by_phase["wait"]) <= set(ticks) - {0}, "invalid wait request")
+    _require(set(by_phase["wait"]) <= adopted_ids - {0}, "invalid wait request")
     _require(
-        set(by_phase["drain"]) == set(requests) - set(ticks),
+        set(by_phase["drain"]) == set(requests) - adopted_ids,
         "missing/extra terminal drain",
     )
+    boundaries = (
+        _index(groups["chunked_async_boundary"], "request_id", "boundary")
+        if chunked
+        else {}
+    )
+    if chunked:
+        _require(set(boundaries) == adopted_ids - {0}, "missing/extra boundary check")
     work_rows = []
     for rid, request in sorted(requests.items()):
-        source = max(0, rid - 1)
+        source = max(0, rid - depth)
+        prefix = min(chunk, maximum - rid)
+        executed_steps = min(prefix, max(0, len(ticks) - rid))
+        used = rid in adopted_ids
         identity = {
             "request_id": rid,
             "request_tick": rid,
@@ -212,7 +244,7 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
             "backend audit",
         )
         va, vb, aa, ab = (audit.get(key) for key in STAGES)
-        accepted = request["t_s"]
+        accepted = request.get("received_s") if chunked else request["t_s"]
         _ordered(
             (
                 start,
@@ -230,15 +262,15 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
             "request/stage",
         )
         if rid:
-            prior = ticks[rid - 1]
+            prior = ticks[source]
             _same(capture, prior["sensor_capture_s"], "prefetch snapshot capture")
             _ordered(
                 (prior["sensor_capture_s"], capture, submitted, prior["applied_s"]),
                 "prefetch before physical step",
             )
-            if rid > 1:
+            if source > 0:
                 _ordered(
-                    (ticks[rid - 2]["next_observation_computed_s"], capture),
+                    (ticks[source - 1]["next_observation_computed_s"], capture),
                     "source observation availability",
                 )
         for kind, moment in (
@@ -328,16 +360,15 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
                 "t_s": ab,
                 "request_elapsed_s": ab - aa,
                 "valid_start_tick": rid,
-                "valid_end_tick": rid + 1,
+                "valid_end_tick": rid + prefix,
             },
             "DiT completion",
         )
-        used = rid in ticks
         _same(
             request,
             {
                 "disposition": "adopted" if used else "unused",
-                "accepted_prefix_steps": int(used),
+                "accepted_prefix_steps": prefix if used else 0,
                 "adopted_s": accepted if used else None,
                 "unused_reason": None if used else end.get("reason"),
             },
@@ -371,7 +402,7 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
         _same(audit, {"decoded_horizon": len(native)}, "native horizon")
         _same(
             request,
-            {"unused_plan_suffix_slots": len(native) - int(used)},
+            {"unused_plan_suffix_slots": len(native) - executed_steps},
             "unused suffix",
         )
         _same(
@@ -386,20 +417,47 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
                 "frame_hashes": hashes,
                 "submitted_s": submitted,
                 "simulation_paused": rid == 0,
+                "execution_coupling": coupling,
+                "execution_clock": "ready",
             },
             "inference phase",
         )
-        if used:
-            tick = ticks[rid]
-            applied, completed = (
-                tick.get("applied_s"),
-                tick.get("next_observation_computed_s"),
+        _require(len(native) >= chunk, "prefix exceeds native horizon")
+        if chunked:
+            _same(
+                request,
+                {
+                    "protocol_version": 2,
+                    "execution_prefix_steps": chunk,
+                    "async_overlap_steps": depth,
+                    "prefix_steps": prefix,
+                    "executed_prefix_steps": executed_steps,
+                    "unexecuted_accepted_prefix_steps": (prefix if used else 0)
+                    - executed_steps,
+                    "discarded_native_suffix_steps": len(native)
+                    - (prefix if used else 0),
+                    "finalized_s": request["t_s"],
+                },
+                "finalized request accounting",
             )
-            _ordered((accepted, applied, completed, stop), "action application")
+            _ordered(
+                (accepted, request["finalized_s"], work_end), "request finalization"
+            )
+            if used:
+                _ordered(
+                    (
+                        ticks[rid + executed_steps - 1]["next_observation_computed_s"],
+                        request["finalized_s"],
+                    ),
+                    "finalize after actual prefix",
+                )
+            else:
+                _ordered((stop, accepted), "unused response after control")
+        if used:
             if rid:
                 _ordered(
-                    (ticks[rid - 1]["next_observation_computed_s"], applied),
-                    "physical execution",
+                    (ticks[rid - 1]["next_observation_computed_s"], accepted),
+                    "adoption after committed prefix",
                 )
             _same(
                 adopted[rid],
@@ -407,79 +465,149 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
                     "request_tick": rid,
                     "target_tick": rid,
                     "t_s": accepted,
-                    "installed_slots": 1,
+                    "installed_slots": prefix,
                     "expired_slots": 0,
                     "protected_slots": 0,
                     "ready_to_adopt_seconds": accepted - rpc_end,
                 },
                 "adoption",
             )
-            _same(
-                tick,
-                {
-                    **{k: v for k, v in identity.items() if k != "request_tick"},
-                    **dependency,
-                    "action": [float(max(-1, min(1, v))) for v in native[0][:6]]
-                    + [float(native[0][6] >= 0.5)],
-                    "fallback": False,
-                    "t_s": applied,
-                    "command_ready_s": rpc_end,
-                    "ready_to_apply_seconds": applied - rpc_end,
-                    "first_application_of_request": True,
-                    "command_age_ticks": 0,
-                    "action_delay_budget_ticks": 0,
-                    "action_request_pending": rid + 1 < len(requests),
-                    "execution_coupling": "one_step_async",
-                    "execution_clock": "ready",
-                    "observation_lag_ticks": rid - source,
-                    "environment_step_s": completed - applied,
-                    "physics_step_seconds": 0.05,
-                    "simulated_elapsed_seconds": (rid + 1) * 0.05,
-                    "executed_image_age_ms": (applied - capture) * 1000,
-                    "executed_state_age_ms": (applied - capture) * 1000,
-                },
-                "physical tick",
-            )
-            _same(
-                tick.get("executed_slot"),
-                {
-                    "producer_kind": "request",
-                    "producer_request_tick": rid,
-                    "tick": rid,
-                    "fallback": False,
-                },
-                "executed producer",
-            )
-            _same(
-                tick.get("action_buffer"),
-                {"slots": [], "committed_until": rid + 1},
-                "exact prefix",
-            )
-            _same(
-                executed[rid],
-                {
-                    **identity,
-                    "applied_s": applied,
-                    "completed_s": completed,
-                    "t_s": completed,
-                    "executed_steps": 1,
-                    "observation_lag_ticks": rid - source,
-                },
-                "execution record",
-            )
-            _same(
-                by_phase["execution"][rid],
-                {
-                    **identity,
-                    "start_s": applied,
-                    "end_s": completed,
-                    "t_s": completed,
-                    "physics_start_tick": rid,
-                    "physics_end_tick": rid + 1,
-                    "simulation_paused": False,
-                },
-                "execution phase",
-            )
+            for physical in range(rid, rid + executed_steps):
+                tick = ticks[physical]
+                offset = physical - rid
+                applied, completed = (
+                    tick.get("applied_s"),
+                    tick.get("next_observation_computed_s"),
+                )
+                _ordered((accepted, applied, completed, stop), "action application")
+                if physical:
+                    _ordered(
+                        (ticks[physical - 1]["next_observation_computed_s"], applied),
+                        "physical execution",
+                    )
+                _ordered(
+                    (start, tick.get("sensor_capture_s"), applied),
+                    "current sensor timestamp",
+                )
+                _same(
+                    tick,
+                    {
+                        **{k: v for k, v in identity.items() if k != "request_tick"},
+                        **dependency,
+                        "tick": physical,
+                        "action": [
+                            float(max(-1, min(1, v))) for v in native[offset][:6]
+                        ]
+                        + [float(native[offset][6] >= 0.5)],
+                        "fallback": False,
+                        "t_s": applied,
+                        "command_ready_s": rpc_end,
+                        "ready_to_apply_seconds": applied - rpc_end,
+                        "first_application_of_request": offset == 0,
+                        "command_age_ticks": offset,
+                        "action_delay_budget_ticks": 0,
+                        "action_request_pending": rid + chunk in requests
+                        and physical >= rid + chunk - depth,
+                        "execution_coupling": coupling,
+                        "execution_clock": "ready",
+                        "observation_lag_ticks": physical - source,
+                        "environment_step_s": completed - applied,
+                        "physics_step_seconds": 0.05,
+                        "simulated_elapsed_seconds": (physical + 1) * 0.05,
+                        "executed_image_age_ms": (applied - capture) * 1000,
+                        "executed_state_age_ms": (applied - capture) * 1000,
+                    },
+                    "physical tick",
+                )
+                extra = (
+                    {
+                        "execution_id": physical,
+                        "tick": physical,
+                        "executed_offset": offset,
+                    }
+                    if chunked
+                    else {}
+                )
+                if chunked:
+                    _same(tick, {"executed_offset": offset}, "physical native offset")
+                    if (
+                        not (
+                            rid + chunk in requests and physical == rid + chunk - depth
+                        )
+                        and physical
+                    ):
+                        # A fresh camera update is allowed only at bootstrap or
+                        # the declared prefetch boundary; all inner steps reuse
+                        # the preceding env.step observation.
+                        _same(
+                            tick["sensor_capture_s"],
+                            ticks[physical - 1]["next_observation_computed_s"],
+                            "post-step observation reuse",
+                        )
+                _same(
+                    tick.get("executed_slot"),
+                    {
+                        "producer_kind": "request",
+                        "producer_request_tick": rid,
+                        "tick": physical,
+                        "fallback": False,
+                    },
+                    "executed producer",
+                )
+                buffer = tick.get("action_buffer")
+                _same(
+                    buffer,
+                    {"committed_until": rid + prefix if chunked else physical + 1},
+                    "exact prefix",
+                )
+                slots = buffer.get("slots")
+                _require(
+                    isinstance(slots, list)
+                    and len(slots) == rid + prefix - physical - 1,
+                    "buffer prefix length",
+                )
+                for slot, future_tick in zip(slots, range(physical + 1, rid + prefix)):
+                    _same(
+                        slot,
+                        {
+                            "tick": future_tick,
+                            "producer_kind": "request",
+                            "producer_request_tick": rid,
+                            "fallback": False,
+                            "committed": chunked,
+                            "status": "committed" if chunked else "future",
+                        },
+                        "buffer prefix producer",
+                    )
+                _same(
+                    executed[physical],
+                    {
+                        **identity,
+                        **extra,
+                        "applied_s": applied,
+                        "completed_s": completed,
+                        "t_s": completed,
+                        "executed_steps": 1,
+                        "observation_lag_ticks": physical - source,
+                    },
+                    "execution record",
+                )
+                _same(
+                    by_phase["execution"][physical],
+                    {
+                        **identity,
+                        **extra,
+                        "cycle": rid,
+                        "start_s": applied,
+                        "end_s": completed,
+                        "t_s": completed,
+                        "physics_start_tick": physical,
+                        "physics_end_tick": physical + 1,
+                        "simulation_paused": False,
+                        "execution_clock": "ready",
+                    },
+                    "execution phase",
+                )
         work_rows.append(
             {
                 **identity,
@@ -507,19 +635,39 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
                 "forward_counts": audit["forward_counts"],
                 "decoded_horizon": audit["decoded_horizon"],
                 "completed_after_control": rpc_end > stop,
+                **(
+                    {
+                        "protocol_version": 2,
+                        "execution_prefix_steps": chunk,
+                        "async_overlap_steps": depth,
+                        "executed_prefix_steps": executed_steps,
+                        "unexecuted_accepted_prefix_steps": request[
+                            "unexecuted_accepted_prefix_steps"
+                        ],
+                        "discarded_native_suffix_steps": request[
+                            "discarded_native_suffix_steps"
+                        ],
+                        "prefix_steps": prefix,
+                        "received_s": accepted - start,
+                        "finalized_s": request["finalized_s"] - start,
+                    }
+                    if chunked
+                    else {}
+                ),
             }
         )
     for name in ("wait", "drain"):
         for rid, phase in by_phase[name].items():
             request = requests[rid]
+            boundary_tick = len(ticks) if name == "drain" else rid
             _same(
                 phase,
                 {
                     **{key: request[key] for key in IDENTITY},
                     "cycle": rid,
                     "simulation_paused": True,
-                    "physics_start_tick": rid,
-                    "physics_end_tick": rid,
+                    "physics_start_tick": boundary_tick,
+                    "physics_end_tick": boundary_tick,
                     "execution_clock": "ready",
                     "t_s": phase.get("end_s"),
                 },
@@ -528,9 +676,9 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
             a, b = phase.get("start_s"), phase.get("end_s")
             _ordered(
                 (
-                    ticks[rid - 1]["next_observation_computed_s"],
+                    ticks[boundary_tick - 1]["next_observation_computed_s"],
                     a,
-                    request["t_s"],
+                    request["received_s"] if chunked else request["t_s"],
                     b,
                     work_end,
                 ),
@@ -540,13 +688,84 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
                 _same(a, stop, "drain starts at control end")
             else:
                 _ordered((b, ticks[rid]["applied_s"]), "wait precedes next action")
+    if chunked:
+        for rid, boundary in boundaries.items():
+            _same(
+                boundary,
+                {"target_tick": rid, "physical_tick": rid},
+                "boundary identity",
+            )
+            ready = boundary.get("result_ready")
+            _require(type(ready) is bool, "boundary result readiness")
+            _ordered(
+                (
+                    ticks[rid - 1]["next_observation_computed_s"],
+                    boundary["t_s"],
+                    requests[rid]["received_s"],
+                ),
+                "boundary receive",
+            )
+            _require(
+                (rid in by_phase["wait"]) is (not ready), "missing/extra boundary wait"
+            )
+            if not ready:
+                _same(
+                    by_phase["wait"][rid]["start_s"],
+                    boundary["t_s"],
+                    "wait boundary start",
+                )
+            else:
+                _ordered(
+                    (requests[rid]["rpc_completed_s"], boundary["t_s"]),
+                    "ready response before boundary",
+                )
     if normalized is not None:
         _same(normalized, work_rows, "normalized full work")
+    rpc_intervals = [
+        (r["rpc_started_s"], r["rpc_completed_s"]) for r in requests.values()
+    ]
+    execution_intervals = [
+        (t["applied_s"], t["next_observation_computed_s"]) for t in ticks.values()
+    ]
+
+    def overlap(intervals):
+        return sum(
+            max(0.0, min(b, d) - max(a, c))
+            for a, b in intervals
+            for c, d in execution_intervals
+        )
+
     if metadata:
         for key, value in {
+            "execution_coupling": coupling,
+            "execution_clock": "ready",
+            "control_steps": len(ticks),
+            "controlled_start_s": start,
+            "controlled_end_s": stop,
+            "controlled_wall_seconds": stop - start,
+            "actual_control_hz": len(ticks) / (stop - start) if stop > start else None,
+            "physical_control_seconds": len(ticks) * 0.05,
+            "simulated_elapsed_seconds": len(ticks) * 0.05,
+            "total_policy_rpc_seconds": sum(b - a for a, b in rpc_intervals),
+            "total_policy_request_seconds": sum(
+                r["rpc_completed_s"] - r["submitted_s"] for r in requests.values()
+            ),
+            "measured_inference_execution_overlap_seconds": overlap(rpc_intervals),
+            "measured_server_execution_overlap_seconds": {
+                stage: overlap(
+                    [
+                        (
+                            r["audit"][stage + "_started_s"],
+                            r["audit"][stage + "_completed_s"],
+                        )
+                        for r in requests.values()
+                    ]
+                )
+                for stage in ("vlm", "action")
+            },
             "policy_calls": len(requests),
-            "adopted_policy_calls": len(ticks),
-            "unused_policy_calls": len(requests) - len(ticks),
+            "adopted_policy_calls": len(adopted_ids),
+            "unused_policy_calls": len(requests) - len(adopted_ids),
             "forward_counts": {"vlm": len(requests), "dit": 4 * len(requests)},
             "scored_work_end_s": work_end,
             "scored_work_wall_seconds": work_end - start,
@@ -556,6 +775,25 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
             ),
             "unused_plan_suffix_slots": sum(
                 r["unused_plan_suffix_slots"] for r in requests.values()
+            ),
+            **(
+                {
+                    "execution_prefix_steps": chunk,
+                    "async_overlap_steps": depth,
+                    "protocol_version": 2,
+                    "accepted_prefix_steps": sum(
+                        r["accepted_prefix_steps"] for r in requests.values()
+                    ),
+                    "executed_prefix_steps": len(ticks),
+                    "unexecuted_accepted_prefix_steps": sum(
+                        r["unexecuted_accepted_prefix_steps"] for r in requests.values()
+                    ),
+                    "discarded_native_suffix_steps": sum(
+                        r["discarded_native_suffix_steps"] for r in requests.values()
+                    ),
+                }
+                if chunked
+                else {}
             ),
         }.items():
             if key in metadata:
@@ -567,3 +805,32 @@ def validate_one_step_async_work(events, normalized=None, metadata=None):
         "control_end_s": stop,
         "start_s": start,
     }
+
+
+def validate_one_step_async_work(events, normalized=None, metadata=None):
+    """Validate original version1 recordings without changing their schema."""
+    try:
+        return _validate_lookahead_work(events, normalized, metadata, chunked=False)
+    except ValueError as error:
+        raise ValueError(
+            str(error).replace("Lookahead async evidence", "One-step async evidence")
+        ) from error
+
+
+def validate_chunked_async_work(events, normalized=None, metadata=None):
+    """Validate version2 native-prefix execution and lookahead evidence."""
+    return _validate_lookahead_work(events, normalized, metadata, chunked=True)
+
+
+def validate_async_work(events, normalized=None, metadata=None):
+    """Select the declared protocol; reject unknown async evidence."""
+    begins = [e for e in events if e.get("kind") == "control_start"]
+    _require(len(begins) == 1, "requires exactly one control_start")
+    coupling = begins[0].get("execution_coupling")
+    _require(coupling in ("one_step_async", "chunked_async"), "unknown async protocol")
+    validator = (
+        validate_chunked_async_work
+        if coupling == "chunked_async"
+        else validate_one_step_async_work
+    )
+    return validator(events, normalized, metadata)
