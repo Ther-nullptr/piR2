@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from coexecution.libero.preprocessing import add_image_arguments, image_config
+
 from .common import (
     create_output,
     cuda_capture_range,
@@ -81,7 +83,7 @@ def run(args):
     )
     with torch.inference_mode():
         workload = LiberoWorkload(args)
-        with GrootOptimizations(workload.policy, config) as optimized:
+        with workload, GrootOptimizations(workload.policy, config) as optimized:
             adapter = ComponentBoundaries(optimized, SerialForwardBoundary)
             runner = None
             try:
@@ -214,6 +216,7 @@ def run(args):
                         "cuda": torch.version.cuda,
                     },
                     "optimization": optimized.evidence(),
+                    "image_resolution": workload.image_resolution.evidence(),
                     "runtime_adapter": adapter.evidence,
                     "streams": runner.stream_metadata,
                     "equivalence": equivalence,
@@ -305,6 +308,7 @@ def run(args):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
+    add_image_arguments(result)
     result.add_argument("--mode", choices=MODES, required=True)
     result.add_argument("--precision", choices=("bf16", "w8a8", "w4a4"), default="bf16")
     result.add_argument("--component", choices=("all", "vlm", "dit"), default="all")
@@ -352,6 +356,7 @@ def nonnegative_int(value):
 
 
 def validate_arguments(args):
+    image_config(args)
     mask = args.gpu_uuid or str(args.gpu)
     if args.gpu < 0 or os.environ.get("CUDA_VISIBLE_DEVICES") != mask:
         raise RuntimeError(

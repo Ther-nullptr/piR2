@@ -16,6 +16,12 @@ from coexecution.libero.features import (
     TIMING_VERSION,
     add_feature_arguments,
 )
+from coexecution.libero.preprocessing import (
+    ImageResolutionConfig,
+    ImageResolutionScope,
+    add_image_arguments,
+    image_config,
+)
 from coexecution.optimization.config import (
     add_optimization_arguments,
     optimization_config,
@@ -52,6 +58,14 @@ def worker_scope(backend, spec, optimization, torch):
         with guard():
             stack.enter_context(torch.cuda.device(spec["device"]))
             stack.enter_context(torch.cuda.stream(backend.stream))
+            images = stack.enter_context(
+                ImageResolutionScope(
+                    backend.core, ImageResolutionConfig(spec.get("image_resolution"))
+                )
+            )
+            if images.config.size is not None:
+                backend.image_resolution = images
+                stack.callback(delattr, backend, "image_resolution")
             optimized = stack.enter_context(
                 GrootOptimizations(backend.core, optimization)
             )
@@ -116,6 +130,11 @@ def serve(backend, spec, identity, optimization=None, record_runtime_receipt=Fal
     # endpoint permits same-context overlap on one GPU; fences are stream-local.
     with worker_scope(backend, spec, optimization, torch) as optimized:
         backend.optimization = optimized
+        if getattr(backend, "image_resolution", None) is not None:
+            identity["image_resolution"] = backend.image_resolution.configuration()
+            (backend.output / "identity.json").write_text(
+                json.dumps(identity, indent=2) + "\n"
+            )
         if optimized.config.enabled:
             identity["inference_optimization"] = optimized.evidence()
             (backend.output / "identity.json").write_text(
@@ -234,6 +253,7 @@ def main():
     parser.add_argument("--torch-threads", type=int, default=2)
     parser.add_argument("--server-layout", choices=("split", "paired"))
     parser.add_argument("--feature-max-leases", type=int, default=16)
+    add_image_arguments(parser)
     parser.add_argument(
         "--runtime-receipt",
         action="store_true",
@@ -242,6 +262,7 @@ def main():
     add_feature_arguments(parser)
     add_optimization_arguments(parser)
     args = parser.parse_args()
+    images = image_config(args)
     optimization = optimization_config(args)
     optimization.validate_variant(args.variant)
     layout = endpoint_layout(
@@ -288,6 +309,8 @@ def main():
     server_instance = uuid.uuid4().hex
     workers = []
     for spec in layout:
+        if images.size is not None:
+            spec["image_resolution"] = images.size
         output = args.output / spec["role"] if len(layout) > 1 else args.output
         output.mkdir(parents=True, exist_ok=True)
         core = load_core(args.checkpoint, output, spec["device"])

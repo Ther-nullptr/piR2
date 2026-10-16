@@ -45,6 +45,8 @@ def stage_command(plan, case, stage, output, gpu, gpu_uuid):
         "capture": "none" if stage == "timing" else "cuda",
         "capture_window": config["capture_window"],
     }.items():
+        if key == "image_resolution" and value is None:
+            continue
         command += ["--" + key.replace("_", "-"), str(value)]
     if stage == "ncu":
         command += ["--replay-output-root", str(output / "worker-passes")]

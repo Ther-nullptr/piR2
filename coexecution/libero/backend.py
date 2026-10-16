@@ -256,6 +256,10 @@ class Backend:
                 if self.feature_transport == "numpy_bf16"
                 else "upstream_return_features",
             }
+        if getattr(self, "image_resolution", None) is not None:
+            with self.core._vl_cache_lock:
+                self.image_resolution.record_features(self.core._vl_cache)
+            meta["image_resolution"] = self.image_resolution.evidence()
         self.cache_meta = meta
         self.cache_install_timing = {}
         result["meta"] = meta
@@ -326,6 +330,9 @@ class Backend:
                 period_ms=50.0,
             )
         self.stream.synchronize()
+        if getattr(self, "image_resolution", None) is not None:
+            with self.core._vl_cache_lock:
+                self.image_resolution.record_features(self.core._vl_cache)
         return {
             "actions": self.raw(actions),
             "bootstrap_seconds": time.monotonic() - started,

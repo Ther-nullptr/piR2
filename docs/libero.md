@@ -65,6 +65,78 @@ Use a new output directory when changing the plan. Deployment comparison fixes
 real control at 20 Hz and reports success, deadline misses and executed AoI;
 kernel timing alone does not establish these results.
 
+## Fixed inference image resolution / 固定推理图像分辨率
+
+**中文：** 在原有服务命令后添加 `--image-resolution 192`（或 `128`），
+即可保留 checkpoint 的原有裁剪/视野，再对双相机图像做 `INTER_AREA`
+缩放。未指定参数时完全沿用 checkpoint；这不是默认 256。
+该选项会改变视觉信息及可能的任务质量，与数值优化配置独立。
+
+**English:** Append `--image-resolution 192` or `128` to an existing
+`python -m coexecution.libero.service` command (the compatibility
+`scripts/serve_libero_protocol.py` entrypoint also accepts it). Both cameras keep
+the checkpoint's complete eval crop/transform, followed by an area resize.
+All Qwen pixel consumers, including the collators, receive the matching pixel
+budget so they cannot silently upscale the image again. Omitting the argument
+leaves the checkpoint preprocessing untouched. Explicit sizes must be positive,
+no larger than the square checkpoint target, and divisible by the actual Qwen
+`patch_size * merge_size`. The current override requires eval-mode
+albumentations preprocessing; unsupported pipelines fail instead of falling back.
+
+An experiment plan can declare `image_resolution` globally or per condition;
+a condition's explicit `null` restores checkpoint behavior for that condition.
+For example, a condition in an otherwise complete plan can contain:
+
+```json
+{
+  "name": "bf16-r192",
+  "checkpoint": "models/spatial-checkpoint",
+  "variant": "pir2",
+  "image_resolution": 192,
+  "flags": ["--input-preparation", "--static-vlm", "--vlm-cuda-graph"]
+}
+```
+
+The runner passes the same setting to both independently owned policies in
+split or paired layouts. The evaluator records it in each server's stable
+identity, binding resumes to that configuration. Vision response metadata also
+records the observed `actual_grid_thw`, visual tokens per image and feature
+tensor shapes. Do not equate the requested size with the observed token count.
+
+The reusable API is separate from `OptimizationConfig`:
+
+```python
+from coexecution.libero.preprocessing import ImageResolutionConfig, ImageResolutionScope
+from coexecution.optimization.session import GrootOptimizations
+
+with ImageResolutionScope(policy, ImageResolutionConfig(size=192)):
+    with GrootOptimizations(policy, optimization_config):
+        # Collate, prepare inputs, warm every shape, then run serial inference.
+        ...
+```
+
+The resolution scope must enclose input preparation and optimization/Graph
+scopes. Exit quiescently after those scopes close; the original processors and
+eval transform are restored, including on setup failure. Live resolution
+switching and nested ownership are unsupported. Training transforms, model
+weights and checkpoint metadata are not modified. Lower-resolution features
+can also reduce DiT attention work, so measure the matching solo DiT baseline
+before attributing a concurrent improvement entirely to reduced contention.
+
+`coexecution.libero.measurement`, the streaming contention `worker` and
+`campaign prepare`, and the Flow contention `flow` command accept the same
+`--image-resolution` option. They apply it before preparing resident inputs and
+keep the actual-grid evidence in their results; an already prepared tensor
+cannot be resized by changing a later service argument.
+
+Lightweight configuration/lifecycle checks run with
+`python -m pytest -q tests/contracts/test_image_resolution.py`.
+The explicit pinned-processor/tiny-CUDA gate is
+`PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_image_resolution_gpu.py`.
+It checks fast/slow Qwen processors, reduced token/feature lengths, Flow4 and
+streaming bootstrap/one-step updates, and eager/Graph agreement at each size.
+These contracts do not establish trained-policy task success or a speedup.
+
 ## Training
 
 After selecting an idle GPU, train both methods with the same dataset, seed 1000, effective batch 64, H40 and 10,000-update schedule:

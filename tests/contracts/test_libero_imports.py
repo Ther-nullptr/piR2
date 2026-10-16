@@ -126,7 +126,7 @@ else:
 
 
 def test_evaluation_fingerprints_include_canonical_runtime_implementations(tmp_path):
-    from coexecution.libero import backend, features, loading, service
+    from coexecution.libero import backend, features, loading, preprocessing, service
 
     source = ROOT / "scripts/evaluate_libero_protocol.py"
     module = ast.parse(source.read_text())
@@ -143,7 +143,7 @@ def test_evaluation_fingerprints_include_canonical_runtime_implementations(tmp_p
     recorded_files = ast.literal_eval(files_assignment.value)
     runtime_files = [
         Path(item.__file__).relative_to(ROOT).as_posix()
-        for item in (loading, backend, service, features)
+        for item in (loading, backend, service, features, preprocessing)
     ]
     assert set(runtime_files) <= set(recorded_files)
     assert {
