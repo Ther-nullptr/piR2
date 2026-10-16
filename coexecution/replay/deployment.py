@@ -384,7 +384,12 @@ def deployment_run(root, media):
     if execution_clock not in ("paced", "ready"):
         raise ValueError("Unknown deployment execution clock")
     execution_coupling = config.get("execution_coupling", "asynchronous")
-    if execution_coupling not in ("asynchronous", "synchronous", "one_step_async"):
+    if execution_coupling not in (
+        "asynchronous",
+        "synchronous",
+        "one_step_async",
+        "chunked_async",
+    ):
         raise ValueError("Unknown deployment execution coupling")
     metadata = read_jsonl(root / "episodes.jsonl")
     run_id = "deployment-" + digest(str(root))[:20]
@@ -464,7 +469,7 @@ def deployment_run(root, media):
             model_request_id = (
                 f"{episode_id}/S1-{producer}" if producer is not None else None
             )
-            if execution_coupling == "one_step_async":
+            if execution_coupling in ("one_step_async", "chunked_async"):
                 row["model_request_id"] = model_request_id
             else:
                 row["request_id"] = model_request_id
@@ -481,18 +486,16 @@ def deployment_run(root, media):
         phases, cycles = [], []
         if execution_coupling == "synchronous":
             phases, cycles = _synchronous_phases(events, ticks, start, stop, episode_id)
-        elif execution_coupling == "one_step_async":
-            from .async_deployment import one_step_async_replay
+        elif execution_coupling in ("one_step_async", "chunked_async"):
+            from .async_deployment import async_replay
 
-            phases, queue["replay_requests"] = one_step_async_replay(
-                events, queue, episode_id
-            )
+            phases, queue["replay_requests"] = async_replay(events, queue, episode_id)
         for request in queue["requests"]:
             sequence = (
                 request.get("request_tick")
                 if request["role"] == "S1"
                 else request.get("feature_sequence")
-                if execution_coupling == "one_step_async"
+                if execution_coupling in ("one_step_async", "chunked_async")
                 else request.get("source_tick")
             )
             request["id"] = f"{episode_id}/{request['role']}-{sequence}"
@@ -544,6 +547,7 @@ def deployment_run(root, media):
                 "robot": robot,
             }
         )
+    schedule = _deployment_schedule(config, episodes, execution_coupling)
     return {
         "schema": "pir2.replay.run",
         "version": VERSION,
@@ -551,6 +555,7 @@ def deployment_run(root, media):
         "kind": "deployment",
         "execution_clock": execution_clock,
         "execution_coupling": execution_coupling,
+        **schedule,
         "label": root.parent.name,
         "precision": _precision(config),
         "mode": root.parent.name,
@@ -565,3 +570,38 @@ def deployment_run(root, media):
         ],
         "timing_note": "Actual host/controller/RPC timestamps; these lanes are not GPU kernel activity. Debug camera recording can affect control timing.",
     }
+
+
+def _deployment_schedule(config, episodes, coupling):
+    """Declare only recorded K/D, and reject configuration/evidence disagreement."""
+    keys = ("execution_prefix_steps", "async_overlap_steps")
+    if coupling == "asynchronous":
+        return dict.fromkeys(keys)
+    fixed = (
+        (1, 1)
+        if coupling == "one_step_async"
+        else (None, 0 if coupling == "synchronous" else None)
+    )
+    schedule = []
+    for index, key in enumerate(keys):
+        configured = config.get(key)
+        if key == "execution_prefix_steps":
+            alias = config.get("synchronous_chunk_steps")
+            if configured is not None and alias is not None and configured != alias:
+                raise ValueError("Conflicting configured execution prefixes")
+            configured = configured if configured is not None else alias
+        values = [
+            e["queue"][key]
+            for e in episodes
+            if e.get("queue") is not None and e["queue"].get(key) is not None
+        ]
+        values += [v for v in (configured, fixed[index]) if v is not None]
+        if any(type(v) is not int or v < (1 if index == 0 else 0) for v in values):
+            raise ValueError("Invalid recorded execution schedule")
+        if values and any(v != values[0] for v in values):
+            raise ValueError("Deployment schedule disagrees with recorded evidence")
+        schedule.append(values[0] if values else None)
+    k, d = schedule
+    if coupling == "chunked_async" and (k is None or d is None or not 1 <= d <= k):
+        raise ValueError("Chunked async requires a measured valid K/D schedule")
+    return dict(zip(keys, schedule))

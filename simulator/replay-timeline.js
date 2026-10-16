@@ -184,7 +184,7 @@
     const view = viewport(cursor, end, Math.min(0.3, end));
     let left = view.start;
     for (const row of rows) {
-      if (R.deploymentCoupling(row.run) !== "one_step_async") continue;
+      if (!R.isFullPolicyAsync(row.run)) continue;
       const requests = R.timelineQueue(row.episode)?.requests ?? [];
       for (const phase of R.activePhases(row.episode, cursor)) {
         if (phase.phase !== "execution" || phase.request_tick == null) continue;
@@ -227,7 +227,8 @@
       ? Q.dependencies(queue, 0, queue.duration_s ?? Infinity)
       : null;
     const synchronous = R.deploymentCoupling(row.run) === "synchronous";
-    const lookahead = R.deploymentCoupling(row.run) === "one_step_async";
+    const lookahead = R.isFullPolicyAsync(row.run);
+    const chunked = R.deploymentCoupling(row.run) === "chunked_async";
     const visualCounts = new Map();
     for (const request of requests)
       if (request.role === "S2" && request.feature_sequence != null)
@@ -285,7 +286,7 @@
             sourceId: stage === "action" ? (parent?.request?.id ?? null) : null,
             adopted: stage === "action" ? r.adopted_s : null,
             description: lookahead
-              ? `Obs ${r.source_tick ?? "?"} → action ${r.target_tick ?? "?"}${r.disposition === "unused" ? " · unused final" : ""}`
+              ? `Obs ${r.source_tick ?? "?"} → ${chunked ? "plan" : "action"} ${r.target_tick ?? "?"}${chunked ? " · native " + (r.decoded_horizon ?? "?") + " / accepted " + (r.accepted_prefix_steps ?? "?") + " / executed " + (r.executed_prefix_steps ?? "?") : ""}${r.disposition === "unused" ? " · unused final" : ""}`
               : null,
             consumed:
               stage === "vlm"
@@ -339,7 +340,7 @@
           return {
             id: p.id,
             label: lookahead
-              ? `Request ${p.request_id ?? "?"} · ${{ inference: p.request_id === 0 ? "Bootstrap" : "Infer", execution: "Execute 1", wait: "Wait", drain: "Drain unused" }[p.phase]}`
+              ? `Request ${p.request_id ?? "?"} · ${p.phase === "execution" && chunked ? "Tick " + (p.execution_id ?? "?") + " · offset " + (p.executed_offset ?? "?") : { inference: p.request_id === 0 ? "Bootstrap" : "Infer", execution: "Execute 1", wait: "Wait", drain: "Drain unused" }[p.phase]}`
               : `Cycle ${p.cycle ?? "?"} · ${p.phase === "inference" ? "Infer" : "Execute"}`,
             stage: "phase",
             phaseKind: p.phase,
@@ -361,7 +362,7 @@
             sourceId: action?.id ?? null,
             sourceLabel: action?.label ?? null,
             description: lookahead
-              ? `Obs ${p.source_tick ?? "?"} → action ${p.target_tick ?? "?"} · ${p.simulation_paused ? "Simulation paused" : p.phase === "inference" ? "Overlap allowed" : "One physical step"}`
+              ? `Obs ${p.source_tick ?? "?"} → plan ${p.target_tick ?? "?"}${chunked && p.phase === "execution" ? " · tick " + (p.execution_id ?? "?") + " · native offset " + (p.executed_offset ?? "?") + " · lag " + (Number.isInteger(p.execution_id) && Number.isInteger(p.source_tick) ? p.execution_id - p.source_tick : "?") + " physics steps" : ""} · ${p.simulation_paused ? "Simulation paused" : p.phase === "inference" ? "Overlap allowed" : "One physical step"}`
               : p.phase === "inference"
                 ? "Simulation paused"
                 : "Executing actions",
