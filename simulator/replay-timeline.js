@@ -21,6 +21,7 @@
         async_policy_rpc:
           "真实异步 policy RPC（worker 输入准备之后）· 可与执行重叠",
         control_wait: "真实等待 / 终止排空 · 此区间无物理推进",
+        env_step: "真实 env.step 墙钟 · 无额外节拍等待；每步推进 50 ms 仿真",
         execution_phase: "动作执行段 · 控制墙钟（包含执行段节拍等待）",
         gpu_span: "实际 CUDA 首末事件跨度（含间隙）",
         host_submit: "主机提交区间",
@@ -352,7 +353,9 @@
                   : "inference_rpc"
                 : ["wait", "drain"].includes(p.phase)
                   ? "control_wait"
-                  : "execution_phase",
+                  : lookahead
+                    ? "env_step"
+                    : "execution_phase",
             clockId: "control_wall",
             status: p.status ?? (p.end_s == null ? "incomplete" : "completed"),
             sourceId: action?.id ?? null,
