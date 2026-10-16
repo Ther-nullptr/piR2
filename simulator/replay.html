@@ -53,6 +53,9 @@
         <label id="execution-clock-label"
           >执行时钟<select id="execution-clock"></select
         ></label>
+        <label id="execution-coupling-label"
+          >动作与推理<select id="execution-coupling"></select
+        ></label>
         <label
           ><span id="sample-label">输入 / 随机种子</span
           ><select id="sample"></select
@@ -131,6 +134,8 @@
                 <option value="all">全部模块</option>
                 <option value="vlm">VLM / S2</option>
                 <option value="action">Action / S1</option>
+                <option value="phase">Inference / Execution phases</option>
+                <option value="control">Control</option>
               </select></label
             ><label
               >内核类别<select id="category">

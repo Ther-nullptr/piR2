@@ -7,7 +7,13 @@ from .schema import VERSION, write_json
 
 
 def build_catalog(
-    *, model_runs, deployments, output, clock_cohort=None, default_execution_clock=None
+    *,
+    model_runs,
+    deployments,
+    output,
+    clock_cohort=None,
+    default_execution_clock=None,
+    default_execution_coupling=None,
 ):
     from .deployment import deployment_directories, deployment_run
     from .media import MediaRegistry
@@ -42,6 +48,21 @@ def build_catalog(
         raise ValueError(
             "Requested default execution clock is not present in deployment evidence"
         )
+    if default_execution_coupling is not None and (
+        default_execution_coupling not in ("asynchronous", "synchronous")
+        or not any(
+            run.get("execution_coupling") == default_execution_coupling
+            and (
+                default_execution_clock is None
+                or run.get("execution_clock") == default_execution_clock
+            )
+            for run in runs
+            if run["kind"] == "deployment"
+        )
+    ):
+        raise ValueError(
+            "Requested execution coupling/clock is not present in deployment evidence"
+        )
     compare_outputs(runs)
     index = []
     for run in runs:
@@ -56,7 +77,10 @@ def build_catalog(
                 "episodes": len(run.get("episodes", [])),
                 "warnings": run["warnings"],
                 **(
-                    {"execution_clock": run["execution_clock"]}
+                    {
+                        "execution_clock": run["execution_clock"],
+                        "execution_coupling": run["execution_coupling"],
+                    }
                     if run["kind"] == "deployment"
                     else {}
                 ),
@@ -78,6 +102,7 @@ def build_catalog(
         "media_manifest": "media.json",
         "clock_cohort": clock_cohort,
         "default_execution_clock": default_execution_clock,
+        "default_execution_coupling": default_execution_coupling,
         "notes": [
             "Independent model replay and closed-loop robot trajectories have separate measurement boundaries",
             "Missing evidence remains null or unavailable, never a fabricated zero",

@@ -180,8 +180,20 @@ helpers, never Torch, NumPy archives, a simulator or a model.
   Thin task bars move through a following time window, with explicit not-started,
   running, completed and failed/unknown states. `S1[n].k` names the actual consumed
   S2 feature, never the newest cache by proximity. Click a bar to inspect its
-  source and timestamps; detailed kernels remain in the expandable section.
-  Deployment bars are RPC intervals. Model Profile bars span the actual first
+  source and timestamps; recorded upstream tasks are highlighted with a dashed
+  outline. Detailed kernels remain in the expandable section.
+  Asynchronous deployment bars are RPC intervals. Synchronous VLM/DiT bars are
+  server stages within one full inference RPC, not separate RPCs or GPU kernel
+  durations. A third `Inference / Execution` track uses only recorded
+  `episode.phases` intervals on the control wall clock: inference pauses physics;
+  execution includes the configured action-phase pacing. Execution source links
+  use the phase's recorded producer request identity, never the closest task in
+  time. Missing phases or producer identities stay unavailable. The coupling
+  selector is independent of cadence; synchronous `paced` means 20 Hz within
+  execution phases only, not a global fixed control frequency. Cards show the
+  current phase, wall/physics clocks and retained episode outcome. Videos continue
+  to use recorded frame timestamps, including held frames during inference.
+  Model Profile bars span the actual first
   and last attributed CUDA activity, including gaps; host-submission intervals
   remain explicitly labelled. Clean records without component timestamps show
   unavailable tracks. Bar shading follows the recorded playback cursor, not an

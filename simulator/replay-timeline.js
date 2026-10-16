@@ -12,6 +12,21 @@
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const names = { vlm: "VLM / S2", action: "DiT / S1" };
 
+  function basisLabel(basis) {
+    return (
+      {
+        rpc: "完整请求区间（含准备/通信）",
+        server_stage: "服务端分段（非独立 RPC，非 GPU kernel 时间）",
+        inference_rpc: "完整同步推理 RPC · 控制墙钟 · 仿真暂停",
+        execution_phase: "动作执行段 · 控制墙钟（包含执行段节拍等待）",
+        gpu_span: "实际 CUDA 首末事件跨度（含间隙）",
+        host_submit: "主机提交区间",
+        host_observed_cuda_completion: "主机观察 CUDA 完成",
+        cuda_event: "CUDA event 区间",
+      }[basis] ?? "计时边界未记录"
+    );
+  }
+
   function phase(block, cursor) {
     if (cursor < block.start)
       return { key: "future", label: "尚未开始", progress: 0 };
@@ -48,8 +63,12 @@
           1,
         ),
       };
-    if (block.status === "incomplete")
-      return { key: "unknown", label: "未完成", progress: null };
+    if (["incomplete", "unknown"].includes(block.status))
+      return {
+        key: "unknown",
+        label: block.status === "unknown" ? "结果未知" : "未完成",
+        progress: null,
+      };
     if (submitting)
       return {
         key: "submitted",
@@ -69,6 +88,92 @@
     return { start: left, end: left + span, span };
   }
 
+  function synchronousCycles(row) {
+    const complete = new Map();
+    if (R.deploymentCoupling(row.run) !== "synchronous") return complete;
+    const cycles = new Map();
+    for (const p of row.episode?.phases ?? []) {
+      if (!Number.isInteger(p.cycle)) continue;
+      if (!cycles.has(p.cycle)) cycles.set(p.cycle, []);
+      cycles.get(p.cycle).push(p);
+    }
+    for (const [cycle, phases] of cycles) {
+      const inference = phases.find((p) => p.phase === "inference");
+      const execution = phases.find((p) => p.phase === "execution");
+      if (
+        phases.length !== 2 ||
+        !inference ||
+        !execution ||
+        phases.some(
+          (p) =>
+            !finite(p.start_s) ||
+            !finite(p.end_s) ||
+            p.end_s < p.start_s ||
+            ["unknown", "incomplete", "running"].includes(p.status),
+        ) ||
+        execution.start_s < inference.end_s
+      )
+        continue;
+      complete.set(cycle, {
+        start: inference.start_s,
+        end: execution.end_s,
+        executionStart: execution.start_s,
+        requestTick: execution.request_tick,
+      });
+    }
+    return complete;
+  }
+
+  function synchronousSpan(rows, end) {
+    let span = 0.3;
+    for (const row of rows) {
+      const complete = synchronousCycles(row);
+      // Two actual adjacent cycles, including their recorded inter-cycle gap.
+      // A single cycle or an open/unknown phase is never extrapolated.
+      for (const [cycle, first] of complete) {
+        const second = complete.get(cycle + 1);
+        if (second && second.start >= first.end)
+          span = Math.max(span, second.end - first.start);
+      }
+    }
+    return finite(end) && end >= 0 ? Math.min(span, end) : span;
+  }
+
+  function synchronousViewport(rows, cursor, end) {
+    const view = viewport(cursor, end, synchronousSpan(rows, end));
+    let left = view.start;
+    for (const row of rows) {
+      for (const cycle of synchronousCycles(row).values()) {
+        if (cursor < cycle.executionStart || cursor >= cycle.end) continue;
+        // Preserve the current execution cycle's complete inference history.
+        // Unequal cycles and a single recorded cycle need no history percentage.
+        left = Math.min(left, cycle.start);
+        const requests = row.episode?.queue?.requests ?? [];
+        const actions =
+          cycle.requestTick == null
+            ? []
+            : requests.filter(
+                (r) => r.role === "S1" && r.request_tick === cycle.requestTick,
+              );
+        if (actions.length !== 1) continue;
+        const action = actions[0];
+        if (finite(action.start_s)) left = Math.min(left, action.start_s);
+        const sources =
+          action.feature_sequence == null
+            ? []
+            : requests.filter(
+                (r) =>
+                  r.role === "S2" &&
+                  r.feature_sequence === action.feature_sequence,
+              );
+        if (sources.length === 1 && finite(sources[0].start_s))
+          left = Math.min(left, sources[0].start_s);
+      }
+    }
+    left = Math.max(0, left);
+    return { start: left, end: view.end, span: view.end - left };
+  }
+
   function geometry(block, view) {
     const stop = finite(block.end) ? block.end : view.end;
     return {
@@ -85,13 +190,15 @@
     const aliases = queue
       ? Q.dependencies(queue, 0, queue.duration_s ?? Infinity)
       : null;
-    return ["vlm", "action"].map((stage) => ({
+    const synchronous = R.deploymentCoupling(row.run) === "synchronous";
+    const taskTracks = ["vlm", "action"].map((stage) => ({
       id: row.run.id + ":" + stage,
       precision: row.run.precision,
       stage,
       title: names[stage],
       unit: "s",
-      basis: "rpc",
+      basis: synchronous ? "server_stage" : "rpc",
+      clockId: "control_wall",
       unavailable: !queue ? "本运行未记录模块时序" : null,
       blocks: requests
         .filter(
@@ -116,7 +223,13 @@
             start: r.start_s,
             end,
             unit: "s",
-            basis: "rpc",
+            basis: r.timing_scope?.startsWith("server_")
+              ? "server_stage"
+              : synchronous
+                ? "unknown"
+                : "rpc",
+            timingScope: r.timing_scope ?? null,
+            clockId: "control_wall",
             status: r.status ?? (end == null ? "incomplete" : "completed"),
             featureSequence: r.feature_sequence ?? null,
             sourceLabel: stage === "action" ? (parent?.label ?? null) : null,
@@ -135,7 +248,9 @@
                 : [],
             event: {
               id: r.id,
-              kind: "rpc",
+              kind: r.timing_scope?.startsWith("server_")
+                ? "server_stage"
+                : "rpc",
               precision: row.run.precision,
               run: row.run,
               episode: row.episode,
@@ -144,6 +259,86 @@
           };
         }),
     }));
+    if (synchronous || row.episode?.phases?.length) {
+      const blocks = (row.episode?.phases ?? [])
+        .filter(
+          (p) =>
+            ["inference", "execution"].includes(p.phase) &&
+            finite(p.start_s) &&
+            (p.end_s == null || (finite(p.end_s) && p.end_s >= p.start_s)),
+        )
+        .map((p) => {
+          // Recorded producer identity is authoritative. Temporal proximity is
+          // insufficient: another completed DiT may not supply these actions.
+          const producers =
+            p.phase === "execution" && p.request_tick != null
+              ? requests.filter(
+                  (r) => r.role === "S1" && r.request_tick === p.request_tick,
+                )
+              : [];
+          const producer = producers.length === 1 ? producers[0] : null;
+          const action = producer
+            ? taskTracks[1].blocks.find((b) => b.id === producer.id)
+            : null;
+          return {
+            id: p.id,
+            label: `Cycle ${p.cycle ?? "?"} · ${p.phase === "inference" ? "Infer" : "Execute"}`,
+            stage: "phase",
+            phaseKind: p.phase,
+            start: p.start_s,
+            end: p.end_s ?? null,
+            unit: "s",
+            basis:
+              p.phase === "inference" ? "inference_rpc" : "execution_phase",
+            clockId: "control_wall",
+            status: p.status ?? (p.end_s == null ? "incomplete" : "completed"),
+            sourceId: action?.id ?? null,
+            sourceLabel: action?.label ?? null,
+            description:
+              p.phase === "inference"
+                ? "Simulation paused"
+                : "Executing actions",
+            event: {
+              id: p.id,
+              kind: "phase",
+              precision: row.run.precision,
+              run: row.run,
+              episode: row.episode,
+              phase: p,
+              source_request: producer,
+            },
+          };
+        });
+      taskTracks.push({
+        id: row.run.id + ":phase",
+        precision: row.run.precision,
+        stage: "phase",
+        title: "Inference / Execution",
+        unit: "s",
+        basis: "control_wall",
+        clockId: "control_wall",
+        blocks,
+        unavailable: blocks.length ? null : "未记录推理 / 执行阶段",
+      });
+    }
+    return taskTracks;
+  }
+
+  function sourceBlocks(tracks, selectedId) {
+    const blocks = new Map(
+      tracks.flatMap((t) => t.blocks.map((b) => [b.id, b])),
+    );
+    const visited = new Set([selectedId]),
+      sources = [];
+    let sourceId = blocks.get(selectedId)?.sourceId;
+    while (sourceId != null && !visited.has(sourceId)) {
+      visited.add(sourceId);
+      const block = blocks.get(sourceId);
+      if (!block) break;
+      sources.push(block);
+      sourceId = block.sourceId;
+    }
+    return sources;
   }
 
   function model(row) {
@@ -279,5 +474,16 @@
       : { key: "idle", label: "等待首个任务", block: null };
   }
 
-  return { tracks, phase, viewport, geometry, laneState, observedModelEnd };
+  return {
+    tracks,
+    phase,
+    viewport,
+    synchronousSpan,
+    synchronousViewport,
+    geometry,
+    laneState,
+    observedModelEnd,
+    basisLabel,
+    sourceBlocks,
+  };
 });
