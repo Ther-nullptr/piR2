@@ -322,6 +322,11 @@ python scripts/evaluate_libero_protocol.py \
 ```
 
 experiment plan 支持 `async_overlap_steps`，condition 中的值覆盖全局。
+启动实验前，runner 读取每个 checkpoint 的 `processor_config.json` 中
+`processor_kwargs.modality_configs.libero_sim.action.delta_indices`，按其实际长度
+检查所有 condition 的有效 K；它不会把模型的 H40 当作原生解码长度，也不会加载模型。
+root metadata 优先，缺失时才按上游 loader 回退到 `processor/` 子目录；错误或缺失的
+metadata 在 GPU admission 和子进程启动之前报错。服务加载后的 identity 检查仍保留。
 对照矩阵可采用 K1/D0,1；K2/D0,1,2；K4/D0,1,2,4；K8/D0,1,4,8。
 D0 condition 设置 `execution_coupling=synchronous`；D>0 设置 `chunked_async`。
 该版本仅支持 deployment Flow、ready、一个普通 action endpoint。输入快照独立

@@ -712,3 +712,102 @@ def test_one_step_async_plan_owns_single_worker_and_prefix_alias(plan):
     plan["conditions"][1]["execution_prefix_steps"] = 1
     with pytest.raises(ValueError, match="Conflicting"):
         module().validate_plan(plan)
+
+
+def launchable_plan(plan, tmp_path, horizon=16):
+    """Real checkpoint JSON layout and files, without a model or CUDA runtime."""
+    import json
+
+    root = tmp_path / "runtime"
+    upstream = root / "upstream/learning/Isaac-GR00T"
+    checkpoint = tmp_path / "checkpoint"
+    for path in (
+        root / "coexecution/libero/service.py",
+        root / "scripts/evaluate_libero_protocol.py",
+        tmp_path / "model-python",
+        tmp_path / "evaluation-python",
+        tmp_path / "libero-config",
+        upstream / "gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
+        upstream / "gr00t/policy/decoupled_policy.py",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"action_horizon": 40}))
+    (checkpoint / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_class": "Gr00tN1d7Processor",
+                "processor_kwargs": {
+                    "modality_configs": {
+                        "libero_sim": {
+                            "action": {"delta_indices": list(range(horizon))}
+                        }
+                    }
+                },
+            }
+        )
+    )
+    result = deepcopy(plan)
+    result.update(
+        runtime_root=str(root),
+        model_python=str(tmp_path / "model-python"),
+        evaluation_python=str(tmp_path / "evaluation-python"),
+        upstream=str(upstream),
+        libero_config=str(tmp_path / "libero-config"),
+        execution_clock="ready",
+        execution_coupling="chunked_async",
+        execution_prefix_steps=8,
+        async_overlap_steps=1,
+    )
+    for condition in result["conditions"]:
+        condition["checkpoint"] = str(checkpoint)
+    return result
+
+
+@pytest.mark.parametrize("coupling", ["synchronous", "chunked_async"])
+@pytest.mark.parametrize("override", [False, True], ids=["global", "last-condition"])
+def test_native_prefix_preflight_rejects_before_any_gpu_or_child(
+    plan, tmp_path, monkeypatch, coupling, override
+):
+    m = module()
+    plan = launchable_plan(plan, tmp_path)
+    plan["execution_coupling"] = coupling
+    plan["async_overlap_steps"] = 1 if coupling == "chunked_async" else 0
+    if override:
+        plan["conditions"][-1]["execution_prefix_steps"] = 17
+    else:
+        plan["execution_prefix_steps"] = 17
+    activity = []
+    monkeypatch.setattr(m, "_admit_devices", lambda *_: activity.append("gpu"))
+    monkeypatch.setattr(m.OwnedProcesses, "start", lambda *_: activity.append("child"))
+    with pytest.raises(ValueError, match="prefix 17 exceeds native decoded horizon 16"):
+        m.run(plan, tmp_path / "output")
+    assert activity == []
+    assert not (tmp_path / "output").exists()
+
+
+def test_native_prefix_preflight_uses_condition_override_and_actual_length(
+    plan, tmp_path
+):
+    m = module()
+    plan = launchable_plan(plan, tmp_path, horizon=24)
+    plan["execution_prefix_steps"] = 30
+    for condition in plan["conditions"]:
+        condition["execution_prefix_steps"] = 24
+    m.validate_plan(plan)
+    m.validate_launch_paths(plan)
+    plan["conditions"][-1]["execution_prefix_steps"] = 25
+    with pytest.raises(ValueError, match="prefix 25 exceeds native decoded horizon 24"):
+        m.validate_launch_paths(plan)
+
+
+def test_one_step_preflight_requires_readable_native_processor(plan, tmp_path):
+    m = module()
+    plan = launchable_plan(plan, tmp_path)
+    plan.update(execution_coupling="one_step_async", execution_prefix_steps=1)
+    m.validate_plan(plan)
+    m.validate_launch_paths(plan)
+    (Path(plan["conditions"][0]["checkpoint"]) / "processor_config.json").unlink()
+    with pytest.raises(ValueError, match="decoded action horizon"):
+        m.validate_launch_paths(plan)
