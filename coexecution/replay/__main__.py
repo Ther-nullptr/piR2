@@ -20,7 +20,7 @@ def main(argv=None):
     )
     build.add_argument(
         "--default-execution-coupling",
-        choices=("asynchronous", "synchronous"),
+        choices=("asynchronous", "synchronous", "one_step_async"),
         help="Explicit robot coupling default; must exist with the selected clock",
     )
     build.add_argument(

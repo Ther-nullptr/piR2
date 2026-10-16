@@ -285,3 +285,17 @@ forward_counts 和完整 RPC 分布包含最终未用请求；`adopted_policy_ca
 `work_requests` 保留整个 bootstrap/推测/排空过程，不把 drain 隐去。
 `measured_inference_execution_overlap_seconds` 是实际 RPC 与实际执行区间的交集；
 服务端 VLM/DiT 交集另列，不能从“提交在步进之前”推断一定存在 GPU 重叠。
+
+
+回放导入与 `feature_usage.audit_raw` 共用 `coexecution.async_evidence` 的全工作审计。
+每个规范化 `work_requests` 项都要独立匹配原始 submission、图像 hash、RPC 和服务端
+阶段、唯一 request/target/source、adopted 或 unused 处置及实际动作；最终不用的计算
+同样验证。缺失、重复、错误时序或计数不一致会拒绝结果。控制窗口 `requests` 不变，
+供前端使用的 `replay_requests` 保留完整 VLM/DiT 阶段，`work_end_s` 保留排空尾部。
+前端把 Policy RPC 与 Execute/Wait/Drain 分成可同时可见的轨道；执行动作关联其精确的
+DiT→VLM 来源，并同时显示物理步滞后和 wall AoI。末尾机器人保持真实末帧，模型轨道
+继续展示未执行的最终结果。当前为调试记录，非无插桩性能测试或完整套件成功率。
+
+比较完整策略延时时，异步 `inference_request_seconds` 从主线程提交至响应；其
+`inference_wall_seconds` 仅为 worker 输入准备之后的 RPC。同步的完整调用起点在
+输入准备之前。前端分别标注这些边界，不能直接把异步 RPC 与同步完整调用做加速比。

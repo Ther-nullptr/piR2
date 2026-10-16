@@ -152,11 +152,54 @@
     }
     return out.sort((a, b) => a.time - b.time);
   }
-  function episodeEnd(episode) {
+  function controlledEnd(episode) {
     return finite(episode?.controlled_end_s) &&
       finite(episode?.controlled_start_s)
       ? episode.controlled_end_s - episode.controlled_start_s
       : (episode?.queue?.duration_s ?? null);
+  }
+  function episodeEnd(episode) {
+    return finite(episode?.work_end_s) && finite(episode?.controlled_start_s)
+      ? episode.work_end_s - episode.controlled_start_s
+      : controlledEnd(episode);
+  }
+  function timelineQueue(episode) {
+    if (!episode?.queue) return null;
+    return {
+      ...episode.queue,
+      requests: episode.queue.replay_requests ?? episode.queue.requests,
+      duration_s: episodeEnd(episode),
+    };
+  }
+  function activePhases(episode, time) {
+    return (episode?.phases ?? []).filter(
+      (phase) =>
+        finite(phase.start_s) &&
+        finite(phase.end_s) &&
+        phase.start_s <= time &&
+        time < phase.end_s,
+    );
+  }
+  function asyncStatus(episode, time) {
+    const phases = activePhases(episode, time);
+    const active = new Set(phases.map((p) => p.phase));
+    const end = controlledEnd(episode),
+      workEnd = episodeEnd(episode);
+    if (finite(workEnd) && time >= workEnd)
+      return "Robot stopped · all work complete";
+    if (finite(end) && time >= end)
+      return active.has("inference")
+        ? "Robot stopped · unused inference / terminal drain"
+        : "Robot stopped · terminal drain";
+    if (phases.some((p) => p.phase === "inference" && p.request_id === 0))
+      return "Bootstrap inference · simulation paused";
+    if (active.has("inference") && active.has("execution"))
+      return "Inferring + executing";
+    if (active.has("wait"))
+      return "Waiting for next result · simulation paused";
+    if (active.has("execution")) return "Executing one action";
+    if (active.has("inference")) return "Inferring · between physical steps";
+    return "Control transition";
   }
   function normalizeEpisode(episode) {
     const metadata = episode.metadata ?? {};
@@ -203,7 +246,7 @@
     );
   }
   function robotAt(episode, time, camera) {
-    const end = episodeEnd(episode),
+    const end = controlledEnd(episode),
       at = finite(end) ? Math.min(time, end) : time;
     return {
       frame: lastAt(episode?.robot?.frames, at, "relative_s"),
@@ -326,6 +369,10 @@
     deploymentCadence,
     deploymentCoupling,
     phaseAt,
+    activePhases,
+    asyncStatus,
+    timelineQueue,
+    controlledEnd,
     physicsAt,
     replayDescriptors,
     playableEpisode,

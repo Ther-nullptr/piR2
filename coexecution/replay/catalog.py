@@ -49,7 +49,8 @@ def build_catalog(
             "Requested default execution clock is not present in deployment evidence"
         )
     if default_execution_coupling is not None and (
-        default_execution_coupling not in ("asynchronous", "synchronous")
+        default_execution_coupling
+        not in ("asynchronous", "synchronous", "one_step_async")
         or not any(
             run.get("execution_coupling") == default_execution_coupling
             and (

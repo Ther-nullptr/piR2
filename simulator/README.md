@@ -182,7 +182,7 @@ helpers, never Torch, NumPy archives, a simulator or a model.
   S2 feature, never the newest cache by proximity. Click a bar to inspect its
   source and timestamps; recorded upstream tasks are highlighted with a dashed
   outline. Detailed kernels remain in the expandable section.
-  Asynchronous deployment bars are RPC intervals. Synchronous VLM/DiT bars are
+  Cached-asynchronous deployment bars are RPC intervals. Synchronous VLM/DiT bars are
   server stages within one full inference RPC, not separate RPCs or GPU kernel
   durations. A third `Inference / Execution` track uses only recorded
   `episode.phases` intervals on the control wall clock: inference pauses physics;
@@ -198,6 +198,44 @@ helpers, never Torch, NumPy archives, a simulator or a model.
   remain explicitly labelled. Clean records without component timestamps show
   unavailable tracks. Bar shading follows the recorded playback cursor, not an
   estimated fraction of neural work. There is no separate dependency diagram.
+- **One-step asynchronous** is a separate `one_step_async` coupling option, available
+  with `ready` cadence. It overlaps a complete VLM+Flow4 request for the next action
+  with one current physical step. The first bootstrap uses observation 0 for action
+  0; the next request also captures observation 0, but has its own request/feature
+  identity. Subsequent labels show `Obs k → action k+1`. A physical observation lag
+  of one step and wall-clock AoI are distinct metrics. The model's native decoded
+  horizon stays unchanged; only the first command is executed from each result.
+  Separate `Policy RPC` and `Execute / Wait / Drain` tracks expose overlapping
+  intervals without hiding bars. Waiting never consumes extra old actions. Clicking
+  execution highlights the exact prior DiT and VLM producers, even while the next
+  inference runs. The auto window retains these sources. Cards can show
+  `Inferring + executing`, explicit waiting or bootstrap, and stopped-robot terminal
+  drain. Playback extends through `work_end_s`; the robot itself freezes at
+  `controlled_end_s`, while final unused inference remains visible. Frame and
+  physics progression still use actual post-step timestamps, never nominal FPS.
+  The importer and raw feature auditor share a full-work evidence gate: every
+  `work_requests` row is matched to the original submission, capture/hash,
+  RPC/server stages, result disposition and physical execution. Missing, duplicate
+  or contradictory terminal work rejects the catalog. The control-window queue
+  statistics stay separate from the full `replay_requests` task display.
+  Async RPC begins **after** worker input preparation; synchronous full-call
+  timing includes preparation. Compare submission-to-response boundaries when
+  assessing complete policy latency. Both are instrumented host measurements,
+  not GPU kernel activity or full-suite success-rate evidence.
+
+  ```bash
+  python -m coexecution.replay build \
+    --deployment /path/to/one-step-async/deployment \
+    --deployment /path/to/matched-synchronous/deployment \
+    --default-execution-coupling one_step_async --default-execution-clock ready \
+    --output .local/one-step-replay
+  python simulator/serve.py --replay .local/one-step-replay/catalog.json
+  ```
+
+  The catalog default or `?execution_coupling=one_step_async&execution_clock=ready`
+  selects the new protocol; catalog refresh, task/camera changes and SSE retain the
+  same coupling filter. `ready` here means unpaced physical steps with explicit
+  result waits, not 20 Hz wall control or StreamingVLA weights.
 - Declared live streams use `replay-stream.js`: snapshot first, then ordered SSE
   events, duplicate/gap checks, resnapshot and explicit terminal closure. Live
   updates preserve media, cursor and user selection; following the latest event

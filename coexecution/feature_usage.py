@@ -372,6 +372,23 @@ def audit_raw(condition, episode, root):
     ).resolve()
     _check(path.is_relative_to(root), "raw trace path escapes raw root")
     raw = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    if episode.get("execution_coupling") == "one_step_async" or any(
+        row.get("execution_coupling") == "one_step_async" for row in raw
+    ):
+        from coexecution.async_evidence import validate_one_step_async_work
+
+        _check("work_requests" in episode, "raw audit requires full async work")
+        _check(
+            episode.get("execution_coupling") == "one_step_async",
+            "raw/normalized coupling mismatch",
+        )
+        work = validate_one_step_async_work(raw, normalized=episode["work_requests"])
+        for key, expected in {
+            "work_end_s": work["work_end_s"],
+            "work_duration_s": work["work_end_s"] - work["start_s"],
+            "terminal_drain_s": work["work_end_s"] - work["control_end_s"],
+        }.items():
+            _same(episode.get(key), expected, "raw full work " + key)
     base = _number(episode.get("start_s"), "raw audit start_s")
     end = _number(episode.get("end_s"), "raw audit end_s")
     _same(end - base, episode["duration_s"], "control duration")

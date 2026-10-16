@@ -17,7 +17,10 @@
       {
         rpc: "完整请求区间（含准备/通信）",
         server_stage: "服务端分段（非独立 RPC，非 GPU kernel 时间）",
-        inference_rpc: "完整同步推理 RPC · 控制墙钟 · 仿真暂停",
+        inference_rpc: "完整同步调用（含输入准备）· 控制墙钟 · 仿真暂停",
+        async_policy_rpc:
+          "真实异步 policy RPC（worker 输入准备之后）· 可与执行重叠",
+        control_wait: "真实等待 / 终止排空 · 此区间无物理推进",
         execution_phase: "动作执行段 · 控制墙钟（包含执行段节拍等待）",
         gpu_span: "实际 CUDA 首末事件跨度（含间隙）",
         host_submit: "主机提交区间",
@@ -69,6 +72,8 @@
         label: block.status === "unknown" ? "结果未知" : "未完成",
         progress: null,
       };
+    if (block.status === "unused")
+      return { key: "unused", label: "已完成 · 未执行的最终结果", progress: 1 };
     if (submitting)
       return {
         key: "submitted",
@@ -174,6 +179,36 @@
     return { start: left, end: view.end, span: view.end - left };
   }
 
+  function oneStepViewport(rows, cursor, end) {
+    const view = viewport(cursor, end, Math.min(0.3, end));
+    let left = view.start;
+    for (const row of rows) {
+      if (R.deploymentCoupling(row.run) !== "one_step_async") continue;
+      const requests = R.timelineQueue(row.episode)?.requests ?? [];
+      for (const phase of R.activePhases(row.episode, cursor)) {
+        if (phase.phase !== "execution" || phase.request_tick == null) continue;
+        const actions = requests.filter(
+          (r) => r.role === "S1" && r.request_tick === phase.request_tick,
+        );
+        if (actions.length !== 1) continue;
+        const action = actions[0];
+        if (finite(action.start_s)) left = Math.min(left, action.start_s);
+        const sources =
+          action.feature_sequence == null
+            ? []
+            : requests.filter(
+                (r) =>
+                  r.role === "S2" &&
+                  r.feature_sequence === action.feature_sequence,
+              );
+        if (sources.length === 1 && finite(sources[0].start_s))
+          left = Math.min(left, sources[0].start_s);
+      }
+    }
+    left = Math.max(0, left);
+    return { start: left, end: view.end, span: view.end - left };
+  }
+
   function geometry(block, view) {
     const stop = finite(block.end) ? block.end : view.end;
     return {
@@ -185,19 +220,27 @@
   }
 
   function deployment(row) {
-    const queue = row.episode?.queue;
+    const queue = R.timelineQueue(row.episode);
     const requests = queue?.requests ?? [];
     const aliases = queue
       ? Q.dependencies(queue, 0, queue.duration_s ?? Infinity)
       : null;
     const synchronous = R.deploymentCoupling(row.run) === "synchronous";
+    const lookahead = R.deploymentCoupling(row.run) === "one_step_async";
+    const visualCounts = new Map();
+    for (const request of requests)
+      if (request.role === "S2" && request.feature_sequence != null)
+        visualCounts.set(
+          request.feature_sequence,
+          (visualCounts.get(request.feature_sequence) ?? 0) + 1,
+        );
     const taskTracks = ["vlm", "action"].map((stage) => ({
       id: row.run.id + ":" + stage,
       precision: row.run.precision,
       stage,
       title: names[stage],
       unit: "s",
-      basis: synchronous ? "server_stage" : "rpc",
+      basis: synchronous || lookahead ? "server_stage" : "rpc",
       clockId: "control_wall",
       unavailable: !queue ? "本运行未记录模块时序" : null,
       blocks: requests
@@ -206,11 +249,16 @@
             r.role === (stage === "vlm" ? "S2" : "S1") && finite(r.start_s),
         )
         .map((r) => {
-          const parent = aliases.parents.get(r.feature_sequence);
+          const parent =
+            !lookahead || visualCounts.get(r.feature_sequence) === 1
+              ? aliases.parents.get(r.feature_sequence)
+              : null;
           const label =
             stage === "vlm"
               ? (parent?.label ?? "S2[?]")
-              : (aliases.actions.get(r.request_tick)?.label ?? "S1[?]");
+              : !lookahead || parent
+                ? (aliases.actions.get(r.request_tick)?.label ?? "S1[?]")
+                : "S1[?]";
           const end = finite(r.end_s)
             ? r.end_s
             : finite(r.completed_s)
@@ -225,7 +273,7 @@
             unit: "s",
             basis: r.timing_scope?.startsWith("server_")
               ? "server_stage"
-              : synchronous
+              : synchronous || lookahead
                 ? "unknown"
                 : "rpc",
             timingScope: r.timing_scope ?? null,
@@ -234,7 +282,10 @@
             featureSequence: r.feature_sequence ?? null,
             sourceLabel: stage === "action" ? (parent?.label ?? null) : null,
             sourceId: stage === "action" ? (parent?.request?.id ?? null) : null,
-            adopted: r.adopted_s,
+            adopted: stage === "action" ? r.adopted_s : null,
+            description: lookahead
+              ? `Obs ${r.source_tick ?? "?"} → action ${r.target_tick ?? "?"}${r.disposition === "unused" ? " · unused final" : ""}`
+              : null,
             consumed:
               stage === "vlm"
                 ? requests
@@ -263,7 +314,11 @@
       const blocks = (row.episode?.phases ?? [])
         .filter(
           (p) =>
-            ["inference", "execution"].includes(p.phase) &&
+            [
+              "inference",
+              "execution",
+              ...(lookahead ? ["wait", "drain"] : []),
+            ].includes(p.phase) &&
             finite(p.start_s) &&
             (p.end_s == null || (finite(p.end_s) && p.end_s >= p.start_s)),
         )
@@ -282,20 +337,29 @@
             : null;
           return {
             id: p.id,
-            label: `Cycle ${p.cycle ?? "?"} · ${p.phase === "inference" ? "Infer" : "Execute"}`,
+            label: lookahead
+              ? `Request ${p.request_id ?? "?"} · ${{ inference: p.request_id === 0 ? "Bootstrap" : "Infer", execution: "Execute 1", wait: "Wait", drain: "Drain unused" }[p.phase]}`
+              : `Cycle ${p.cycle ?? "?"} · ${p.phase === "inference" ? "Infer" : "Execute"}`,
             stage: "phase",
             phaseKind: p.phase,
             start: p.start_s,
             end: p.end_s ?? null,
             unit: "s",
             basis:
-              p.phase === "inference" ? "inference_rpc" : "execution_phase",
+              p.phase === "inference"
+                ? lookahead
+                  ? "async_policy_rpc"
+                  : "inference_rpc"
+                : ["wait", "drain"].includes(p.phase)
+                  ? "control_wait"
+                  : "execution_phase",
             clockId: "control_wall",
             status: p.status ?? (p.end_s == null ? "incomplete" : "completed"),
             sourceId: action?.id ?? null,
             sourceLabel: action?.label ?? null,
-            description:
-              p.phase === "inference"
+            description: lookahead
+              ? `Obs ${p.source_tick ?? "?"} → action ${p.target_tick ?? "?"} · ${p.simulation_paused ? "Simulation paused" : p.phase === "inference" ? "Overlap allowed" : "One physical step"}`
+              : p.phase === "inference"
                 ? "Simulation paused"
                 : "Executing actions",
             event: {
@@ -309,17 +373,32 @@
             },
           };
         });
-      taskTracks.push({
-        id: row.run.id + ":phase",
-        precision: row.run.precision,
-        stage: "phase",
-        title: "Inference / Execution",
-        unit: "s",
-        basis: "control_wall",
-        clockId: "control_wall",
-        blocks,
-        unavailable: blocks.length ? null : "未记录推理 / 执行阶段",
-      });
+      const phaseGroups = lookahead
+        ? [
+            [
+              "policy",
+              "Policy RPC",
+              blocks.filter((b) => b.phaseKind === "inference"),
+            ],
+            [
+              "control",
+              "Execute / Wait / Drain",
+              blocks.filter((b) => b.phaseKind !== "inference"),
+            ],
+          ]
+        : [["phase", "Inference / Execution", blocks]];
+      for (const [id, title, phaseBlocks] of phaseGroups)
+        taskTracks.push({
+          id: row.run.id + ":" + id,
+          precision: row.run.precision,
+          stage: "phase",
+          title,
+          unit: "s",
+          basis: "control_wall",
+          clockId: "control_wall",
+          blocks: phaseBlocks,
+          unavailable: phaseBlocks.length ? null : "未记录推理 / 执行阶段",
+        });
     }
     return taskTracks;
   }
@@ -480,6 +559,7 @@
     viewport,
     synchronousSpan,
     synchronousViewport,
+    oneStepViewport,
     geometry,
     laneState,
     observedModelEnd,

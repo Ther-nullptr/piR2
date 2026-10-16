@@ -384,7 +384,7 @@ def deployment_run(root, media):
     if execution_clock not in ("paced", "ready"):
         raise ValueError("Unknown deployment execution clock")
     execution_coupling = config.get("execution_coupling", "asynchronous")
-    if execution_coupling not in ("asynchronous", "synchronous"):
+    if execution_coupling not in ("asynchronous", "synchronous", "one_step_async"):
         raise ValueError("Unknown deployment execution coupling")
     metadata = read_jsonl(root / "episodes.jsonl")
     run_id = "deployment-" + digest(str(root))[:20]
@@ -443,7 +443,7 @@ def deployment_run(root, media):
             continue
         start, stop = interval(begin[0]["t_s"], end[0]["t_s"])
         ticks = sorted(
-            (row for row in events if row.get("kind") == "control_tick"),
+            (dict(row) for row in events if row.get("kind") == "control_tick"),
             key=lambda row: row["tick"],
         )
         previous_applied = start
@@ -461,9 +461,13 @@ def deployment_run(root, media):
             row["observation_id"] = f"{episode_id}/observation-{row['tick']}"
             row["relative_s"] = applied - start
             producer = (row.get("executed_slot") or {}).get("producer_request_tick")
-            row["request_id"] = (
+            model_request_id = (
                 f"{episode_id}/S1-{producer}" if producer is not None else None
             )
+            if execution_coupling == "one_step_async":
+                row["model_request_id"] = model_request_id
+            else:
+                row["request_id"] = model_request_id
             previous_applied = applied
         queue = summarize_episode(events, episode)
         if queue["execution_clock"] != execution_clock:
@@ -477,10 +481,18 @@ def deployment_run(root, media):
         phases, cycles = [], []
         if execution_coupling == "synchronous":
             phases, cycles = _synchronous_phases(events, ticks, start, stop, episode_id)
+        elif execution_coupling == "one_step_async":
+            from .async_deployment import one_step_async_replay
+
+            phases, queue["replay_requests"] = one_step_async_replay(
+                events, queue, episode_id
+            )
         for request in queue["requests"]:
             sequence = (
                 request.get("request_tick")
                 if request["role"] == "S1"
+                else request.get("feature_sequence")
+                if execution_coupling == "one_step_async"
                 else request.get("source_tick")
             )
             request["id"] = f"{episode_id}/{request['role']}-{sequence}"
@@ -520,6 +532,7 @@ def deployment_run(root, media):
                 "status": "recorded",
                 "controlled_start_s": start,
                 "controlled_end_s": stop,
+                "work_end_s": queue.get("work_end_s", stop),
                 "paired_fixture_key": digest(fixture)
                 if all(value is not None for value in fixture.values())
                 else None,

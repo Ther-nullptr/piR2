@@ -82,8 +82,11 @@
   const couplingLabels = {
     asynchronous: "Asynchronous · 动作与推理重叠",
     synchronous: "Synchronous · 推理完成后执行动作段",
+    one_step_async: "One-step async · 提前推理下一步 / 当前步执行",
   };
   function cadenceLabel(mode) {
+    if (state.executionCoupling === "one_step_async")
+      return "单步异步 · 无墙钟节拍等待 / 未就绪则等待结果";
     if (state.executionCoupling === "synchronous")
       return mode === "paced"
         ? "执行段 20 Hz · 推理期间暂停仿真"
@@ -687,9 +690,11 @@
         `${couplingLabels[state.executionCoupling]} · ${cadenceLabel(state.executionClock)} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
         (state.executionCoupling === "synchronous"
           ? " 每个周期先完成实际 VLM + Flow4，再执行记录中的动作段；推理与执行阶段互斥。20 Hz 仅适用于 paced 的执行段，全局固定频率有效性不适用。视频停帧按真实采集时间映射，墙钟继续推进而 physics clock 暂停。"
-          : state.executionClock === "ready"
-            ? " 每次 env.step 仍推进 0.05 s 仿真时间；上一步结束即接纳已完成计划，不额外等待 50 ms。实际墙钟执行率与实时倍率分别显示。沿用 GR00T Flow4 / H40 / 解码16，无 StreamingVLA AFM/AEO 权重；视频按原始帧时间映射，不加速伪装。"
-            : " 控制目标为每 50 ms 执行一步，实际时序单独验证。") +
+          : state.executionCoupling === "one_step_async"
+            ? " 当前动作执行前捕获观测并提前推理下一步；每份结果只执行第 1 个动作，未完成则显式等待。首次 bootstrap 使用当前观测，其余动作滞后 1 个物理步；墙钟 AoI 独立报告。末次未使用推理保留至排空完成，机器人停在真实末帧。实际 RPC 从 worker 输入准备之后计时，不能直接与同步完整调用边界作速度比。"
+            : state.executionClock === "ready"
+              ? " 每次 env.step 仍推进 0.05 s 仿真时间；上一步结束即接纳已完成计划，不额外等待 50 ms。实际墙钟执行率与实时倍率分别显示。沿用 GR00T Flow4 / H40 / 解码16，无 StreamingVLA AFM/AEO 权重；视频按原始帧时间映射，不加速伪装。"
+              : " 控制目标为每 50 ms 执行一步，实际时序单独验证。") +
         " 当前为调试示例，不是套件成功率；记录相机拷贝会带来开销。";
     }
     const canPlay =
@@ -764,9 +769,9 @@
             end: phase.end_s,
             stage: "phase",
             category: phase.phase + "_phase",
-            name: `Cycle ${phase.cycle} · ${phase.phase === "inference" ? "Inference / simulation paused" : "Executing"}`,
+            name: `Request ${phase.request_id ?? phase.cycle} · ${phase.phase}${phase.simulation_paused ? " / simulation paused" : ""}`,
           });
-        for (const request of episode.queue?.requests ?? [])
+        for (const request of R.timelineQueue(episode)?.requests ?? [])
           out.push({
             id: request.id,
             precision: run.precision,
@@ -807,7 +812,7 @@
       state.rows
         .map(
           ({ run }, i) =>
-            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2>${state.kind === "deployment" ? `<span class="coupling-badge">${R.deploymentCoupling(run) === "synchronous" ? "Synchronous" : "Asynchronous"}</span>` : ""}<select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置">${state.descriptors
+            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2>${state.kind === "deployment" ? `<span class="coupling-badge">${R.deploymentCoupling(run) === "synchronous" ? "Synchronous" : R.deploymentCoupling(run) === "one_step_async" ? "One-step async" : "Asynchronous"}</span>` : ""}<select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置">${state.descriptors
               .filter(
                 (d) =>
                   d.kind === state.kind &&
@@ -950,6 +955,8 @@
         const at = R.robotAt(episode, state.clock, $("camera").value),
           meta = episode?.metadata ?? {},
           synchronous = R.deploymentCoupling(run) === "synchronous",
+          lookahead = R.deploymentCoupling(run) === "one_step_async",
+          fullPolicy = synchronous || lookahead,
           phase = R.phaseAt(episode, state.clock),
           queue = episode?.queue
             ? Q.stateAt(
@@ -965,7 +972,7 @@
               : "结果未知";
         status.textContent = !episode
           ? "该任务没有回合记录"
-          : `${at.ended ? "已结束" : synchronous ? (phase?.phase === "inference" ? "Inference / simulation paused" : phase?.phase === "execution" ? "Executing" : "Cycle transition") : "正在回放"} · 回合最终结果：${verdict} · ${synchronous || R.deploymentCadence(run) === "ready" ? "固定频率有效性不适用" : meta.control_rate_valid === false ? "时序无效" : meta.control_rate_valid === true ? "控制时序有效" : "控制时序未知"} · ${meta.termination_reason ?? "原因未知"}${episode.robot?.error ? " · " + episode.robot.error : ""}`;
+          : `${lookahead ? R.asyncStatus(episode, state.clock) : at.ended ? "已结束" : synchronous ? (phase?.phase === "inference" ? "Inference / simulation paused" : phase?.phase === "execution" ? "Executing" : "Cycle transition") : "正在回放"} · 回合最终结果：${verdict} · ${synchronous || R.deploymentCadence(run) === "ready" ? "固定频率有效性不适用" : meta.control_rate_valid === false ? "时序无效" : meta.control_rate_valid === true ? "控制时序有效" : "控制时序未知"} · ${meta.termination_reason ?? "原因未知"}${episode.robot?.error ? " · " + episode.robot.error : ""}`;
         status.dataset.status =
           meta.success === false || meta.control_rate_valid === false
             ? "bad"
@@ -988,42 +995,86 @@
         );
         metrics.innerHTML = metricsHTML([
           [
-            synchronous ? "DiT stage P50" : "S1 RPC P50",
+            fullPolicy ? "DiT stage P50" : "S1 RPC P50",
             R.scaleMetric(
-              (synchronous
-                ? meta.action_stage_seconds
-                : meta.action_rpc_seconds
-              )?.p50,
+              (fullPolicy ? meta.action_stage_seconds : meta.action_rpc_seconds)
+                ?.p50,
               1000,
             ),
             "ms",
           ],
           [
-            synchronous ? "DiT stage P95" : "S1 RPC P95",
+            fullPolicy ? "DiT stage P95" : "S1 RPC P95",
             R.scaleMetric(
-              (synchronous
-                ? meta.action_stage_seconds
-                : meta.action_rpc_seconds
-              )?.p95,
+              (fullPolicy ? meta.action_stage_seconds : meta.action_rpc_seconds)
+                ?.p95,
               1000,
             ),
             "ms",
           ],
-          ...(synchronous
+          ...(fullPolicy
             ? [
                 [
-                  "Inference RPC P50",
+                  lookahead
+                    ? "Policy RPC P50 (after prepare)"
+                    : "Full policy call P50 (incl. prepare)",
                   R.scaleMetric(meta.inference_wall_seconds?.p50, 1000),
                   "ms",
                 ],
                 [
-                  "Inference wait",
-                  R.scaleMetric(meta.inference_wait_fraction, 100),
-                  "%",
+                  lookahead ? "Post-step wait total" : "Inference wait",
+                  lookahead
+                    ? R.scaleMetric(meta.post_step_wait_seconds, 1000)
+                    : R.scaleMetric(meta.inference_wait_fraction, 100),
+                  lookahead ? "ms" : "%",
                 ],
               ]
             : []),
-          ["Wall clock", Math.min(state.clock, at.end ?? state.clock), "s"],
+          ...(lookahead
+            ? [
+                [
+                  "Submission → response P50",
+                  R.scaleMetric(meta.inference_request_seconds?.p50, 1000),
+                  "ms",
+                ],
+                [
+                  "Inference/execution overlap",
+                  R.scaleMetric(
+                    meta.measured_inference_execution_overlap_seconds,
+                    1000,
+                  ),
+                  "ms",
+                ],
+                ["Unused final requests", meta.unused_policy_calls, ""],
+                [
+                  "Terminal drain",
+                  R.scaleMetric(meta.terminal_drain_seconds, 1000),
+                  "ms",
+                ],
+                [
+                  "Observation lag",
+                  at.tick?.observation_lag_ticks ?? null,
+                  "physics steps",
+                ],
+                [
+                  "Native decoded steps",
+                  episode.queue?.work_requests?.find(
+                    (r) => r.request_id === at.tick?.request_id,
+                  )?.decoded_horizon ?? null,
+                  "→ execute 1",
+                ],
+                [
+                  "Full work clock",
+                  Math.min(state.clock, R.episodeEnd(episode) ?? state.clock),
+                  "s",
+                ],
+              ]
+            : []),
+          [
+            "Control wall clock",
+            Math.min(state.clock, at.end ?? state.clock),
+            "s",
+          ],
           ["Physics clock", R.physicsAt(episode, state.clock), "s"],
           ["实际墙钟执行率", meta.actual_control_hz, "Hz"],
           ["S1 请求率", meta.action_request_hz, "Hz"],
@@ -1049,7 +1100,7 @@
         ]);
         metrics.title =
           "当前动作的信息年龄 = 当前控制墙钟游标 − 该已执行命令实际来源的采集时刻；不是执行瞬间的汇总 AoI。回合结束后固定在终止时刻，不虚构后续执行。";
-        details.textContent = `位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · ${synchronous ? "每段至多 " + meta.synchronous_chunk_steps + " 步" : (R.deploymentCadence(run) === "ready" ? "承诺步数" : "d") + " " + (queue?.delay ?? "未知")} · 仿真 ${fmt(meta.simulated_elapsed_seconds)} s / 墙钟 ${fmt(meta.controlled_wall_seconds)} s · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
+        details.textContent = `位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · ${lookahead ? "每份结果执行 1 步 · 来源 obs " + (at.tick?.source_tick ?? "未知") + " → action " + (at.tick?.target_tick ?? "未知") : synchronous ? "每段至多 " + meta.synchronous_chunk_steps + " 步" : (R.deploymentCadence(run) === "ready" ? "承诺步数" : "d") + " " + (queue?.delay ?? "未知")} · 仿真 ${fmt(meta.simulated_elapsed_seconds)} s / 墙钟 ${fmt(meta.controlled_wall_seconds)} s · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
         action.textContent = at.tick
           ? `检查动作 ${at.tick.tick} · ${at.tick.action?.map((v) => fmt(v, 3)).join(", ")}`
           : "游标前没有已执行命令";
@@ -1070,6 +1121,16 @@
     $("window").title = synchronous
       ? "自动窗口约两个已记录完整周期，并保留当前执行段的实际推理来源；缺少阶段时使用 0.3 s 窗口。窗口宽度不是推理耗时。"
       : "按真实记录跟随时间游标";
+    if (
+      mode === "auto" &&
+      state.kind === "deployment" &&
+      state.executionCoupling === "one_step_async"
+    )
+      return window.ReplayTimeline.oneStepViewport(
+        state.rows,
+        state.clock,
+        state.end,
+      );
     if (mode === "auto" && synchronous)
       return window.ReplayTimeline.synchronousViewport(
         state.rows,
@@ -1293,7 +1354,7 @@
           button.dataset.basis = block.basis;
           if (block.phaseKind) button.dataset.phaseKind = block.phaseKind;
           if (block.sourceId) button.dataset.source = block.sourceId;
-          button.innerHTML = `<strong>${esc(block.label)}</strong><span>${esc(block.sourceLabel ? "← " + block.sourceLabel : (block.description ?? (block.stage === "vlm" ? "视觉特征" : "来源未记录")))}</span><small></small>`;
+          button.innerHTML = `<strong>${esc(block.label)}</strong><span>${esc(block.sourceLabel ? "← " + block.sourceLabel + (block.description ? " · " + block.description : "") : (block.description ?? (block.stage === "vlm" ? "视觉特征" : "来源未记录")))}</span><small></small>`;
           button.addEventListener("click", () =>
             inspect({
               ...block.event,
@@ -1320,7 +1381,7 @@
           (status.progress ?? 0) * 100 + "%",
         );
         const basis = T.basisLabel(block.basis);
-        button.title = `${label(track.precision)} · ${block.label}\n${status.label} · ${fmt(block.start, 3)} → ${R.finite(block.end) ? fmt(block.end, 3) : "结束未知"} ${unit}\n${basis}${block.sourceLabel ? "\n实际使用 " + block.sourceLabel : ""}`;
+        button.title = `${label(track.precision)} · ${block.label}\n${status.label} · ${fmt(block.start, 3)} → ${R.finite(block.end) ? fmt(block.end, 3) : "结束未知"} ${unit}\n${basis}${block.description ? "\n" + block.description : ""}${block.sourceLabel ? "\n实际使用 " + block.sourceLabel : ""}`;
         button.setAttribute("aria-label", button.title.replaceAll("\n", "；"));
       }
       for (const [id, button] of item.buttons)
@@ -1333,7 +1394,9 @@
       state.kind === "deployment"
         ? (state.executionCoupling === "synchronous"
             ? "控制墙钟：VLM / DiT 为同一次同步 RPC 内的服务端分段，非独立 RPC 或 GPU kernel 时间。Inference / Execution 显示真实互斥阶段；执行段包含节拍等待。"
-            : "控制墙钟：VLM / DiT 任务块为完整请求区间。") +
+            : state.executionCoupling === "one_step_async"
+              ? "控制墙钟：VLM / DiT 是真实服务端分段；Policy RPC 与 Execute/Wait/Drain 分轨显示实际重叠。Obs k → action k+1 表示 1 步观测滞后，首次 bootstrap 除外；unused final 计算仍展示。"
+              : "控制墙钟：VLM / DiT 任务块为完整请求区间。") +
           " S1[xx].k 实际使用 S2-xx 的特征；点击高亮已记录来源，随游标向左流动。"
         : tracks.some((track) => track.blocks.length)
           ? "按该次真实模块时间移动；CUDA 跨度含内核间隙。点击任务块或展开算子明细。"
@@ -1360,7 +1423,9 @@
           ...(state.kind === "deployment"
             ? [
                 "control",
-                ...(R.deploymentCoupling(row.run) === "synchronous"
+                ...(["synchronous", "one_step_async"].includes(
+                  R.deploymentCoupling(row.run),
+                )
                   ? ["phase"]
                   : []),
               ]
@@ -1431,7 +1496,9 @@
       state.kind === "deployment"
         ? state.executionCoupling === "synchronous"
           ? "Synchronous：VLM / DiT 为实际服务端分段；Phase 为完整推理 RPC 与动作执行段。Control 是实际命令时刻，均非 GPU kernel timeline。"
-          : "S1 / S2 显示完整 RPC 区间；Control 是实际命令时刻。它们不是 GPU kernel 时间。"
+          : state.executionCoupling === "one_step_async"
+            ? "One-step async：完整 policy RPC、服务端 VLM/DiT、物理执行和等待分别计时；含终止后未执行计算。非 GPU kernel timeline。"
+            : "S1 / S2 显示完整 RPC 区间；Control 是实际命令时刻。它们不是 GPU kernel 时间。"
         : state.type === "profile"
           ? "实际 CUDA 设备事件；同一行内的多 stream 可能重叠，点击查看。"
           : `${R.scopeInfo(state.scope).label} · 仅有请求 wall；本 Clean 调用未采集 GPU timeline。`;
