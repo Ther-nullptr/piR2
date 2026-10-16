@@ -21,7 +21,10 @@
         async_policy_rpc:
           "真实异步 policy RPC（worker 输入准备之后）· 可与执行重叠",
         control_wait: "真实等待 / 终止排空 · 此区间无物理推进",
-        env_step: "真实 env.step 墙钟 · 无额外节拍等待；每步推进 50 ms 仿真",
+        env_step:
+          "真实 env.step 墙钟 · 无额外节拍等待（两步间隔另列）；仿真推进量另列",
+        control_gap:
+          "两次 env.step 之间的实测间隔（含节拍等待 / 控制开销）；未单独记录 sleep 时间",
         execution_phase: "动作执行段 · 控制墙钟（包含执行段节拍等待）",
         gpu_span: "实际 CUDA 首末事件跨度（含间隙）",
         host_submit: "主机提交区间",
@@ -220,6 +223,27 @@
     };
   }
 
+  function controlViewport(tracks, cursor, end) {
+    const view = viewport(cursor, end, Math.min(0.3, end));
+    let left = view.start;
+    for (const track of tracks) {
+      if (track.stage !== "control") continue;
+      for (const block of track.blocks) {
+        if (
+          block.phaseKind !== "execution" ||
+          !finite(block.end) ||
+          cursor < block.start ||
+          cursor >= block.end
+        )
+          continue;
+        for (const source of sourceBlocks(tracks, block.id))
+          if (finite(source.start)) left = Math.min(left, source.start);
+      }
+    }
+    left = Math.max(0, left);
+    return { ...view, start: left, span: view.end - left };
+  }
+
   function deployment(row) {
     const queue = R.timelineQueue(row.episode);
     const requests = queue?.requests ?? [];
@@ -252,7 +276,7 @@
         )
         .map((r) => {
           const parent =
-            !lookahead || visualCounts.get(r.feature_sequence) === 1
+            visualCounts.get(r.feature_sequence) === 1
               ? aliases.parents.get(r.feature_sequence)
               : null;
           const label =
@@ -407,6 +431,71 @@
           blocks: phaseBlocks,
           unavailable: phaseBlocks.length ? null : "未记录推理 / 执行阶段",
         });
+    }
+    if (
+      R.deploymentCoupling(row.run) === "asynchronous" &&
+      row.episode?.ticks?.length
+    ) {
+      const blocks = R.controlIntervals(row.episode).map((interval) => {
+        const tick = interval.tick;
+        const slot = tick?.executed_slot;
+        const fallback =
+          tick?.fallback === true || slot?.producer_kind === "fallback";
+        const producers =
+          !fallback &&
+          slot?.producer_kind === "request" &&
+          slot.producer_request_tick != null
+            ? requests.filter(
+                (r) =>
+                  r.role === "S1" &&
+                  r.request_tick === slot.producer_request_tick,
+              )
+            : [];
+        const action =
+          producers.length === 1
+            ? taskTracks[1].blocks.find((b) => b.id === producers[0].id)
+            : null;
+        const physical = finite(tick?.physics_step_seconds)
+          ? `${(tick.physics_step_seconds * 1000).toFixed(1)} ms simulation`
+          : "simulation advance unknown";
+        return {
+          id: interval.id,
+          label: tick ? `Execute ${tick.tick}` : "Between steps",
+          stage: "control",
+          phaseKind: interval.kind,
+          start: interval.start_s,
+          end: interval.end_s,
+          unit: "s",
+          basis: tick ? "env_step" : "control_gap",
+          clockId: "control_wall",
+          status: finite(interval.end_s) ? "completed" : "incomplete",
+          sourceId: action?.id ?? null,
+          sourceLabel: action?.label ?? null,
+          description: tick
+            ? `${physical} · ${fallback ? "Fallback action" : slot?.producer_kind === "bootstrap" ? "Bootstrap action" : action ? "Recorded DiT producer" : "Producer unknown"}`
+            : "No env.step · pacing / controller overhead; sleep not separately measured",
+          event: {
+            id: interval.id,
+            kind: tick ? "command" : "control_gap",
+            precision: row.run.precision,
+            run: row.run,
+            episode: row.episode,
+            tick,
+            control_interval: interval,
+          },
+        };
+      });
+      taskTracks.push({
+        id: row.run.id + ":control",
+        precision: row.run.precision,
+        stage: "control",
+        title: "Action execution / gap",
+        unit: "s",
+        basis: "control_wall",
+        clockId: "control_wall",
+        blocks,
+        unavailable: blocks.length ? null : "未记录动作执行起止时间",
+      });
     }
     return taskTracks;
   }
@@ -568,6 +657,7 @@
     synchronousSpan,
     synchronousViewport,
     oneStepViewport,
+    controlViewport,
     geometry,
     laneState,
     observedModelEnd,

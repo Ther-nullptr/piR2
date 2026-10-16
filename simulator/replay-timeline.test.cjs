@@ -2,6 +2,141 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const T = require("./replay-timeline.js");
 
+function cachedExecution() {
+  return {
+    run: {
+      id: "r",
+      precision: "bf16",
+      execution_coupling: "asynchronous",
+      policy_variant: "pir2",
+    },
+    episode: {
+      id: "e",
+      controlled_start_s: 100,
+      controlled_end_s: 101.1,
+      metadata: { control_steps: 22 },
+      ticks: [
+        {
+          id: "tick21",
+          tick: 21,
+          applied_s: 101.051,
+          next_observation_computed_s: 101.075,
+          physics_step_seconds: 0.05,
+          executed_slot: {
+            producer_kind: "request",
+            producer_request_tick: 20,
+          },
+        },
+      ],
+      queue: {
+        duration_s: 1.1,
+        requests: [
+          {
+            id: "v-old",
+            role: "S2",
+            start_s: 0.2,
+            end_s: 0.24,
+            feature_sequence: 1,
+          },
+          {
+            id: "v-new",
+            role: "S2",
+            start_s: 0.9,
+            end_s: 0.94,
+            feature_sequence: 2,
+          },
+          {
+            id: "a-source",
+            role: "S1",
+            start_s: 1.001,
+            end_s: 1.025,
+            request_tick: 20,
+            feature_sequence: 1,
+          },
+          {
+            id: "a-new",
+            role: "S1",
+            start_s: 1.052,
+            end_s: 1.068,
+            request_tick: 21,
+            feature_sequence: 2,
+          },
+        ],
+      },
+    },
+  };
+}
+
+test("cached policy execution has its own measured lane and exact DiT-to-VLM lineage", () => {
+  const tracks = T.tracks([cachedExecution()], "deployment");
+  const control = tracks.find((t) => t.stage === "control");
+  assert.ok(control);
+  const block = control.blocks.find((b) => b.phaseKind === "execution");
+  assert.ok(Math.abs(block.start - 1.051) < 1e-10);
+  assert.ok(Math.abs(block.end - 1.075) < 1e-10);
+  assert.equal(block.basis, "env_step");
+  assert.equal(block.sourceId, "a-source");
+  assert.deepEqual(
+    T.sourceBlocks(tracks, block.id).map((b) => b.id),
+    ["a-source", "v-old"],
+  );
+  assert.equal(block.event.tick.tick, 21);
+  assert.match(block.description, /50.*ms/);
+  const gap = control.blocks.find((b) => b.phaseKind === "gap");
+  assert.equal(gap.basis, "control_gap");
+  assert.equal(gap.sourceId, null);
+  const view = T.controlViewport(tracks, 1.07, 1.1);
+  assert.ok(view.start <= 0.2 && view.end >= block.end);
+});
+
+test("bootstrap, fallback and ambiguous control producers never acquire a guessed model source", () => {
+  for (const kind of ["bootstrap", "fallback", "request"]) {
+    const row = cachedExecution();
+    if (kind === "request")
+      row.episode.queue.requests.push({
+        ...row.episode.queue.requests[2],
+        id: "duplicate",
+      });
+    else
+      row.episode.ticks[0].executed_slot = {
+        producer_kind: kind,
+        producer_request_tick: null,
+      };
+    const block = T.tracks([row], "deployment")
+      .find((t) => t.stage === "control")
+      .blocks.find((b) => b.phaseKind === "execution");
+    assert.equal(block.sourceId, null);
+    assert.deepEqual(
+      T.sourceBlocks(T.tracks([row], "deployment"), block.id),
+      [],
+    );
+    if (kind !== "request")
+      assert.match(block.description, new RegExp(kind, "i"));
+  }
+});
+
+test("execution source stops at an ambiguous visual cache and keeps the recorded physical step", () => {
+  const row = cachedExecution();
+  row.episode.queue.requests.push({
+    ...row.episode.queue.requests[0],
+    id: "duplicate-visual",
+  });
+  row.episode.ticks[0].physics_step_seconds = 0.02;
+  const tracks = T.tracks([row], "deployment");
+  const block = tracks
+    .find((t) => t.stage === "control")
+    .blocks.find((b) => b.phaseKind === "execution");
+  assert.deepEqual(
+    T.sourceBlocks(tracks, block.id).map((b) => b.id),
+    ["a-source"],
+  );
+  assert.match(block.description, /20\.0 ms simulation/);
+  assert.equal(
+    T.controlViewport(tracks, 1.07, 1.1).start,
+    T.viewport(1.07, 1.1, 0.3).start,
+  );
+});
+
 test("DiT labels retain consumed VLM source even after a newer publication", () => {
   const requests = [
     { id: "v0", role: "S2", start_s: 0, end_s: 0.1, feature_sequence: 8 },

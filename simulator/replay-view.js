@@ -82,7 +82,7 @@
   };
   const color = (p) => colors[p] ?? "#78669d";
   const cadenceLabels = {
-    paced: "固定 20 Hz 墙钟节拍",
+    paced: "20 Hz 目标节拍（50 ms / 步）",
     ready: "就绪即接纳（StreamingVLA式调度，GR00T）",
   };
   const couplingLabels = {
@@ -811,7 +811,7 @@
       $("evidence-note").textContent =
         `${couplingLabels[state.executionCoupling]} · ${cadenceLabel(state.executionClock)} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
         (state.cohortPolicy === "pir2"
-          ? ` ${R.policyNote(runs.find((run) => !run.error) ?? {})} 控制目标为每 50 ms 执行一步，实际时序与 AoI 独立报告；推理、执行与相机记录可能争用资源。`
+          ? ` ${R.policyNote(runs.find((run) => !run.error) ?? {})} 墙钟目标是 t₀ + k×50 ms 执行第 k 步；提前完成的推理等到执行时刻，迟到则保留实测时间。Action execution 画出实际 env.step，Between steps 包含节拍等待和控制开销；50 ms 仿真推进量不等于 env.step 墙钟耗时。`
           : state.executionCoupling === "synchronous"
             ? " 每个周期先完成实际 VLM + Flow4，再执行记录中的动作段；推理与执行阶段互斥。20 Hz 仅适用于 paced 的执行段，全局固定频率有效性不适用。视频停帧按真实采集时间映射，墙钟继续推进而 physics clock 暂停。"
             : state.executionCoupling === "chunked_async"
@@ -912,6 +912,11 @@
             stage: request.role === "S2" ? "vlm" : "action",
             name: `${request.role} ${request.timing_scope?.startsWith("server_") ? "stage" : "request"} ${request.request_tick ?? request.source_tick ?? request.feature_source_tick ?? "?"}`,
           });
+        const control = new Map(
+          R.controlIntervals(episode)
+            .filter((p) => p.kind === "execution")
+            .map((p) => [p.id, p]),
+        );
         for (const tick of episode.ticks ?? [])
           out.push({
             id: tick.id,
@@ -921,7 +926,8 @@
             tick,
             kind: "command",
             time: tick.relative_s,
-            end: tick.relative_s,
+            end: control.get(tick.id)?.end_s ?? null,
+            control_interval: control.get(tick.id) ?? null,
             stage: "control",
             name: `执行动作 · tick ${tick.tick}`,
           });
@@ -1330,6 +1336,16 @@
     if (
       mode === "auto" &&
       state.kind === "deployment" &&
+      state.executionCoupling === "asynchronous"
+    )
+      return window.ReplayTimeline.controlViewport(
+        state.taskTracks ?? [],
+        state.clock,
+        state.end,
+      );
+    if (
+      mode === "auto" &&
+      state.kind === "deployment" &&
       ["one_step_async", "chunked_async"].includes(state.executionCoupling)
     )
       return window.ReplayTimeline.oneStepViewport(
@@ -1384,6 +1400,13 @@
         phase: event.phase,
         source: event.run.provenance,
       };
+    else if (event.control_interval?.kind === "gap")
+      data = {
+        precision: event.precision,
+        control_interval: event.control_interval,
+        note: "No env.step in this recorded interval; pacing and controller overhead are not separately timed.",
+        source: event.run.provenance,
+      };
     else if (event.tick) {
       const q = event.episode.queue
         ? Q.stateAt(event.episode.queue, event.tick.relative_s)
@@ -1393,6 +1416,19 @@
         tick: event.tick.tick,
         policy_identity: event.run.policy_identity ?? null,
         control_wall_s: event.tick.relative_s,
+        execution_interval: event.control_interval ?? null,
+        env_step_wall_ms: R.finite(event.control_interval?.end_s)
+          ? (event.control_interval.end_s - event.control_interval.start_s) *
+            1000
+          : null,
+        simulation_advance_ms: R.scaleMetric(
+          event.tick.physics_step_seconds,
+          1000,
+        ),
+        scheduled_wall_s: R.finite(event.tick.scheduled_s)
+          ? event.tick.scheduled_s - event.episode.controlled_start_s
+          : null,
+        lateness_ms: R.scaleMetric(event.tick.lateness_s, 1000),
         command_units: event.episode.robot?.command_units,
         command: event.tick.action,
         robot_response: event.tick.robot_response,
@@ -1609,8 +1645,8 @@
               : state.executionCoupling === "one_step_async"
                 ? "控制墙钟：VLM / DiT 是真实服务端分段；Policy RPC 与 Execute/Wait/Drain 分轨显示实际重叠。Obs k → action k+1 表示 1 步观测滞后，首次 bootstrap 除外；unused final 计算仍展示。"
                 : state.cohortPolicy === "pir2"
-                  ? "πR² 控制墙钟：独立 S2 VLM RPC 更新缓存；S1 RPC 进行滚动去噪（常态 1 NFE / 恢复 5 NFE）。bootstrap 只有聚合计数，未伪造分段。"
-                  : "控制墙钟：VLM / DiT 任务块为完整请求区间。") +
+                  ? "πR² 控制墙钟：独立 S2 VLM RPC 更新缓存；S1 RPC 滚动去噪（常态 1 NFE / 恢复 5 NFE）。Action execution 是实测 env.step；Between steps 包含节拍等待与控制开销，每步仿真推进量另列。bootstrap 动作有明确标签，推理仅有聚合计数。"
+                  : "控制墙钟：VLM / DiT 为完整请求区间；Action execution 是实测 env.step，间隔不计入动作执行耗时。") +
           " S1[xx].k 实际使用 S2-xx 的特征；点击高亮已记录来源，随游标向左流动。"
         : tracks.some((track) => track.blocks.length)
           ? "按该次真实模块时间移动；CUDA 跨度含内核间隙。点击任务块或展开算子明细。"
@@ -1690,14 +1726,15 @@
     });
     state.hits = [];
     for (const event of events) {
-      if (event.end < a || event.time > b) continue;
+      const eventEnd = R.finite(event.end) ? event.end : event.time;
+      if (eventEnd < a || event.time > b) continue;
       const lane = lanes.findIndex(
         (l) => l.p === event.precision && l.stage === event.stage,
       );
       if (lane < 0) continue;
       const index = state.hits.push(event) - 1,
         xx = x(Math.max(a, event.time)),
-        width = Math.max(1.5, x(Math.min(b, event.end)) - xx),
+        width = Math.max(1.5, x(Math.min(b, eventEnd)) - xx),
         fill = event.category
           ? (categories[event.category] ?? "#9b8eab")
           : color(event.precision);
@@ -1709,12 +1746,12 @@
     $("kernel-note").textContent =
       state.kind === "deployment"
         ? state.executionCoupling === "synchronous"
-          ? "Synchronous：VLM / DiT 为实际服务端分段；Phase 为完整推理 RPC 与动作执行段。Control 是实际命令时刻，均非 GPU kernel timeline。"
+          ? "Synchronous：VLM / DiT 为实际服务端分段；Phase 为完整推理 RPC 与动作执行段。Control 是实测 env.step 墙钟，缺少结束时间时仅显示命令时刻；均非 GPU kernel timeline。"
           : ["one_step_async", "chunked_async"].includes(
                 state.executionCoupling,
               )
             ? "Full-policy async：完整 policy RPC、服务端 VLM/DiT、物理执行和等待分别计时；含终止后未执行计算。非 GPU kernel timeline。"
-            : "S1 / S2 显示完整 RPC 区间；Control 是实际命令时刻。它们不是 GPU kernel 时间。"
+            : "S1 / S2 显示完整 RPC 区间；Control 是实测 env.step 墙钟，缺少结束时间时仅显示命令时刻。它们不是 GPU kernel 时间。"
         : state.type === "profile"
           ? "实际 CUDA 设备事件；同一行内的多 stream 可能重叠，点击查看。"
           : `${R.scopeInfo(state.scope).label} · 仅有请求 wall；本 Clean 调用未采集 GPU timeline。`;
@@ -1886,7 +1923,7 @@
       slice
         .map(
           (e, i) =>
-            `<button class="event-row ${e.id === state.selected ? "selected" : ""}" data-list-index="${i}" style="--precision:${color(e.precision)}"><span class="precision">${esc(label(e.precision))}</span><span>${fmt(e.time, state.kind === "model" ? 3 : 2)} ${state.kind === "model" ? "ms" : "s"}</span><span title="${esc(e.name)}">${esc(e.name)}</span><span>${fmt((e.end - e.time) * (state.kind === "model" ? 1 : 1000), 3)} ms</span></button>`,
+            `<button class="event-row ${e.id === state.selected ? "selected" : ""}" data-list-index="${i}" style="--precision:${color(e.precision)}"><span class="precision">${esc(label(e.precision))}</span><span>${fmt(e.time, state.kind === "model" ? 3 : 2)} ${state.kind === "model" ? "ms" : "s"}</span><span title="${esc(e.name)}">${esc(e.name)}</span><span>${fmt(R.finite(e.end) ? (e.end - e.time) * (state.kind === "model" ? 1 : 1000) : null, 3)} ms</span></button>`,
         )
         .join("") || '<p class="small-note">此窗口没有相应事件。</p>';
     for (const button of $("event-list").querySelectorAll("button"))
@@ -1919,7 +1956,9 @@
       ...new Set([
         0,
         state.end,
-        ...filteredEvents().flatMap((e) => [e.time, e.end]),
+        ...filteredEvents()
+          .flatMap((e) => [e.time, e.end])
+          .filter(R.finite),
       ]),
     ].sort((a, b) => a - b);
     setClock(

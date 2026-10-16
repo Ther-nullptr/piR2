@@ -92,7 +92,8 @@
 .task-lane[data-stage="action"] {
   background: #f7f9f6;
 }
-.task-lane[data-stage="phase"] {
+.task-lane[data-stage="phase"],
+.task-lane[data-stage="control"] {
   background: #faf8f3;
 }
 .task-lane-label {
@@ -899,6 +900,14 @@ footer {
 .task-block[data-phase-kind="drain"] {
   background: #f5e8c9;
   border-style: dotted;
+}
+.task-block[data-phase-kind="gap"] {
+  background: #f1f2ee;
+  border-style: dotted;
+}
+.task-block[data-phase-kind="gap"][data-phase="running"] {
+  color: var(--ink);
+  box-shadow: inset 0 -3px var(--precision);
 }
 .task-block[data-phase="unused"] {
   border-style: dashed;

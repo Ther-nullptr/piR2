@@ -17,6 +17,76 @@ const clean = {
   instrumented: false,
   output: { status: "recorded" },
 };
+
+test("control intervals separate measured execution from pacing and physical time", () => {
+  const episode = {
+    id: "e",
+    controlled_start_s: 100,
+    controlled_end_s: 100.1,
+    metadata: { control_steps: 2 },
+    ticks: [
+      {
+        id: "t0",
+        tick: 0,
+        applied_s: 100.002,
+        next_observation_computed_s: 100.026,
+        physics_step_seconds: 0.05,
+      },
+      {
+        id: "t1",
+        tick: 1,
+        applied_s: 100.051,
+        next_observation_computed_s: 100.074,
+        physics_step_seconds: 0.05,
+      },
+    ],
+  };
+  const spans = R.controlIntervals(episode);
+  assert.deepEqual(
+    spans.map((p) => p.kind),
+    ["gap", "execution", "gap", "execution", "gap"],
+  );
+  const execute = spans.filter((p) => p.kind === "execution");
+  assert.ok(Math.abs(execute[0].end_s - execute[0].start_s - 0.024) < 1e-10);
+  assert.equal(execute[0].tick.physics_step_seconds, 0.05);
+  assert.ok(Math.abs(spans[2].end_s - spans[2].start_s - 0.025) < 1e-10);
+  assert.ok(Math.abs(spans.at(-1).end_s - 0.1) < 1e-10);
+  const late = structuredClone(episode);
+  late.ticks[0].next_observation_computed_s = 100.06;
+  late.ticks[1].applied_s = 100.062;
+  const delayed = R.controlIntervals(late);
+  assert.ok(delayed.find((p) => p.kind === "execution").end_s > 0.05);
+  assert.ok(Math.abs(delayed[2].end_s - delayed[2].start_s - 0.002) < 1e-10);
+});
+
+test("missing control completion or omitted ticks never turn into invented execution or waiting", () => {
+  const episode = {
+    id: "e",
+    controlled_start_s: 100,
+    controlled_end_s: 100.2,
+    metadata: { control_steps: 4 },
+    ticks: [
+      { id: "t0", tick: 0, applied_s: 100.002 },
+      {
+        id: "t2",
+        tick: 2,
+        applied_s: 100.1,
+        next_observation_computed_s: 100.12,
+      },
+    ],
+  };
+  const spans = R.controlIntervals(episode);
+  assert.deepEqual(
+    spans.map((p) => p.kind),
+    ["gap", "execution", "execution"],
+  );
+  assert.equal(spans[1].end_s, null);
+  assert.equal(spans[2].tick.physics_step_seconds, undefined);
+  assert.deepEqual(
+    R.controlIntervals({ ...episode, controlled_start_s: null }),
+    [],
+  );
+});
 test("policy identity uses worker metadata, never filenames or scheduling labels", () => {
   assert.equal(R.policyVariant({ label: "pir2 checkpoint-10000" }), null);
   assert.equal(R.policyVariant({ configuration: { variant: "pir2" } }), null);

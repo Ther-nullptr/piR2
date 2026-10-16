@@ -132,7 +132,15 @@ bootstrap 与所有已记录请求（含末尾未采用结果）的计数审计�
 的 consumed cache 能补充计数，同一缓存的多次消费只证明一次 S2 工作；其余
 显示 unknown，并与已记录 RPC 数区分。预热、独占校准不计入回合 forward 总数。
 
-机器人闭环视图可切换 `paced` 固定 20 Hz 墙钟节拍与 `ready`
+`paced` 的 20 Hz 是现实墙钟的目标节拍：第 k 步目标为 `t₀ + k × 50 ms`。
+提前完成的推理仍等待执行时刻，实际迟到会按日志保留；VLM/DiT 可与动作执行重叠。
+缓存策略的 `Action execution / gap` 轨道使用 `applied_s` 到
+`next_observation_computed_s` 的实测 `env.step` 区间，每步推进的仿真时间单独显示。
+`Between steps` 是相邻执行之间的实测间隔，包含节拍等待和控制开销，不能视为纯 sleep。
+点击执行块可按 `executed_slot` 追溯 DiT→VLM；bootstrap、fallback、缺失或歧义来源保持明确。
+缺少完成时间不会推算成 50 ms；缺失动作记录之间不会补画空闲。
+
+机器人闭环视图可切换 `paced` 20 Hz 目标墙钟节拍与 `ready`
 “就绪即接纳（StreamingVLA式调度，GR00T）”。后者使用真实重新录制的
 GR00T 轨迹，在原子仿真步结束后接纳完成结果；物理步长仍为 0.05 s。
 实际墙钟执行率、S1 请求率、计划更新率、就绪至首次执行等待与仿真/墙钟倍率

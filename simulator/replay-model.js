@@ -180,6 +180,60 @@
         time < phase.end_s,
     );
   }
+  function controlIntervals(episode) {
+    const origin = episode?.controlled_start_s;
+    if (!finite(origin)) return [];
+    const stop = episode.controlled_end_s;
+    const steps = (episode.ticks ?? [])
+      .filter(
+        (tick) =>
+          finite(tick.applied_s) &&
+          tick.applied_s >= origin &&
+          (!finite(stop) || tick.applied_s <= stop),
+      )
+      .map((tick) => ({
+        id: tick.id ?? `${episode.id}/tick-${tick.tick}`,
+        kind: "execution",
+        start_s: tick.applied_s - origin,
+        end_s:
+          finite(tick.next_observation_computed_s) &&
+          tick.next_observation_computed_s >= tick.applied_s &&
+          (!finite(stop) || tick.next_observation_computed_s <= stop)
+            ? tick.next_observation_computed_s - origin
+            : null,
+        tick,
+      }))
+      .sort((a, b) => a.start_s - b.start_s);
+    const intervals = [];
+    function gap(start, end, before, after) {
+      if (finite(start) && finite(end) && end > start)
+        intervals.push({
+          id: `${episode.id}/control-gap-${before ?? "initial"}`,
+          kind: "gap",
+          start_s: start,
+          end_s: end,
+          previous_tick: before,
+          next_tick: after,
+        });
+    }
+    for (const [index, step] of steps.entries()) {
+      const previous = steps[index - 1];
+      if (!previous && step.tick.tick === 0) gap(0, step.start_s, null, 0);
+      else if (previous && step.tick.tick === previous.tick.tick + 1)
+        gap(previous.end_s, step.start_s, previous.tick.tick, step.tick.tick);
+      intervals.push(step);
+    }
+    const last = steps.at(-1);
+    // Missing ticks/completions are unknown work, never inferred idle time.
+    if (
+      last &&
+      finite(stop) &&
+      Number.isInteger(episode.metadata?.control_steps) &&
+      last.tick.tick + 1 === episode.metadata.control_steps
+    )
+      gap(last.end_s, stop - origin, last.tick.tick, null);
+    return intervals;
+  }
   function asyncStatus(episode, time) {
     const phases = activePhases(episode, time);
     const active = new Set(phases.map((p) => p.phase));
@@ -572,6 +626,7 @@
     activePhases,
     asyncStatus,
     timelineQueue,
+    controlIntervals,
     controlledEnd,
     physicsAt,
     replayDescriptors,
