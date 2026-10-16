@@ -280,7 +280,7 @@
       null
     );
   }
-  function matchesDescriptor(run, descriptor) {
+  function matchesDescriptor(run, descriptor, resolvedSchedule = undefined) {
     if (
       run.id !== descriptor.id ||
       run.kind !== descriptor.kind ||
@@ -292,7 +292,9 @@
     return (
       deploymentCoupling(run) === deploymentCoupling(descriptor) &&
       deploymentCadence(run) === deploymentCadence(descriptor) &&
-      (expected == null || sameSchedule(deploymentSchedule(run), expected))
+      (expected == null || sameSchedule(deploymentSchedule(run), expected)) &&
+      (resolvedSchedule === undefined ||
+        sameSchedule(deploymentSchedule(run), resolvedSchedule))
     );
   }
   function currentPrefix(episode, tick) {

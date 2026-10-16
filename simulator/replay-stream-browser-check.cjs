@@ -870,6 +870,119 @@ async function main() {
       },
     );
 
+    const legacyDescriptors = ["bf16", "w8a8"].map((precision) => ({
+      id: `legacy-${precision}`,
+      kind: "deployment",
+      precision,
+      episodes: 0,
+      execution_coupling: "synchronous",
+      execution_clock: "ready",
+      path: `runs/legacy-${precision}.json`,
+      label: fixtureNote,
+    }));
+    let legacyPrefix = 8;
+    const legacyRun = (id, k = legacyPrefix) => ({
+      ...run(id),
+      ...legacyDescriptors.find((r) => r.id === id),
+      configuration: { synchronous_chunk_steps: k },
+      episodes: [],
+      clean_requests: [],
+    });
+    await check(
+      "legacy SSE projections stay bound to the first resolved actual K/D cohort",
+      async ({ page }) => {
+        const bf16 = await waitForSource(page, "legacy-bf16");
+        const w8 = await waitForSource(page, "legacy-w8a8");
+        const status = (precision) =>
+          page.locator(
+            `.precision-card[data-precision="${precision}"] .card-status`,
+          );
+        assert.doesNotMatch(await status("bf16").innerText(), /K\/D schedule/);
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+        await emit(
+          page,
+          bf16,
+          event("legacy-bf16", 8, {
+            projection: { op: "replace", run: legacyRun("legacy-bf16", 1) },
+          }),
+        );
+        assert.match(
+          await status("bf16").innerText(),
+          /K\/D schedule/,
+          "K1 cannot silently replace one card in a resolved K8 cohort",
+        );
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+        assert.equal(
+          await page
+            .locator('.precision-card[data-precision="bf16"] video')
+            .count(),
+          0,
+        );
+        assert.equal(
+          await page
+            .locator('.precision-card[data-precision="bf16"] .metrics')
+            .innerText(),
+          "",
+        );
+        await emit(
+          page,
+          w8,
+          event("legacy-w8a8", 8, {
+            projection: { op: "replace", run: legacyRun("legacy-w8a8", 1) },
+          }),
+        );
+        assert.match(
+          await status("w8a8").innerText(),
+          /K\/D schedule/,
+          "the binding must survive rejection, even if both streams drift",
+        );
+        await emit(
+          page,
+          bf16,
+          event("legacy-bf16", 9, {
+            projection: { op: "replace", run: legacyRun("legacy-bf16", 8) },
+          }),
+        );
+        await emit(
+          page,
+          w8,
+          event("legacy-w8a8", 9, {
+            projection: { op: "replace", run: legacyRun("legacy-w8a8", 8) },
+          }),
+        );
+        assert.doesNotMatch(await status("bf16").innerText(), /K\/D schedule/);
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+        legacyPrefix = 1;
+        await page.selectOption("#execution-coupling", "synchronous");
+        await page.waitForFunction(
+          () =>
+            document.querySelector("#data-status").dataset.state === "ready",
+        );
+        assert.doesNotMatch(
+          await status("bf16").innerText(),
+          /K\/D schedule/,
+          "explicit cohort reload resolves a new matching schedule",
+        );
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+      },
+      {
+        catalog: {
+          ...catalog(false),
+          default_view: "deployment",
+          default_execution_coupling: "synchronous",
+          default_execution_clock: "ready",
+          runs: legacyDescriptors,
+          streams: legacyDescriptors.map((r) => ({
+            run_id: r.id,
+            snapshot_path: `streams/${r.id}/snapshot.json`,
+            journal_path: `streams/${r.id}/events.jsonl`,
+          })),
+        },
+        run: legacyRun,
+        snapshot: (id) => ({ ...snapshot(id), run: legacyRun(id) }),
+      },
+    );
+
     const matrix = [
       [1, 1],
       [4, 1],

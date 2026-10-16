@@ -591,3 +591,43 @@ test("missing physical identities never render a numerically invented chunk lag"
   assert.match(block.description, /lag \? physics steps/);
   assert.match(block.label, /offset \?/);
 });
+
+test("resolved legacy cohorts reject K/D drift on subsequent projections without fixing cached-worker K/D", () => {
+  const descriptor = {
+    id: "legacy",
+    kind: "deployment",
+    precision: "bf16",
+    execution_coupling: "synchronous",
+    execution_clock: "ready",
+  };
+  const initial = {
+    ...descriptor,
+    configuration: { synchronous_chunk_steps: 8 },
+  };
+  const changed = {
+    ...descriptor,
+    configuration: { synchronous_chunk_steps: 1 },
+  };
+  assert.equal(R.matchesDescriptor(initial, descriptor), true);
+  assert.equal(R.matchesDescriptor(initial, descriptor, { k: 8, d: 0 }), true);
+  assert.equal(R.matchesDescriptor(changed, descriptor, { k: 8, d: 0 }), false);
+  assert.equal(R.matchesDescriptor(changed, descriptor, { k: 1, d: 0 }), true);
+  assert.equal(R.matchesDescriptor(initial, descriptor, null), false);
+  const cached = { ...descriptor, execution_coupling: "asynchronous" };
+  assert.equal(
+    R.matchesDescriptor(
+      { ...cached, configuration: { synchronous_chunk_steps: 8 } },
+      cached,
+      null,
+    ),
+    true,
+  );
+  assert.equal(
+    R.matchesDescriptor(
+      { ...cached, configuration: { synchronous_chunk_steps: 1 } },
+      cached,
+      null,
+    ),
+    true,
+  );
+});
