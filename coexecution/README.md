@@ -654,6 +654,58 @@ include online activation packing. Action/cache errors
 and finite outputs do not establish task quality. No learned-policy quality
 threshold or FP4 deployment recommendation is supplied by this adapter.
 
+### Calibrated SmoothQuant channel balancing
+
+`--fp-smoothquant PROFILE.pt` optionally balances activation/weight input
+channels before the existing Thor FP8 or FP4 GEMM. Profiles are precision
+specific and bound to SHA-256 hashes of the original BF16 projection weights.
+An incompatible weight, channel count or shared-input group is rejected.
+Missing profile sites keep their configured low-bit quantization; they do not
+silently fall back to BF16. Coverage records smoothed and unsmoothed sites.
+
+The calibration statistic and alpha formula follow the official
+[SmoothQuant revision](https://github.com/mit-han-lab/smoothquant/tree/c61476d728e42ae0d8a35e7e78494edcac3237b5).
+Its published INT8 language-model results do not establish accuracy of this
+GR00T FP8/FP4 adaptation. For PyTorch weights `[N,K]`, the transformation is
+`(X / s) @ (W * s).T + bias`. Original weights/biases are retained unchanged;
+the packed weight copy contains the compensation. Finite-precision rounding
+means this is not a claim of bitwise equivalence to unsmoothed BF16 inference.
+
+Input compensation is fused into packing, including the opt-in SwiGLU,
+AdaLN and residual/normalization producers. AdaLN compensation is applied
+after both conditional scale and shift. QKV/KV/gate-up consumers share one
+channel scale, preserving shared-packing and merged-projection compatibility.
+The profile is loaded and verified before Graph capture; activation-dependent
+quantization scales still refresh on every invocation.
+
+For an existing Thor launch command, retain its execution/precision flags and
+add the matching profile:
+
+```bash
+# Existing FP8 command: --inference-precision fp8 --fp-smoothquant /path/fp8.pt
+# Existing FP4 command: --inference-precision fp4 --fp-smoothquant /path/fp4.pt
+```
+
+The reusable Python APIs `ActivationCalibration`, `channel_scales` and
+`projection_groups` live in
+`coexecution.optimization.backends.thor.smoothquant`. Collect eager BF16
+activation statistics from representative images, language, robot state and
+denoising steps. Keep calibration, parameter-selection and final-validation
+episodes disjoint. The collector owns its RNG and removes hooks on exit.
+Export a `pir2.thor.smoothquant.v1` tensor-only profile with `precision`,
+`upstream_revision`, calibration metadata and `linears[name]` records containing
+FP32 `scale` tensors and `weight_sha256`. Shared-input members must all be
+present with identical scales, or all absent. A scale of one and no profile
+entry are different: absence preserves the original packing path.
+
+Report action deviations against matched BF16, gripper disagreements and
+complete-call latency separately. Calibration/operator error improvements are
+not proof of lower held-out action error or LIBERO success. Profile collection,
+weight packing, Graph capture and warmup are outside inference timing. The
+GPU tests in `tests/gpu/test_smoothquant_gpu.py` exercise compensation, producer
+compatibility, Graph updates, weight identity and restoration; they do not
+establish task-quality acceptance.
+
 ## Measured LIBERO queue reports
 
 `queue_report` is a separate offline consumer of real LIBERO closed-loop trace artifacts. It loads no model and launches no GPU work. Install Matplotlib for static exports, and make Node.js available for the optional illustrative queue-model comparison:

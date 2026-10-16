@@ -169,6 +169,7 @@ class GrootOptimizations:
                 shared_inputs=self.config.fp_shared_inputs,
                 grouped=self.config.fp_grouped,
                 swiglu=self.config.fp_swiglu,
+                smoothquant=self.config.fp_smoothquant,
             )
             self.stack.callback(floating.close)
             self.coverage = floating.coverage
@@ -478,6 +479,7 @@ class GrootOptimizations:
             "group_tactics",
             "shape_tactics",
             "operator_profile",
+            "fp_smoothquant",
         ):
             path = config[key]
             actual = (

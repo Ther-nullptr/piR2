@@ -1,5 +1,15 @@
 # Third-party provenance
 
+- **SmoothQuant**: https://github.com/mit-han-lab/smoothquant at
+  `c61476d728e42ae0d8a35e7e78494edcac3237b5`, copyright 2022 MIT HAN Lab.
+  The per-input-channel absmax statistic, shared-consumer weight maximum and
+  alpha balancing formula in `coexecution/optimization/backends/thor/smoothquant.py`
+  adapt `smoothquant/calibration.py` and `smoothquant/smooth.py` under the
+  [retained MIT license](licenses/SMOOTHQUANT_LICENSE). The Thor implementation
+  retains native FP8/FP4 GEMMs and fuses input compensation into local packing
+  producers; it does not use upstream INT8 model classes or assert that the
+  upstream LLM accuracy results transfer to GR00T or FP4.
+
 - **πR² official repository**: https://github.com/pi-r2-flow/pi-r2-flow at `3af52ca400a6ec7d141416879aa531a6f62f697a`. The official parent source is downloaded separately, not redistributed here. Preserve its original attribution.
 - **πR² Isaac-GR00T fork**: https://github.com/pi-r2-flow/Isaac-GR00T at `2a39d591a3af24c42bb1d1c9cd708a2dddac0600`, derived from NVIDIA Isaac-GR00T. Apache-2.0; [LICENSE](licenses/ISAAC_GROOT_LICENSE) and [NOTICE](licenses/ISAAC_GROOT_NOTICE) accompany `patches/groot-reproduction-fixes.patch`. The local patch preserves clean prefixes under jitter, aligns warm-start time/delay conditioning, zero-initializes newly missing delay embeddings after Hugging Face loading, and retains padded final action frames. The runtime adapters in `coexecution/groot_pointwise.py` and `coexecution/quantization_connections.py` also follow this fork's `gr00t/model/modules/dit.py` and `embodiment_conditioned_mlp.py`: they replace selected inference forwards while retaining the loaded model weights, attention sequence and native normalization. These are modified adapters, not unmodified upstream files.
 - **MuJoCo Playground**: https://github.com/google-deepmind/mujoco_playground at `ef4fefc13033c0468af4ef651847f5348af0c7d7`. Downloaded separately under its own terms.

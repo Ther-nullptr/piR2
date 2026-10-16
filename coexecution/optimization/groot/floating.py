@@ -26,6 +26,7 @@ class FloatingProjections:
         shared_inputs=False,
         grouped=False,
         swiglu=False,
+        smoothquant=None,
     ):
         if precision not in ("fp8", "fp4"):
             raise ValueError("Floating precision must be fp8 or fp4")
@@ -105,10 +106,30 @@ class FloatingProjections:
         }
         if not selected:
             raise ValueError("Floating quantization selected no supported projections")
+        self.smoothing_scales = {}
+        if smoothquant is not None:
+            from coexecution.optimization.backends.thor.smoothquant import load_profile
+
+            self.smoothing_scales, self.coverage["smoothquant"] = load_profile(
+                smoothquant, selected, groups, precision
+            )
+            self.coverage["activation_quantizer"] = (
+                "Triton channel balancing fused into FP8/FP4 packing at smoothed sites; "
+                "configured original quantizer at other sites"
+            )
+        self._scale_by_module = {
+            id(module): self.smoothing_scales.get(name)
+            for name, (module, _, _) in selected.items()
+        }
         try:
             for name, (module, role, scope) in selected.items():
                 quantized = FloatingLinear(
-                    module, name, precision, fast_fp8=fast_fp8, fp4_swap_ab=fp4_swap_ab
+                    module,
+                    name,
+                    precision,
+                    fast_fp8=fast_fp8,
+                    fp4_swap_ab=fp4_swap_ab,
+                    smoothing_scale=self.smoothing_scales.get(name),
                 )
                 self.linears[name] = quantized
                 self.coverage["linears"].append(
@@ -154,10 +175,15 @@ class FloatingProjections:
                     ):
                         continue
                     self.saved.append((mlp, mlp.forward, "forward" in mlp.__dict__))
+                    smooth = self.smoothing_scales.get(down)
 
-                    def forward(x, mlp=mlp, lut=lut):
+                    def forward(x, mlp=mlp, lut=lut, smooth=smooth):
                         packed = prepare_swiglu(
-                            mlp.gate_proj(x), mlp.up_proj(x), lut, precision
+                            mlp.gate_proj(x),
+                            mlp.up_proj(x),
+                            lut,
+                            precision,
+                            smoothing_scale=smooth,
                         )
                         return mlp.down_proj(packed)
 
@@ -179,6 +205,7 @@ class FloatingProjections:
                             fast_fp8,
                             fp4_swap_ab=fp4_swap_ab,
                             contiguous=selected[names[0]][1:] == ("AttnQ", "text"),
+                            smoothing_scale=self.smoothing_scales.get(names[0]),
                         )
                         # Individual packed weights are no longer used by grouped sites.
                         for name in names:
@@ -234,6 +261,9 @@ class FloatingProjections:
             self.close()
             raise
 
+    def input_smoothing(self, module):
+        return self._scale_by_module[id(module)]
+
     def close(self):
         for module, forward, had_forward in reversed(self.saved):
             if had_forward:
@@ -245,3 +275,5 @@ class FloatingProjections:
             group.active, group.cache = False, None
         self.groups.clear()
         self.linears.clear()
+        self.smoothing_scales.clear()
+        self._scale_by_module.clear()
