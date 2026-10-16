@@ -421,6 +421,21 @@ def validate_launch_paths(plan):
         plan["upstream"]
     ).resolve():
         raise ValueError("Runtime upstream path does not match the declared source")
+    from coexecution.libero.loading import checkpoint_decoded_horizon
+
+    # Preflight every condition before run() admits devices or starts any child.
+    # A later condition with an invalid native prefix must not waste earlier runs.
+    for case in plan["conditions"]:
+        coupling = case.get(
+            "execution_coupling", plan.get("execution_coupling", "asynchronous")
+        )
+        if coupling in ("synchronous", "one_step_async", "chunked_async"):
+            decoded = checkpoint_decoded_horizon(case["checkpoint"])
+            prefix = _prefix_steps(plan, case)
+            if prefix > decoded:
+                raise ValueError(
+                    f"Condition {case['name']}: execution prefix {prefix} exceeds native decoded horizon {decoded}"
+                )
 
 
 def environment(plan, role):
