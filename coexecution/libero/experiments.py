@@ -95,6 +95,8 @@ def validate_plan(plan):
 
     for settings in (plan, *plan["conditions"]):
         ImageResolutionConfig(settings.get("image_resolution"))
+        if type(settings.get("runtime_receipt", False)) is not bool:
+            raise ValueError("runtime_receipt must be boolean")
         transport = settings.get("feature_transport", "numpy_fp32")
         rpc = settings.get("feature_rpc", "separate")
         validate_feature_options(transport, rpc)
@@ -209,6 +211,11 @@ def build_commands(plan, case, protocol, output):
             *case["flags"],
             *image_controls,
             *feature_controls,
+            *(
+                ["--runtime-receipt"]
+                if case.get("runtime_receipt", plan.get("runtime_receipt", False))
+                else []
+            ),
         ]
     if layout == "paired":
         commands["paired"] = commands.pop("action")

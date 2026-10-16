@@ -230,6 +230,18 @@ def test_cli_defaults_and_explicit_resolution_are_independent_of_optimization():
     assert image_config(parser.parse_args(["--image-resolution", "192"])).size == 192
 
 
+def test_live_recording_parser_shares_resolution_validation():
+    from coexecution.libero.measurement import build_parser, validate_args
+
+    parser = build_parser(add_help=False)
+    required = ["--checkpoint", "unused", "--dataset", "unused", "--output", "unused"]
+    args = parser.parse_args(required + ["--image-resolution", "192"])
+    validate_args(args)
+    args.image_resolution = 0
+    with pytest.raises(ValueError, match="positive integer"):
+        validate_args(args)
+
+
 @pytest.mark.parametrize(
     "module, arguments",
     [

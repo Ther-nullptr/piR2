@@ -1,10 +1,10 @@
-"""Build local replay evidence; no model execution or web dependencies."""
+"""Build recorded evidence or explicitly start a live model recording."""
 
 import argparse
 from pathlib import Path
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     build = commands.add_parser(
@@ -22,7 +22,38 @@ def main():
         "--clock-cohort",
         help="Operator-declared audited common device/clock cohort; omitted disables paired comparison claims",
     )
-    args = parser.parse_args()
+    from coexecution.libero.measurement import build_parser
+
+    model_parser = build_parser(add_help=False)
+    record = commands.add_parser(
+        "record-model",
+        parents=[model_parser],
+        help="Explicitly run model inference and record a live local stream",
+    )
+    record.add_argument("--catalog-output", type=Path, required=True)
+    record.add_argument("--clock-cohort")
+    args = parser.parse_args(argv)
+    if args.command == "record-model":
+        from .live import record_model
+
+        model_args = argparse.Namespace(
+            **{
+                action.dest: getattr(args, action.dest)
+                for action in model_parser._actions
+            }
+        )
+        try:
+            catalog = record_model(
+                model_args,
+                catalog_output=args.catalog_output,
+                clock_cohort=args.clock_cohort,
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        print(
+            f"Recorded {len(catalog['runs'])} catalog runs at {args.catalog_output / 'catalog.json'}"
+        )
+        return
     from .catalog import build_catalog
 
     catalog = build_catalog(

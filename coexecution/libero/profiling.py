@@ -25,6 +25,8 @@ def collect_model_profile(
     model_only=False,
     observation_ids=None,
     max_prepared_observations=16,
+    event_sink=None,
+    mode=None,
 ):
     """Separate instrumented model probe after priming; never a clean wall sample."""
     import torch
@@ -40,6 +42,13 @@ def collect_model_profile(
         graph_interval,
         graph_snapshot,
     )
+    from coexecution.replay.producer import (
+        ModelRequestEvents,
+        emit_event,
+        validate_sink,
+    )
+
+    validate_sink(event_sink)
 
     if type(rounds) is not int or rounds < 1:
         raise ValueError("Profile rounds must be positive")
@@ -62,9 +71,32 @@ def collect_model_profile(
         else:
             policy.get_action(observation)
     torch.cuda.synchronize(device)
+    if event_sink is not None and model_only:
+        for identity in observation_ids:
+            emit_event(
+                event_sink,
+                "input.ready",
+                sources={"observation_id": identity},
+                payload={
+                    "mode": mode,
+                    "instrumented": True,
+                    "gpu_completion_observed": True,
+                    "scope": "prepared cohort after warmup synchronization",
+                },
+            )
+    active_request = {}
+
+    def stage_scope(name):
+        context = torch.profiler.record_function(STAGE_PREFIX + name)
+        return (
+            active_request["events"].stage(name, context)
+            if event_sink is not None
+            else context
+        )
+
     engine = PreparedInferenceEngine(
         policy.model,
-        stage=lambda name: torch.profiler.record_function(STAGE_PREFIX + name),
+        stage=stage_scope,
     )
     before = graph_snapshot(session)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +112,28 @@ def collect_model_profile(
                 _seed_reset(policy, seed + index, device)
                 request_id = f"profile-r{round_index}-o{index}"
                 annotation = REQUEST_PREFIX + request_id
+                if event_sink is not None:
+                    active_request["events"] = ModelRequestEvents(
+                        event_sink,
+                        request_id=request_id,
+                        observation_id=observation_ids[index],
+                        mode=mode,
+                    )
+                    emit_event(
+                        event_sink,
+                        "model.request.started",
+                        sources={
+                            "request_id": request_id,
+                            "observation_id": observation_ids[index],
+                        },
+                        payload={
+                            "mode": mode,
+                            "seed": seed + index,
+                            "instrumented": True,
+                            "measurement_boundary": "profile",
+                            "output_available": False,
+                        },
+                    )
                 requests.append(
                     {
                         "request_id": request_id,
@@ -94,9 +148,7 @@ def collect_model_profile(
                     if model_only:
                         inputs = prepared[index]
                     else:
-                        with torch.profiler.record_function(
-                            STAGE_PREFIX + "preparation_transfer"
-                        ):
+                        with stage_scope("preparation_transfer"):
                             backbone, action, states = _prepare(policy, observation)
                             torch.cuda.synchronize(device)
                         inputs = PreparedInputs(
@@ -104,6 +156,8 @@ def collect_model_profile(
                         )
                     engine.full(inputs)
                     torch.cuda.synchronize(device)
+                    if event_sink is not None:
+                        active_request["events"].completed()
     profiler.export_chrome_trace(str(output))
     after = graph_snapshot(session)
     calls = rounds * len(observations)

@@ -215,11 +215,11 @@ def complete_graph_interval(before, after):
     return {"passes": all(value["passes"] for value in result.values()), **result}
 
 
-def build_parser():
+def build_parser(*, add_help=True):
     from coexecution.libero.preprocessing import add_image_arguments
     from coexecution.optimization.config import add_optimization_arguments
 
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, add_help=add_help)
     for name in ("checkpoint", "dataset", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--upstream", type=Path)
@@ -252,6 +252,11 @@ def build_parser():
         "--replay-assets",
         action="store_true",
         help="Export actual raw observation PNG/state assets before timing",
+    )
+    parser.add_argument(
+        "--runtime-receipt",
+        action="store_true",
+        help="Record source and loaded operator identities outside measurement timers",
     )
     parser.add_argument("--start-step", type=int, default=10)
     parser.add_argument("--step-stride", type=int, default=7)
@@ -448,6 +453,26 @@ def _rng_equal(first, second):
     return all(torch.equal(left, right) for left, right in zip(first, second))
 
 
+def _mode_evidence(session, args):
+    """Optionally observe installed identity after execution, outside all timers."""
+    evidence = session.evidence()
+    if not getattr(args, "runtime_receipt", False):
+        return evidence
+    import torch
+
+    from coexecution.libero.runtime_receipt import capture_runtime_receipt
+
+    return {
+        **evidence,
+        "runtime_receipt": capture_runtime_receipt(
+            session,
+            variant="flow",
+            measurement_boundary=args.measurement_boundary,
+            torch_module=torch,
+        ),
+    }
+
+
 def _model_only_evidence(previous, gates, audits, retained):
     previous = {} if previous is None else previous
     return {
@@ -477,6 +502,7 @@ def _model_only_mode(
     stream,
     *,
     previous=None,
+    event_sink=None,
 ):
     """One resident cohort; all raw references precede warmup and clean replay.
 
@@ -489,10 +515,23 @@ def _model_only_mode(
         decode_prediction,
         prepare_observations,
     )
+    from coexecution.replay.producer import emit_event, emit_sample
 
     prepared = prepare_observations(
         policy, observations, observation_ids, limit=args.max_prepared_observations
     )
+    if event_sink is not None:
+        for inputs in prepared:
+            emit_event(
+                event_sink,
+                "input.prepared",
+                sources={"observation_id": inputs.observation_id},
+                payload={
+                    "mode": label,
+                    "scope": "resident_input_preparation",
+                    "gpu_completion_observed": False,
+                },
+            )
     engine = PreparedInferenceEngine(policy.model)
     references = {}
     for round_row in plan:
@@ -520,6 +559,7 @@ def _model_only_mode(
                 args.device,
                 cuda_events=args.cuda_events,
             )
+            completed_s = time.monotonic() if event_sink is not None else None
             after = graph_snapshot(session)
             rng = _rng_state(args.device)
             audit = {
@@ -582,6 +622,7 @@ def _model_only_mode(
             }
             samples.append(row)
             stream.write(json.dumps(row, allow_nan=False) + "\n")
+            emit_sample(event_sink, row, completed_s=completed_s, actions=actions)
     return {
         "samples": samples,
         "gates": gates,
@@ -602,6 +643,7 @@ def _model_only_precision(
     stream,
     *,
     previous=None,
+    event_sink=None,
 ):
     samples, gates, audits, evidence, retained = [], [], [], {}, {}
     reference_name = reference_mode(args.modes)
@@ -623,6 +665,7 @@ def _model_only_precision(
             label,
             stream,
             previous=_model_only_evidence(previous, gates, audits, retained),
+            event_sink=event_sink,
         )
         samples.extend(result["samples"])
         gates.extend(result["gates"])
@@ -646,7 +689,18 @@ def _model_only_precision(
                     args.output, _model_only_evidence(previous, gates, audits, retained)
                 )
                 raise RuntimeError(f"Model-only runtime output differs: {gates[-1]}")
-        evidence[label] = optimized.evidence()
+        evidence[label] = _mode_evidence(optimized, args)
+        from coexecution.replay.producer import emit_event
+
+        if evidence[label].get("runtime_receipt") is not None:
+            emit_event(
+                event_sink,
+                "runtime.receipt",
+                payload={
+                    "mode": label,
+                    "runtime_receipt": evidence[label]["runtime_receipt"],
+                },
+            )
         stream.flush()
         _persist_model_only_evidence(
             args.output, _model_only_evidence(previous, gates, audits, retained)
@@ -655,7 +709,10 @@ def _model_only_precision(
     return samples, gates, audits, evidence, retained
 
 
-def run(args):
+def run(args, *, event_sink=None):
+    from coexecution.replay.producer import emit_event, emit_sample, validate_sink
+
+    validate_sink(event_sink)
     reference_name = reference_mode(args.modes)
     import torch
 
@@ -686,10 +743,28 @@ def run(args):
         raise ValueError("Expected unchanged Flow4 NFE=4")
     observations, identity = _observations(policy, args)
     _write(args.output / "observations.json", identity)
+    for observation_identity in identity:
+        emit_event(
+            event_sink,
+            "observation.loaded",
+            sources={"observation_id": observation_identity["observation_id"]},
+            payload={
+                **observation_identity,
+                "timestamp_boundary": "dataset cohort loaded",
+                "live_camera_capture": False,
+            },
+        )
     if getattr(args, "replay_assets", False):
         from coexecution.replay.assets import export_observations
 
-        export_observations(args.output, observations, identity)
+        asset_rows = export_observations(args.output, observations, identity)
+        for asset in asset_rows:
+            emit_event(
+                event_sink,
+                "observation.assets_ready",
+                sources={"observation_id": asset["observation_id"]},
+                payload={"observation": asset},
+            )
     plan = round_plan(args.modes, len(observations), args.rounds, args.seed)
     _write(args.output / "round-plan.json", plan)
     samples, gates, evidence, graph_audits, profiles = [], [], {}, [], {}
@@ -730,6 +805,7 @@ def run(args):
                             "graph_audits": graph_audits,
                             "retained": retained,
                         },
+                        event_sink=event_sink,
                     )
                     samples.extend(block[0])
                     gates.extend(block[1])
@@ -760,6 +836,9 @@ def run(args):
                                     lambda obs=observation: policy.get_action(obs),
                                     args.device,
                                 )
+                                policy_completed_s = (
+                                    time.monotonic() if event_sink is not None else None
+                                )
                                 after_policy = graph_snapshot(optimized)
                                 outputs[mode][index] = actions
                                 retain(
@@ -781,6 +860,12 @@ def run(args):
                                 }
                                 samples.append(row)
                                 stream.write(json.dumps(row, allow_nan=False) + "\n")
+                                emit_sample(
+                                    event_sink,
+                                    row,
+                                    completed_s=policy_completed_s,
+                                    actions=actions,
+                                )
                                 # Independent probes: preparation executes once outside
                                 # the prepared-model boundary. The neural model still
                                 # recomputes the full VLM and every Flow step.
@@ -789,6 +874,9 @@ def run(args):
                                     lambda obs=observation: _prepare(policy, obs),
                                     args.device,
                                 )
+                                prep_completed_s = (
+                                    time.monotonic() if event_sink is not None else None
+                                )
                                 backbone, action, states = prepared
                                 prediction, model_wall, model_detail = timed_model(
                                     lambda bb=backbone, act=action: forward_prepared(
@@ -796,6 +884,9 @@ def run(args):
                                     ),
                                     args.device,
                                     cuda_events=args.cuda_events,
+                                )
+                                model_completed_s = (
+                                    time.monotonic() if event_sink is not None else None
                                 )
                                 after_model = graph_snapshot(optimized)
                                 audit = {
@@ -872,7 +963,28 @@ def run(args):
                                     stream.write(
                                         json.dumps(row, allow_nan=False) + "\n"
                                     )
-                            evidence[label] = optimized.evidence()
+                                    emit_sample(
+                                        event_sink,
+                                        row,
+                                        completed_s=model_completed_s
+                                        if scope == "prepared_model"
+                                        else prep_completed_s,
+                                        actions=prepared_actions
+                                        if scope == "prepared_model"
+                                        else None,
+                                    )
+                            evidence[label] = _mode_evidence(optimized, args)
+                            if evidence[label].get("runtime_receipt") is not None:
+                                emit_event(
+                                    event_sink,
+                                    "runtime.receipt",
+                                    payload={
+                                        "mode": label,
+                                        "runtime_receipt": evidence[label][
+                                            "runtime_receipt"
+                                        ],
+                                    },
+                                )
                         reference = outputs[reference_name]
                         for mode, candidates in outputs.items():
                             for index, actions in candidates.items():
@@ -918,6 +1030,8 @@ def run(args):
                             model_only=args.measurement_boundary == "model-only",
                             observation_ids=[row["observation_id"] for row in identity],
                             max_prepared_observations=args.max_prepared_observations,
+                            event_sink=event_sink,
+                            mode=label,
                         )
                         _write(args.output / "profiles.json", profiles)
     for name, sha in sources.items():
@@ -975,19 +1089,15 @@ def run(args):
     return result
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-    try:
-        from coexecution.libero.preprocessing import image_config
+def validate_args(args):
+    """Share metadata validation with explicit live recording entry points."""
+    from coexecution.libero.preprocessing import image_config
 
-        image_config(args)
-        reference_mode(args.modes)
-        for precision in args.precisions:
-            for mode in args.modes:
-                _config(args, precision, mode)
-    except ValueError as error:
-        parser.error(str(error))
+    image_config(args)
+    reference_mode(args.modes)
+    for precision in args.precisions:
+        for mode in args.modes:
+            _config(args, precision, mode)
     if any(
         getattr(args, name) < 1
         for name in (
@@ -999,18 +1109,29 @@ def main():
             "max_prepared_observations",
         )
     ):
-        parser.error("Observation/round/warmup/stride/thread counts must be positive")
+        raise ValueError(
+            "Observation/round/warmup/stride/thread counts must be positive"
+        )
     if (
         args.start_step < 0
         or args.profile_rounds < 0
         or len(set(args.precisions)) != len(args.precisions)
     ):
-        parser.error("Nonnegative start step and unique precisions are required")
+        raise ValueError("Nonnegative start step and unique precisions are required")
     if (
         args.measurement_boundary == "model-only"
         and args.observations > args.max_prepared_observations
     ):
-        parser.error("Model-only observations exceed --max-prepared-observations")
+        raise ValueError("Model-only observations exceed --max-prepared-observations")
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        validate_args(args)
+    except ValueError as error:
+        parser.error(str(error))
     run(args)
 
 
