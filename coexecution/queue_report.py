@@ -182,65 +182,11 @@ def summarize_episode(events, metadata):
     work_end = stop
     work_requests = []
     if execution_coupling == "one_step_async":
-        complete = [r for r in events if r["kind"] == "async_work_end"]
-        if len(complete) != 1 or any(
-            r["kind"] in ("control_error", "worker_shutdown_error") for r in events
-        ):
-            raise ValueError(
-                "One-step async requires a complete control and work-drain trace"
-            )
-        work_end = complete[0]["t_s"]
-        if work_end < stop:
-            raise ValueError("One-step async work ends before its controlled window")
-        for request in events:
-            if request["kind"] != "one_step_async_request":
-                continue
-            audit = request["audit"]
-            work_requests.append(
-                {
-                    key: request[key]
-                    for key in (
-                        "request_id",
-                        "request_tick",
-                        "source_tick",
-                        "target_tick",
-                        "disposition",
-                        "accepted_prefix_steps",
-                        "unused_plan_suffix_slots",
-                        "frame_hashes",
-                        "unused_reason",
-                    )
-                }
-                | {
-                    key: request[key] - start if request[key] is not None else None
-                    for key in (
-                        "capture_s",
-                        "submitted_s",
-                        "rpc_started_s",
-                        "rpc_completed_s",
-                        "adopted_s",
-                    )
-                }
-                | {
-                    "server_stages": {
-                        key: audit[key] - start
-                        for key in (
-                            "vlm_started_s",
-                            "vlm_completed_s",
-                            "action_started_s",
-                            "action_completed_s",
-                        )
-                    },
-                    "forward_counts": audit["forward_counts"],
-                    "decoded_horizon": audit["decoded_horizon"],
-                    "completed_after_control": request["rpc_completed_s"] > stop,
-                }
-            )
-        if (
-            len({r["request_id"] for r in work_requests}) != len(work_requests)
-            or len(work_requests) != complete[0]["policy_calls"]
-        ):
-            raise ValueError("One-step async request identity/count mismatch")
+        from coexecution.async_evidence import validate_one_step_async_work
+
+        evidence = validate_one_step_async_work(events, metadata=metadata)
+        work_end = evidence["work_end_s"]
+        work_requests = evidence["work_requests"]
     inside = [r for r in events if start <= r["t_s"] <= stop]
     ticks = [r for r in inside if r["kind"] == "control_tick"]
     by_kind = defaultdict(list)
