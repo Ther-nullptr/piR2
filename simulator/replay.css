@@ -895,3 +895,12 @@ footer {
   color: #40564a;
   white-space: nowrap;
 }
+.task-block[data-phase-kind="wait"],
+.task-block[data-phase-kind="drain"] {
+  background: #f5e8c9;
+  border-style: dotted;
+}
+.task-block[data-phase="unused"] {
+  border-style: dashed;
+  opacity: 0.72;
+}

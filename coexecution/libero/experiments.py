@@ -136,7 +136,9 @@ def validate_plan(plan):
 
             defaults = {
                 "execution_coupling": "asynchronous",
+                "execution_clock": "paced",
                 "synchronous_chunk_steps": 8,
+                "async_overlap_steps": None,
                 "synchronous_warmup_timeout_seconds": 900,
                 "server_layout": "split",
                 "feature_transport": "numpy_fp32",
@@ -150,7 +152,9 @@ def validate_plan(plan):
             validate_synchronous_controls(
                 SimpleNamespace(
                     **{
-                        key: case.get(key, plan.get(key, value))
+                        key: _prefix_steps(plan, case)
+                        if key == "synchronous_chunk_steps"
+                        else case.get(key, plan.get(key, value))
                         for key, value in defaults.items()
                     },
                     protocol=protocol,
@@ -194,6 +198,22 @@ def validate_plan(plan):
             )
 
 
+def _prefix_steps(plan, case):
+    for settings in (plan, case):
+        if (
+            "execution_prefix_steps" in settings
+            and "synchronous_chunk_steps" in settings
+            and settings["execution_prefix_steps"]
+            != settings["synchronous_chunk_steps"]
+        ):
+            raise ValueError("Conflicting execution prefix aliases")
+    for settings in (case, plan):
+        for key in ("execution_prefix_steps", "synchronous_chunk_steps"):
+            if key in settings:
+                return settings[key]
+    return 8
+
+
 def build_commands(plan, case, protocol, output):
     root = Path(plan["runtime_root"])
     commands = {}
@@ -222,12 +242,7 @@ def build_commands(plan, case, protocol, output):
                 "--execution-coupling",
                 coupling,
                 "--synchronous-chunk-steps",
-                str(
-                    case.get(
-                        "synchronous_chunk_steps",
-                        plan.get("synchronous_chunk_steps", 8),
-                    )
-                ),
+                str(_prefix_steps(plan, case)),
                 "--synchronous-warmup-timeout-seconds",
                 str(
                     case.get(
@@ -237,12 +252,19 @@ def build_commands(plan, case, protocol, output):
                 ),
             ]
         )
+        overlap = case.get("async_overlap_steps", plan.get("async_overlap_steps"))
+        if overlap is not None:
+            deployment_controls.extend(["--async-overlap-steps", str(overlap)])
         fixed_delay = case.get(
             "deployment_fixed_delay", plan.get("deployment_fixed_delay")
         )
         if fixed_delay is not None:
             deployment_controls.extend(["--deployment-fixed-delay", str(fixed_delay)])
-    for role in ("action",) if coupling == "synchronous" else ("action", "vlm"):
+    for role in (
+        ("action",)
+        if coupling in ("synchronous", "one_step_async", "chunked_async")
+        else ("action", "vlm")
+    ):
         commands[role] = [
             str(plan["model_python"]),
             "-m",
@@ -399,6 +421,21 @@ def validate_launch_paths(plan):
         plan["upstream"]
     ).resolve():
         raise ValueError("Runtime upstream path does not match the declared source")
+    from coexecution.libero.loading import checkpoint_decoded_horizon
+
+    # Preflight every condition before run() admits devices or starts any child.
+    # A later condition with an invalid native prefix must not waste earlier runs.
+    for case in plan["conditions"]:
+        coupling = case.get(
+            "execution_coupling", plan.get("execution_coupling", "asynchronous")
+        )
+        if coupling in ("synchronous", "one_step_async", "chunked_async"):
+            decoded = checkpoint_decoded_horizon(case["checkpoint"])
+            prefix = _prefix_steps(plan, case)
+            if prefix > decoded:
+                raise ValueError(
+                    f"Condition {case['name']}: execution prefix {prefix} exceeds native decoded horizon {decoded}"
+                )
 
 
 def environment(plan, role):

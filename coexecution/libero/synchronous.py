@@ -19,7 +19,12 @@ from scripts.libero_queue_trace import QueueTrace
 
 def validate_synchronous_controls(args):
     coupling = getattr(args, "execution_coupling", "asynchronous")
-    if coupling not in ("asynchronous", "synchronous"):
+    if coupling not in (
+        "asynchronous",
+        "synchronous",
+        "one_step_async",
+        "chunked_async",
+    ):
         raise ValueError("Unknown execution coupling")
     chunk = getattr(args, "synchronous_chunk_steps", 8)
     if type(chunk) is not int or chunk < 1:
@@ -29,10 +34,38 @@ def validate_synchronous_controls(args):
         raise ValueError(
             "Synchronous warmup RPC timeout must be positive and fit socket milliseconds"
         )
-    if coupling != "synchronous":
+    overlap = getattr(args, "async_overlap_steps", None)
+    if coupling == "chunked_async":
+        if (
+            type(overlap) is not int
+            or not 1 <= overlap <= chunk
+            or getattr(args, "execution_clock", "paced") != "ready"
+        ):
+            raise ValueError(
+                "Chunked async requires ready and integer 1 <= overlap D <= prefix K"
+            )
+    elif overlap is not None and not (
+        coupling == "synchronous"
+        and type(overlap) is int
+        and overlap == 0
+        or coupling == "one_step_async"
+        and type(overlap) is int
+        and overlap == 1
+    ):
+        raise ValueError(
+            "Async overlap is only valid for chunked async, synchronous D0, or one-step D1"
+        )
+    if coupling == "asynchronous":
         return
+    if coupling == "one_step_async" and (
+        chunk != 1 or getattr(args, "execution_clock", "paced") != "ready"
+    ):
+        raise ValueError(
+            "One-step async requires ready execution and exactly one prefix step"
+        )
+    name = coupling.replace("_", " ").capitalize()
     if args.protocol != "deployment" or args.variant != "flow":
-        raise ValueError("Synchronous execution requires deployment Flow")
+        raise ValueError(f"{name} execution requires deployment Flow")
     if (
         args.server_layout != "split"
         or args.feature_transport != "numpy_fp32"
@@ -44,7 +77,7 @@ def validate_synchronous_controls(args):
         or args.artificial_compute_wait
     ):
         raise ValueError(
-            "Synchronous Flow requires one ordinary action endpoint without paired/resident "
+            f"{name} Flow requires one ordinary action endpoint without paired/resident "
             "feature exchange, asynchronous scheduling controls or artificial waits"
         )
 
@@ -232,6 +265,8 @@ def run_synchronous_loop(
         fixed_rate_timing_applicable=False,
         max_steps=max_steps,
         synchronous_chunk_steps=chunk_steps,
+        execution_prefix_steps=chunk_steps,
+        async_overlap_steps=0,
         bootstrap_action_slots=0,
     )
     try:
@@ -385,6 +420,12 @@ def run_synchronous_loop(
     finally:
         events.flush(trace)
     wall = end - base
+    adjacent_gaps = [b["applied_s"] - a["applied_s"] for a, b in pairwise(ticks)]
+    boundary_gaps = [
+        b["applied_s"] - a["next_observation_computed_s"]
+        for a, b in pairwise(ticks)
+        if b["first_application_of_request"]
+    ]
     result = {
         "success": bool(success),
         "termination_reason": reason,
@@ -392,6 +433,8 @@ def run_synchronous_loop(
         "execution_coupling": "synchronous",
         "execution_clock": execution_clock,
         "synchronous_chunk_steps": chunk_steps,
+        "execution_prefix_steps": chunk_steps,
+        "async_overlap_steps": 0,
         "control_steps": len(ticks),
         "physics_step_seconds": period,
         "nominal_physics_hz": 1 / period,
@@ -441,6 +484,12 @@ def run_synchronous_loop(
             bool(a.get("graph_execution", {}).get("cold_capture")) for a in audits
         ),
         "unused_plan_suffix_slots": unused,
+        "adjacent_action_gap_seconds": summarize_values(adjacent_gaps),
+        "total_adjacent_action_gap_seconds": sum(adjacent_gaps),
+        "boundary_gap_seconds": summarize_values(boundary_gaps),
+        "total_boundary_gap_seconds": sum(boundary_gaps),
+        "amortized_wall_seconds_per_action": wall / len(ticks),
+        "total_environment_step_seconds": sum(t["environment_step_s"] for t in ticks),
         "fallback_ticks": 0,
         "action_trace_sha256": hashlib.sha256(
             np.asarray([r["action"] for r in ticks], dtype=np.float32).tobytes()

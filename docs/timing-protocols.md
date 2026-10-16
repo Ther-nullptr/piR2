@@ -1,11 +1,11 @@
 # Two timing protocols
 
-Both protocols use real VLM image features, current robot state, the same checkpoint/data identities and paired initial conditions. They answer different questions and their scores must not be pooled.
+Both protocols use real VLM image features, the same checkpoint/data identities and paired initial conditions. Their deployment coupling selects the image/state age and inference/execution relationship; the table describes the original cached-worker deployment baseline. Scores from different protocols or coupling modes must not be pooled.
 
 | Protocol | Observation/action timing | Purpose |
 |---|---|---|
 | Algorithm | Image age fixed at 3 ticks (150ms); action release fixed at 1 tick (50ms); current state | Compare behavior at identical simulated delays |
-| Deployment | Absolute wall-clock 20Hz control; asynchronous real VLM and action workers | Measure behavior with actual processing/transport delays |
+| Deployment (cached asynchronous baseline) | Absolute wall-clock 20Hz control; asynchronous real VLM and action workers | Measure behavior with actual processing/transport delays |
 
 In the algorithm protocol, computation waits do not advance physics. Each method executes the committed prefix, then uses the next legal segment. The initial missing image history is explicitly padded. A GPU contract check adds 100ms wait per call and compares actions and final images; this is a timing check, not a success-rate evaluation.
 
@@ -225,3 +225,131 @@ python simulator/serve.py --replay .local/synchronous-replay/catalog.json
 映射，推理期间保持已有帧，不伪造运动；VLM→DiT→已执行动作仍可追溯。
 相机拷贝与 trace 收集属于 instrumented debug 成本，视频编码在控制结束后执行。
 少量任务样例不代表完整 Spatial 套件成功率。
+
+
+### One-step asynchronous policy/execution / 单步异步策略与动作执行
+
+`--execution-coupling one_step_async --execution-clock ready
+--execution-prefix-steps 1` 是独立协议。它保留一个普通 Flow action server，每次请求
+在同一服务内完整运行真实 VLM 和 Flow4。原有 `asynchronous` 仍指独立 VLM/DiT
+缓存控制器，`synchronous` 仍按推理、执行顺序运行；三者不能混称。
+
+先用观测0完成一次计入 scored control 的 bootstrap 请求，得到动作0。执行动作 k
+之前，主线程复制当前观测 k，将它交给专属模型线程计算动作 k+1；主线程同时执行
+当前结果的**第一个动作**。该原子步结束后，若下一结果未完成，控制器明确等待，
+不补执行旧计划后缀，也不使用 fallback。bootstrap 的源/目标为0/0，随后为0/1、
+1/2等：图像和状态一起滞后一个**物理步**，没有未来状态预测或补偿算法。
+原生解码长度保持 checkpoint 配置，未采纳的动作后缀计入丢弃数量。
+
+每个 `env.step` 仍推进0.05秒仿真时间，但 `ready` 不为它额外等待50ms。
+因此重叠预算来自实际的 `env.step` wall 区间，不等同于50ms；后端渲染和模型同卡
+争用也包含在实测值中。`observation_lag_ticks` 与 capture-to-apply wall AoI 分别
+报告，一个旧物理步不等于额外50ms wall AoI。此实现受
+[The Speedup Paradox §3.1](https://arxiv.org/pdf/2606.28529v3) 启发，但使用真实并发
+RPC/仿真执行；论文中的历史观测抽象和理想周期公式不能替代此处的测量。
+
+```bash
+python scripts/evaluate_libero_protocol.py \
+  --protocol deployment --variant flow --port 5570 \
+  --execution-coupling one_step_async --execution-clock ready \
+  --execution-prefix-steps 1 --task-ids 0 3 --episodes-per-task 1 \
+  --max-steps 300 --record-replay --replay-max-frames 301 \
+  --output .local/one-step-async/deployment
+```
+
+`--execution-prefix-steps` 是 `--synchronous-chunk-steps` 的兼容别名。experiment plan
+支持同名下划线字段，逐 condition 覆盖全局；同层别名冲突会报错。该模式只支持
+`ready`、prefix1、deployment Flow 和单个普通 action endpoint；paced、πR²、paired/
+resident 特征传输、服务等待下限、视觉限频与 fixed-delay 均明确拒绝。
+
+专属后台线程创建、使用并销毁自己的 PolicyClient/ZeroMQ context；主线程独占
+MuJoCo 观测和步进，提交的是独立只读数组。每任务同 endpoint 完整 warmup 后只
+重置一次 RNG；warmup socket 超时默认900秒，正式请求恢复120秒的 send/receive
+各自上限。等待 Future 的上限覆盖两次 socket 上限和30秒余量，关闭线程也有上限。
+超时、模型或仿真异常保留不完整 trace 并令实验失败，不会被当作成功 episode。
+
+`request_id`（兼容 `request_tick`）标识唯一策略请求，`target_tick` 是它可能执行的
+目标步；`source_tick` 独立标识源观测步。bootstrap request0与预取 request1 都可源于
+观测0，VLM feature_sequence 使用唯一 request_id，不能用 source_tick 合并它们。
+`policy_request_submitted`、`policy_rpc_started/completed` 分别记录排队提交和模型线程
+实际 RPC 边界；VLM/DiT 的 server stage 时间另存，均不是 kernel-only 时间。
+`cycle_phase` 包含 inference、execution、wait、drain；异步 inference 不标为全程
+暂停仿真。`one_step_async_request` 保存原生计划和采纳状态，
+`one_step_async_execution` 与 `control_tick` 才证明实际动作执行。
+
+首次成功、环境终止或 max_steps 后不再执行动作。已在飞行的最终推测请求必须排空，
+记录为 unused；已知最后一步达到 max_steps 时不额外预取。`control_end` 截止控制
+窗口，`async_work_end` 截止全部已提交策略工作，末尾 drain 分开报告。`policy_calls`、
+forward_counts 和完整 RPC 分布包含最终未用请求；`adopted_policy_calls`、实际执行
+步数、丢弃后缀另列。queue report 的 `requests` 保留控制窗口的阶段暴露和 censoring，
+`work_requests` 保留整个 bootstrap/推测/排空过程，不把 drain 隐去。
+`measured_inference_execution_overlap_seconds` 是实际 RPC 与实际执行区间的交集；
+服务端 VLM/DiT 交集另列，不能从“提交在步进之前”推断一定存在 GPU 重叠。
+
+
+回放导入与 `feature_usage.audit_raw` 共用 `coexecution.async_evidence` 的全工作审计。
+每个规范化 `work_requests` 项都要独立匹配原始 submission、图像 hash、RPC 和服务端
+阶段、唯一 request/target/source、adopted 或 unused 处置及实际动作；最终不用的计算
+同样验证。缺失、重复、错误时序或计数不一致会拒绝结果。控制窗口 `requests` 不变，
+供前端使用的 `replay_requests` 保留完整 VLM/DiT 阶段，`work_end_s` 保留排空尾部。
+前端把 Policy RPC 与 Execute/Wait/Drain 分成可同时可见的轨道；执行动作关联其精确的
+DiT→VLM 来源，并同时显示物理步滞后和 wall AoI。末尾机器人保持真实末帧，模型轨道
+继续展示未执行的最终结果。当前为调试记录，非无插桩性能测试或完整套件成功率。
+
+比较完整策略延时时，异步 `inference_request_seconds` 从主线程提交至响应；其
+`inference_wall_seconds` 仅为 worker 输入准备之后的 RPC。同步的完整调用起点在
+输入准备之前。前端分别标注这些边界，不能直接把异步 RPC 与同步完整调用做加速比。
+
+### Chunked asynchronous lookahead / 动作块长度与异步深度
+
+`chunked_async` 将执行前缀长度 K 与提前推理步数 D 分开：
+`--execution-prefix-steps K --async-overlap-steps D`，要求
+`1 <= D <= K <= checkpoint 原生解码长度`。它复用单步协议的专属 RPC worker，
+保持真实 VLM＋Flow4，每段依次执行原生动作 offset0…K−1。下一段目标 T 为
+K、2K 等；在物理步 T−D 之前捕获当前图像和状态并提交请求，执行完当前段承诺
+的所有动作后才采用下一结果。结果提前就绪也不会提前换段；未就绪时明确等待。
+D=0 使用现有 `synchronous`，而非退化的异步模式。旧 `one_step_async` 保留其
+v1 接口和记录，等价于 K=1、D=1；旧 `asynchronous` 缓存控制器不变。
+
+```bash
+python scripts/evaluate_libero_protocol.py \
+  --protocol deployment --variant flow --port 5570 \
+  --execution-coupling chunked_async --execution-clock ready \
+  --execution-prefix-steps 8 --async-overlap-steps 4 \
+  --task-ids 0 3 --episodes-per-task 1 --max-steps 300 \
+  --record-replay --replay-max-frames 301 \
+  --output .local/chunked-async/deployment
+```
+
+experiment plan 支持 `async_overlap_steps`，condition 中的值覆盖全局。
+启动实验前，runner 读取每个 checkpoint 的 `processor_config.json` 中
+`processor_kwargs.modality_configs.libero_sim.action.delta_indices`，按其实际长度
+检查所有 condition 的有效 K；它不会把模型的 H40 当作原生解码长度，也不会加载模型。
+root metadata 优先，缺失时才按上游 loader 回退到 `processor/` 子目录；错误或缺失的
+metadata 在 GPU admission 和子进程启动之前报错。服务加载后的 identity 检查仍保留。
+对照矩阵可采用 K1/D0,1；K2/D0,1,2；K4/D0,1,2,4；K8/D0,1,4,8。
+D0 condition 设置 `execution_coupling=synchronous`；D>0 设置 `chunked_async`。
+该版本仅支持 deployment Flow、ready、一个普通 action endpoint。输入快照独立
+只读，MuJoCo 仅由主线程操作；普通段内步骤复用上一 env.step 的观测，只有 bootstrap
+和指定的预取边界才强制刷新摄像头。没有未来状态预测或异步补偿算法。
+
+bootstrap 的 offset j 来自物理观测0，滞后 j 步；后续每段 offset j 滞后 D+j
+物理步。wall AoI 由真实 capture-to-apply 测量，与仿真0.05秒/步分别报告。
+成功或终止发生在任何 offset 都立即停止。max_steps 截断最后一段的接纳长度，
+例如 K8、上限300时 target296 只接纳4步。接纳但因提前成功未执行的步骤、未接纳
+的原生后缀，以及最终推测请求完全未采用的动作分别计数，不把“接纳”写成“执行”。
+
+v2 `chunked_async_request` 在段完成后保存最终计数，`t_s=finalized_s`；实际接纳
+时间使用 `adopted_s`，响应接收使用 `received_s`。`request_id=request_tick=target_tick`
+按 K 递增，不能假设连续；每个 `chunked_async_execution` 与 execution phase 使用
+唯一 `execution_id=tick`，并记录 `executed_offset`。多个物理步关联同一个请求。
+尾部 unused 请求的 target 可能大于实际控制结束步；drain 的 physics tick 始终使用
+实际 `control_steps`。`chunked_async_boundary` 记录结果是否在边界就绪，完整工作
+审计验证对应 wait，以及所有原生 offset、执行动作、源观测和终止后未用计算。
+
+主要比较成功/失败、实际 `actual_control_hz`、完整控制窗口除以动作步数的
+`amortized_wall_seconds_per_action`、段边界等待与 gap 的 P95、AoI 和实测重叠。
+`boundary_gap_seconds` 是上一段最后一步 env.step 完成到下一段第一步开始的间隔；
+`adjacent_action_gap_seconds` 是相邻动作开始时刻的间隔。K 较大时段内短间隔会压低
+后一指标的 P50，不能仅凭它声称整体吞吐提升。两种间隔均保留 count 和 sum，原始
+逐动作/逐阶段记录用于汇总分位数，不能把每 episode 的分位数再平均。
