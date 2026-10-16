@@ -1,10 +1,10 @@
-"""Display records for audited complete one-step asynchronous work."""
+"""Display records for audited complete full-policy asynchronous work."""
 
-from coexecution.async_evidence import validate_one_step_async_work
+from coexecution.async_evidence import validate_async_work
 
 
-def one_step_async_replay(events, queue, episode_id):
-    evidence = validate_one_step_async_work(events, normalized=queue["work_requests"])
+def async_replay(events, queue, episode_id):
+    evidence = validate_async_work(events, normalized=queue["work_requests"])
     start = evidence["start_s"]
     phases = []
     for raw in evidence["phases"]:
@@ -18,8 +18,13 @@ def one_step_async_replay(events, queue, episode_id):
                 if key.endswith("_s") and value is not None
             }
         )
+        suffix = (
+            f"execution-{raw['execution_id']}"
+            if raw["phase"] == "execution" and "execution_id" in raw
+            else raw["phase"]
+        )
         phase.update(
-            id=f"{episode_id}/request-{raw['request_id']}/{raw['phase']}",
+            id=f"{episode_id}/request-{raw['request_id']}/{suffix}",
             raw=raw,
             status="completed",
             clock_id="control_wall",
@@ -63,3 +68,7 @@ def one_step_async_replay(events, queue, episode_id):
                 )
             tasks.append(task)
     return phases, tasks
+
+
+# Public compatibility for callers importing the original v1 helper.
+one_step_async_replay = async_replay

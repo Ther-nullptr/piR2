@@ -197,7 +197,7 @@
       return "Inferring + executing";
     if (active.has("wait"))
       return "Waiting for next result · simulation paused";
-    if (active.has("execution")) return "Executing one action";
+    if (active.has("execution")) return "Executing physical step";
     if (active.has("inference")) return "Inferring · between physical steps";
     return "Control transition";
   }
@@ -220,18 +220,155 @@
       "asynchronous"
     );
   }
+  function isFullPolicyAsync(run) {
+    return ["one_step_async", "chunked_async"].includes(
+      deploymentCoupling(run),
+    );
+  }
+  function deploymentSchedule(run) {
+    const coupling = deploymentCoupling(run);
+    if (coupling === "asynchronous") return null;
+    const k =
+      run.execution_prefix_steps ??
+      run.configuration?.execution_prefix_steps ??
+      run.configuration?.synchronous_chunk_steps ??
+      (coupling === "one_step_async" ? 1 : null);
+    const d =
+      run.async_overlap_steps ??
+      run.configuration?.async_overlap_steps ??
+      (coupling === "synchronous"
+        ? 0
+        : coupling === "one_step_async"
+          ? 1
+          : null);
+    if (
+      !Number.isInteger(k) ||
+      k < 1 ||
+      !Number.isInteger(d) ||
+      d < 0 ||
+      d > k ||
+      (coupling === "synchronous" && d !== 0) ||
+      (coupling === "one_step_async" && (k !== 1 || d !== 1)) ||
+      (coupling === "chunked_async" && d === 0)
+    )
+      return null;
+    return { k, d };
+  }
+  function sameSchedule(a, b) {
+    return a == null || b == null
+      ? a == null && b == null
+      : a.k === b.k && a.d === b.d;
+  }
+  function scheduleChoices(descriptors, cadence, coupling) {
+    const choices = new Map();
+    for (const run of replayDescriptors(
+      descriptors,
+      "deployment",
+      cadence,
+      coupling,
+    )) {
+      const schedule = deploymentSchedule(run);
+      if (schedule) choices.set(`${schedule.k}/${schedule.d}`, schedule);
+    }
+    return [...choices.values()].sort((a, b) => a.k - b.k || a.d - b.d);
+  }
+  function selectSchedule(choices, preferred) {
+    return (
+      choices.find((s) => sameSchedule(s, preferred)) ??
+      choices.find((s) => s.k === preferred?.k) ??
+      choices[0] ??
+      null
+    );
+  }
+  function matchesDescriptor(run, descriptor, resolvedSchedule = undefined) {
+    if (
+      run.id !== descriptor.id ||
+      run.kind !== descriptor.kind ||
+      run.precision !== descriptor.precision
+    )
+      return false;
+    if (run.kind !== "deployment") return true;
+    const expected = deploymentSchedule(descriptor);
+    return (
+      deploymentCoupling(run) === deploymentCoupling(descriptor) &&
+      deploymentCadence(run) === deploymentCadence(descriptor) &&
+      (expected == null || sameSchedule(deploymentSchedule(run), expected)) &&
+      (resolvedSchedule === undefined ||
+        sameSchedule(deploymentSchedule(run), resolvedSchedule))
+    );
+  }
+  function currentPrefix(episode, tick) {
+    if (!tick) return null;
+    const work = episode.queue?.work_requests?.find(
+      (r) =>
+        Number.isInteger(tick.request_id) && r.request_id === tick.request_id,
+    );
+    if (work)
+      return {
+        native: work.decoded_horizon ?? null,
+        accepted: work.accepted_prefix_steps ?? null,
+        executed: work.executed_prefix_steps ?? null,
+        offset: tick.executed_offset ?? null,
+        lag: tick.observation_lag_ticks ?? null,
+      };
+    const cycle = episode.cycles?.find((r) => r.cycle === tick.cycle);
+    if (!cycle) return null;
+    const requests = (episode.queue?.requests ?? []).filter(
+      (r) => r.role === "S1" && r.request_tick === cycle.request_tick,
+    );
+    const request = requests.length === 1 ? requests[0] : null;
+    return {
+      native: cycle.audit?.decoded_horizon ?? null,
+      accepted:
+        Number.isInteger(request?.valid_start_tick) &&
+        Number.isInteger(request?.valid_end_tick)
+          ? request.valid_end_tick - request.valid_start_tick
+          : null,
+      executed: cycle.executed_steps ?? null,
+      offset:
+        Number.isInteger(tick.tick) && Number.isInteger(cycle.request_tick)
+          ? tick.tick - cycle.request_tick
+          : null,
+      lag:
+        Number.isInteger(tick.tick) &&
+        Number.isInteger(cycle.audit?.source_tick)
+          ? tick.tick - cycle.audit.source_tick
+          : null,
+    };
+  }
+  function waitStats(episode) {
+    const unknown = { count: null, total: null, p95: null };
+    if (!Array.isArray(episode?.phases)) return unknown;
+    const waits = episode.phases.filter((p) => p.phase === "wait");
+    if (
+      waits.some(
+        (p) => !finite(p.start_s) || !finite(p.end_s) || p.end_s < p.start_s,
+      )
+    )
+      return unknown;
+    const durations = waits.map((p) => p.end_s - p.start_s);
+    return {
+      count: durations.length,
+      total: durations.reduce((a, b) => a + b, 0),
+      p95: quantile(durations, 0.95),
+    };
+  }
   function replayDescriptors(
     descriptors,
     kind,
     cadence,
     coupling = "asynchronous",
+    schedule = undefined,
   ) {
     return descriptors.filter(
       (run) =>
         run.kind === kind &&
         (kind !== "deployment" ||
           (deploymentCadence(run) === cadence &&
-            deploymentCoupling(run) === coupling)),
+            deploymentCoupling(run) === coupling &&
+            (!isFullPolicyAsync(run) || deploymentSchedule(run) != null) &&
+            (schedule === undefined ||
+              sameSchedule(deploymentSchedule(run), schedule)))),
     );
   }
   function playableEpisode(episode) {
@@ -368,6 +505,14 @@
     normalizeEpisode,
     deploymentCadence,
     deploymentCoupling,
+    deploymentSchedule,
+    isFullPolicyAsync,
+    sameSchedule,
+    scheduleChoices,
+    selectSchedule,
+    matchesDescriptor,
+    currentPrefix,
+    waitStats,
     phaseAt,
     activePhases,
     asyncStatus,

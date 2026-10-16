@@ -236,6 +236,55 @@ helpers, never Torch, NumPy archives, a simulator or a model.
   selects the new protocol; catalog refresh, task/camera changes and SSE retain the
   same coupling filter. `ready` here means unpaced physical steps with explicit
   result waits, not 20 Hz wall control or StreamingVLA weights.
+- **Prefix / overlap matrix** adds `chunked_async` with synchronized **K** and
+  **D** selectors. K is the maximum number of native decoded actions executed
+  from each accepted result; D is the number of current-prefix actions remaining
+  when the next observation is captured and its full VLM+Flow4 request is submitted.
+  D=0 uses `synchronous`; D>0 uses `chunked_async`. The older `one_step_async`
+  K=1/D=1 and cached-worker `asynchronous` remain separate protocols. Cached-worker
+  recordings have no invented fixed K/D. Choices come from measured catalog rows,
+  not a hardcoded grid: all precision cards share one cadence/coupling/K/D, and
+  run selectors only choose repetitions of that schedule. A K or coupling change
+  retains the old D when available, otherwise selects the lowest recorded D for
+  that K. Catalog refresh preserves a valid selection; a removed combination
+  falls back deterministically and loads a new cohort. Only that cohort's run
+  JSON is loaded. Stream updates that change its identity or schedule are withheld.
+
+  Request/feature IDs are target ticks 0, K, 2K, …; they are not array indices.
+  Each physical execution block has its own tick and native offset, and all steps
+  of one prefix link to the same exact DiT→VLM producer. The auto window keeps the
+  producer visible at the end of a long prefix. Bootstrap lag equals the native
+  offset; later lag equals D+offset physical steps. Wall AoI is measured separately.
+  Cards show native decoded horizon, accepted prefix and actual executed prefix:
+  success can stop midway, and a finite step cap can shorten the final prefix.
+  The normalized request's `adopted_s` is adoption; v2 `finalized_s` is recorded
+  after actual execution and must not become a false response or inference end.
+  Wait and terminal drain preserve the stopped robot and physics clock; the full
+  unused final VLM/DiT computation remains visible after control ends. Every imported
+  v2 record passes the shared strict full-work evidence validator.
+
+  Use **control wall / actual actions (ms/action)** and **effective execution rate
+  (Hz)** for matrix timing, alongside prefix-boundary gap P95, adjacent gap P95 and
+  explicit wait count/time. An adjacent-gap P50 is dominated by block-internal
+  steps when K>1 and is not whole-episode throughput. Each card describes its
+  selected episode and outcome; no distinct K/D, successful/failed trajectories
+  or max-step terminations are pooled. These are recorded host bounds with camera
+  overhead, not GPU-kernel measurements or suite accuracy.
+
+  ```bash
+  python -m coexecution.replay build \
+    --deployment /path/to/matrix/evaluation \
+    --default-execution-coupling chunked_async --default-execution-clock ready \
+    --default-execution-prefix-steps 8 --default-async-overlap-steps 1 \
+    --output .local/matrix-replay
+  python simulator/serve.py --replay .local/matrix-replay/catalog.json
+  ```
+
+  URL query parameters `execution_prefix_steps` and `async_overlap_steps` select
+  the measured schedule together with `execution_coupling` and `execution_clock`.
+  The URL and exported evidence selection retain all four dimensions. Old catalogs
+  missing K/D descriptors remain inspectable, but incompatible loaded prefixes are
+  withheld rather than compared; rebuild such catalogs to enable their selectors.
 - Declared live streams use `replay-stream.js`: snapshot first, then ordered SSE
   events, duplicate/gap checks, resnapshot and explicit terminal closure. Live
   updates preserve media, cursor and user selection; following the latest event

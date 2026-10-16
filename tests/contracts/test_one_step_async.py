@@ -390,7 +390,8 @@ def test_measured_overlap_is_actual_rpc_and_stage_intersection():
         assert measured == pytest.approx(intersection)
 
 
-def test_episode_warmup_and_reset_use_only_owned_worker(monkeypatch):
+@pytest.mark.parametrize("coupling", ["one_step_async", "chunked_async"])
+def test_episode_warmup_and_reset_use_only_owned_worker(monkeypatch, coupling):
     import sys
 
     monkeypatch.setitem(sys.modules, "zmq", SimpleNamespace(RCVTIMEO=1, SNDTIMEO=2))
@@ -464,6 +465,9 @@ def test_episode_warmup_and_reset_use_only_owned_worker(monkeypatch):
         record_video=False,
         synchronous_warmup_timeout_seconds=900,
         slow_warmup_calls=3,
+        execution_coupling=coupling,
+        synchronous_chunk_steps=4,
+        async_overlap_steps=2,
         port=5570,
         max_steps=1,
     )
