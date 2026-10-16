@@ -130,6 +130,11 @@ test("execution source stops at an ambiguous visual cache and keeps the recorded
     T.sourceBlocks(tracks, block.id).map((b) => b.id),
     ["a-source"],
   );
+  assert.equal(
+    tracks.find((t) => t.stage === "action").blocks[0].label,
+    "S1[?]",
+  );
+  assert.equal(block.sourceLabel, "S1[?]");
   assert.match(block.description, /20\.0 ms simulation/);
   assert.equal(
     T.controlViewport(tracks, 1.07, 1.1).start,

@@ -282,7 +282,7 @@
           const label =
             stage === "vlm"
               ? (parent?.label ?? "S2[?]")
-              : !lookahead || parent
+              : parent || (!lookahead && !visualCounts.has(r.feature_sequence))
                 ? (aliases.actions.get(r.request_tick)?.label ?? "S1[?]")
                 : "S1[?]";
           const end = finite(r.end_s)
