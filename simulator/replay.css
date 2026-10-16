@@ -599,6 +599,7 @@ select {
 }
 .inline-controls {
   display: flex;
+  flex-shrink: 0;
   gap: 10px;
 }
 .inline-controls label {
