@@ -690,3 +690,25 @@ def test_synchronous_warmup_timeout_reaches_evaluator(plan):
     plan["conditions"][0]["synchronous_warmup_timeout_seconds"] = -1
     with pytest.raises(ValueError, match="warmup.*timeout"):
         m.validate_plan(plan)
+
+
+def test_one_step_async_plan_owns_single_worker_and_prefix_alias(plan):
+    plan.update(
+        execution_coupling="one_step_async",
+        execution_clock="ready",
+        execution_prefix_steps=1,
+    )
+    module().validate_plan(plan)
+    commands = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/out")
+    )
+    assert set(commands) == {"action", "evaluate"}
+    evaluate = commands["evaluate"]
+    assert evaluate[evaluate.index("--execution-coupling") + 1] == "one_step_async"
+    assert evaluate[evaluate.index("--synchronous-chunk-steps") + 1] == "1"
+    plan["conditions"][1]["synchronous_chunk_steps"] = 8
+    with pytest.raises(ValueError, match="exactly one"):
+        module().validate_plan(plan)
+    plan["conditions"][1]["execution_prefix_steps"] = 1
+    with pytest.raises(ValueError, match="Conflicting"):
+        module().validate_plan(plan)

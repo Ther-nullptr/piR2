@@ -136,6 +136,7 @@ def validate_plan(plan):
 
             defaults = {
                 "execution_coupling": "asynchronous",
+                "execution_clock": "paced",
                 "synchronous_chunk_steps": 8,
                 "synchronous_warmup_timeout_seconds": 900,
                 "server_layout": "split",
@@ -150,7 +151,9 @@ def validate_plan(plan):
             validate_synchronous_controls(
                 SimpleNamespace(
                     **{
-                        key: case.get(key, plan.get(key, value))
+                        key: _prefix_steps(plan, case)
+                        if key == "synchronous_chunk_steps"
+                        else case.get(key, plan.get(key, value))
                         for key, value in defaults.items()
                     },
                     protocol=protocol,
@@ -194,6 +197,22 @@ def validate_plan(plan):
             )
 
 
+def _prefix_steps(plan, case):
+    for settings in (plan, case):
+        if (
+            "execution_prefix_steps" in settings
+            and "synchronous_chunk_steps" in settings
+            and settings["execution_prefix_steps"]
+            != settings["synchronous_chunk_steps"]
+        ):
+            raise ValueError("Conflicting execution prefix aliases")
+    for settings in (case, plan):
+        for key in ("execution_prefix_steps", "synchronous_chunk_steps"):
+            if key in settings:
+                return settings[key]
+    return 8
+
+
 def build_commands(plan, case, protocol, output):
     root = Path(plan["runtime_root"])
     commands = {}
@@ -222,12 +241,7 @@ def build_commands(plan, case, protocol, output):
                 "--execution-coupling",
                 coupling,
                 "--synchronous-chunk-steps",
-                str(
-                    case.get(
-                        "synchronous_chunk_steps",
-                        plan.get("synchronous_chunk_steps", 8),
-                    )
-                ),
+                str(_prefix_steps(plan, case)),
                 "--synchronous-warmup-timeout-seconds",
                 str(
                     case.get(
@@ -242,7 +256,11 @@ def build_commands(plan, case, protocol, output):
         )
         if fixed_delay is not None:
             deployment_controls.extend(["--deployment-fixed-delay", str(fixed_delay)])
-    for role in ("action",) if coupling == "synchronous" else ("action", "vlm"):
+    for role in (
+        ("action",)
+        if coupling in ("synchronous", "one_step_async")
+        else ("action", "vlm")
+    ):
         commands[role] = [
             str(plan["model_python"]),
             "-m",
