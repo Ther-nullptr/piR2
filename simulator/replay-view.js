@@ -30,6 +30,9 @@
     executionClock: "paced",
     executionCoupling: "asynchronous",
     schedule: null,
+    // Undefined only while resolving a new load. Null is a bound unknown
+    // schedule, as for the cached-worker protocol; it is not a wildcard.
+    cohortSchedule: undefined,
     type: "clean",
     scope: "prepared_model",
     precision: "all",
@@ -201,7 +204,10 @@
     return (state.catalog?.streams ?? []).some((entry) => entry.run_id === id);
   }
   function normalizeRun(run, descriptor) {
-    if (descriptor && !R.matchesDescriptor(run, descriptor))
+    if (
+      descriptor &&
+      !R.matchesDescriptor(run, descriptor, state.cohortSchedule)
+    )
       return {
         ...descriptor,
         descriptor,
@@ -500,6 +506,7 @@
     state.mediaEpoch++;
     state.rows = [];
     state.runs = [];
+    state.cohortSchedule = undefined;
     loadingControls(true);
     state.events = [];
     state.selected = null;
@@ -586,22 +593,18 @@
         run.descriptor ?? selected.find((d) => d.id === run.id),
       );
     });
-    // Old catalogs may omit schedule dimensions in descriptors. Resolve the
-    // loaded cohort once and withhold incompatible evidence instead of silently
-    // comparing unrelated prefixes. New catalogs select before any run fetch.
+    // Bind actual legacy dimensions once per load. Every later SSE projection
+    // must retain this binding, even when all stream descriptors omit K/D.
+    // Only an explicit cohort reload may resolve another actual schedule.
     if (kind === "deployment") {
-      const expected =
-        state.schedule ?? R.deploymentSchedule(state.runs[0] ?? {});
-      state.runs = state.runs.map((run) =>
-        R.sameSchedule(R.deploymentSchedule(run), expected)
-          ? run
-          : {
-              ...run,
-              error:
-                "Different K/D schedule in legacy catalog; rebuild catalog to select it",
-              episodes: [],
-            },
-      );
+      state.cohortSchedule =
+        state.schedule ??
+        state.runs
+          .filter((run) => !run.error)
+          .map(R.deploymentSchedule)
+          .find((schedule) => schedule != null) ??
+        null;
+      state.runs = state.runs.map((run) => normalizeRun(run, run.descriptor));
     }
     loadingControls(false);
     state.runs.forEach((r) =>
