@@ -1169,7 +1169,7 @@
                   "exact-source audit",
                 ],
                 [
-                  "Consumed visual / current state tick",
+                  "Consumed visual / request state tick",
                   `${queue?.executedRequest?.feature_source_tick ?? "?"} / ${queue?.executedRequest?.state_tick ?? "?"}`,
                   "tick",
                 ],
