@@ -138,6 +138,7 @@ def validate_plan(plan):
                 "execution_coupling": "asynchronous",
                 "execution_clock": "paced",
                 "synchronous_chunk_steps": 8,
+                "async_overlap_steps": None,
                 "synchronous_warmup_timeout_seconds": 900,
                 "server_layout": "split",
                 "feature_transport": "numpy_fp32",
@@ -251,6 +252,9 @@ def build_commands(plan, case, protocol, output):
                 ),
             ]
         )
+        overlap = case.get("async_overlap_steps", plan.get("async_overlap_steps"))
+        if overlap is not None:
+            deployment_controls.extend(["--async-overlap-steps", str(overlap)])
         fixed_delay = case.get(
             "deployment_fixed_delay", plan.get("deployment_fixed_delay")
         )
@@ -258,7 +262,7 @@ def build_commands(plan, case, protocol, output):
             deployment_controls.extend(["--deployment-fixed-delay", str(fixed_delay)])
     for role in (
         ("action",)
-        if coupling in ("synchronous", "one_step_async")
+        if coupling in ("synchronous", "one_step_async", "chunked_async")
         else ("action", "vlm")
     ):
         commands[role] = [

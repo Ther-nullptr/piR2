@@ -178,13 +178,17 @@ def summarize_episode(events, metadata):
         "execution_coupling", metadata.get("execution_coupling", "asynchronous")
     )
     paced = execution_clock == "paced" and execution_coupling == "asynchronous"
-    full_policy = execution_coupling in ("synchronous", "one_step_async")
+    full_policy = execution_coupling in (
+        "synchronous",
+        "one_step_async",
+        "chunked_async",
+    )
     work_end = stop
     work_requests = []
-    if execution_coupling == "one_step_async":
-        from coexecution.async_evidence import validate_one_step_async_work
+    if execution_coupling in ("one_step_async", "chunked_async"):
+        from coexecution.async_evidence import validate_async_work
 
-        evidence = validate_one_step_async_work(events, metadata=metadata)
+        evidence = validate_async_work(events, metadata=metadata)
         work_end = evidence["work_end_s"]
         work_requests = evidence["work_requests"]
     inside = [r for r in events if start <= r["t_s"] <= stop]
@@ -394,6 +398,20 @@ def summarize_episode(events, metadata):
                 if state_capture is not None
                 else None,
                 "tick": row["tick"],
+                **(
+                    {
+                        key: row[key]
+                        for key in (
+                            "request_id",
+                            "target_tick",
+                            "source_tick",
+                            "executed_offset",
+                            "observation_lag_ticks",
+                        )
+                    }
+                    if execution_coupling == "chunked_async"
+                    else {}
+                ),
                 "d": row.get("action_delay_budget_ticks", row.get("d")),
                 "clean_slots": sum(not s.get("fallback", False) for s in slots),
                 "fresh_slots": sum(
@@ -513,6 +531,27 @@ def summarize_episode(events, metadata):
         "executed_state_age_ms",
     ]:
         metrics[key] = summary(r[key] for r in tick_rows)
+    if full_policy:
+        adjacent = [b["applied_s"] - a["applied_s"] for a, b in pairwise(ticks)]
+        boundaries = [
+            b["applied_s"] - a["next_observation_computed_s"]
+            for a, b in pairwise(ticks)
+            if b.get("first_application_of_request")
+        ]
+        metrics.update(
+            execution_prefix_steps=begin.get(
+                "execution_prefix_steps", begin.get("synchronous_chunk_steps")
+            ),
+            async_overlap_steps=begin.get(
+                "async_overlap_steps", 0 if execution_coupling == "synchronous" else 1
+            ),
+            actual_control_hz=fraction(len(ticks), stop - start),
+            amortized_wall_seconds_per_action=fraction(stop - start, len(ticks)),
+            adjacent_action_gap_seconds=summary(adjacent),
+            total_adjacent_action_gap_seconds=sum(adjacent),
+            boundary_gap_seconds=summary(boundaries),
+            total_boundary_gap_seconds=sum(boundaries),
+        )
     queue_events = [
         {"t": r["t_s"] - start, "kind": r["kind"], "camera_queue": r["camera_queue"]}
         for r in inside
@@ -521,6 +560,9 @@ def summarize_episode(events, metadata):
     provenance_fields = [
         "execution_clock",
         "execution_coupling",
+        "execution_prefix_steps",
+        "async_overlap_steps",
+        "protocol_version",
         "actual_control_hz",
         "action_request_hz",
         "effective_plan_update_hz",
@@ -539,6 +581,18 @@ def summarize_episode(events, metadata):
     return {
         "execution_clock": execution_clock,
         "execution_coupling": execution_coupling,
+        "execution_prefix_steps": begin.get(
+            "execution_prefix_steps", begin.get("synchronous_chunk_steps")
+        ),
+        "async_overlap_steps": begin.get(
+            "async_overlap_steps",
+            0
+            if execution_coupling == "synchronous"
+            else 1
+            if execution_coupling == "one_step_async"
+            else None,
+        ),
+        "protocol_version": begin.get("protocol_version"),
         "start_s": start,
         "end_s": stop,
         "duration_s": stop - start,
@@ -658,7 +712,11 @@ def condition_report(directory):
             for r in e["requests"]
             if r["role"] == role and not r["censored"]
         ]
-        synchronous = flat["execution_coupling"] in ("synchronous", "one_step_async")
+        synchronous = flat["execution_coupling"] in (
+            "synchronous",
+            "one_step_async",
+            "chunked_async",
+        )
         stats = summary([] if synchronous else values)
         for p in ["count", "mean", "p50", "p95"]:
             flat[

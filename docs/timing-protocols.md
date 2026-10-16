@@ -299,3 +299,52 @@ DiT→VLM 来源，并同时显示物理步滞后和 wall AoI。末尾机器人�
 比较完整策略延时时，异步 `inference_request_seconds` 从主线程提交至响应；其
 `inference_wall_seconds` 仅为 worker 输入准备之后的 RPC。同步的完整调用起点在
 输入准备之前。前端分别标注这些边界，不能直接把异步 RPC 与同步完整调用做加速比。
+
+### Chunked asynchronous lookahead / 动作块长度与异步深度
+
+`chunked_async` 将执行前缀长度 K 与提前推理步数 D 分开：
+`--execution-prefix-steps K --async-overlap-steps D`，要求
+`1 <= D <= K <= checkpoint 原生解码长度`。它复用单步协议的专属 RPC worker，
+保持真实 VLM＋Flow4，每段依次执行原生动作 offset0…K−1。下一段目标 T 为
+K、2K 等；在物理步 T−D 之前捕获当前图像和状态并提交请求，执行完当前段承诺
+的所有动作后才采用下一结果。结果提前就绪也不会提前换段；未就绪时明确等待。
+D=0 使用现有 `synchronous`，而非退化的异步模式。旧 `one_step_async` 保留其
+v1 接口和记录，等价于 K=1、D=1；旧 `asynchronous` 缓存控制器不变。
+
+```bash
+python scripts/evaluate_libero_protocol.py \
+  --protocol deployment --variant flow --port 5570 \
+  --execution-coupling chunked_async --execution-clock ready \
+  --execution-prefix-steps 8 --async-overlap-steps 4 \
+  --task-ids 0 3 --episodes-per-task 1 --max-steps 300 \
+  --record-replay --replay-max-frames 301 \
+  --output .local/chunked-async/deployment
+```
+
+experiment plan 支持 `async_overlap_steps`，condition 中的值覆盖全局。
+对照矩阵可采用 K1/D0,1；K2/D0,1,2；K4/D0,1,2,4；K8/D0,1,4,8。
+D0 condition 设置 `execution_coupling=synchronous`；D>0 设置 `chunked_async`。
+该版本仅支持 deployment Flow、ready、一个普通 action endpoint。输入快照独立
+只读，MuJoCo 仅由主线程操作；普通段内步骤复用上一 env.step 的观测，只有 bootstrap
+和指定的预取边界才强制刷新摄像头。没有未来状态预测或异步补偿算法。
+
+bootstrap 的 offset j 来自物理观测0，滞后 j 步；后续每段 offset j 滞后 D+j
+物理步。wall AoI 由真实 capture-to-apply 测量，与仿真0.05秒/步分别报告。
+成功或终止发生在任何 offset 都立即停止。max_steps 截断最后一段的接纳长度，
+例如 K8、上限300时 target296 只接纳4步。接纳但因提前成功未执行的步骤、未接纳
+的原生后缀，以及最终推测请求完全未采用的动作分别计数，不把“接纳”写成“执行”。
+
+v2 `chunked_async_request` 在段完成后保存最终计数，`t_s=finalized_s`；实际接纳
+时间使用 `adopted_s`，响应接收使用 `received_s`。`request_id=request_tick=target_tick`
+按 K 递增，不能假设连续；每个 `chunked_async_execution` 与 execution phase 使用
+唯一 `execution_id=tick`，并记录 `executed_offset`。多个物理步关联同一个请求。
+尾部 unused 请求的 target 可能大于实际控制结束步；drain 的 physics tick 始终使用
+实际 `control_steps`。`chunked_async_boundary` 记录结果是否在边界就绪，完整工作
+审计验证对应 wait，以及所有原生 offset、执行动作、源观测和终止后未用计算。
+
+主要比较成功/失败、实际 `actual_control_hz`、完整控制窗口除以动作步数的
+`amortized_wall_seconds_per_action`、段边界等待与 gap 的 P95、AoI 和实测重叠。
+`boundary_gap_seconds` 是上一段最后一步 env.step 完成到下一段第一步开始的间隔；
+`adjacent_action_gap_seconds` 是相邻动作开始时刻的间隔。K 较大时段内短间隔会压低
+后一指标的 P50，不能仅凭它声称整体吞吐提升。两种间隔均保留 count 和 sum，原始
+逐动作/逐阶段记录用于汇总分位数，不能把每 episode 的分位数再平均。

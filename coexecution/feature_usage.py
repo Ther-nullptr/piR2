@@ -372,17 +372,36 @@ def audit_raw(condition, episode, root):
     ).resolve()
     _check(path.is_relative_to(root), "raw trace path escapes raw root")
     raw = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    if episode.get("execution_coupling") == "one_step_async" or any(
-        row.get("execution_coupling") == "one_step_async" for row in raw
+    if episode.get("execution_coupling") in ("one_step_async", "chunked_async") or any(
+        row.get("execution_coupling") in ("one_step_async", "chunked_async")
+        for row in raw
     ):
-        from coexecution.async_evidence import validate_one_step_async_work
+        from coexecution.async_evidence import validate_async_work
 
         _check("work_requests" in episode, "raw audit requires full async work")
         _check(
-            episode.get("execution_coupling") == "one_step_async",
+            episode.get("execution_coupling")
+            == next(
+                (
+                    r.get("execution_coupling")
+                    for r in raw
+                    if r.get("kind") == "control_start"
+                ),
+                None,
+            ),
             "raw/normalized coupling mismatch",
         )
-        work = validate_one_step_async_work(raw, normalized=episode["work_requests"])
+        work = validate_async_work(
+            raw, normalized=episode["work_requests"], metadata=episode.get("metadata")
+        )
+        if episode.get("execution_coupling") == "chunked_async":
+            start_record = next(r for r in raw if r["kind"] == "control_start")
+            for key in (
+                "execution_prefix_steps",
+                "async_overlap_steps",
+                "protocol_version",
+            ):
+                _same(episode.get(key), start_record.get(key), "raw protocol " + key)
         for key, expected in {
             "work_end_s": work["work_end_s"],
             "work_duration_s": work["work_end_s"] - work["start_s"],
@@ -476,6 +495,15 @@ def audit_raw(condition, episode, root):
     for tick in episode["ticks"]:
         raw_tick = executions.get(tick["tick"])
         _check(raw_tick is not None, "raw control tick missing")
+        if episode.get("execution_coupling") == "chunked_async":
+            for key in (
+                "request_id",
+                "target_tick",
+                "source_tick",
+                "executed_offset",
+                "observation_lag_ticks",
+            ):
+                _same(tick.get(key), raw_tick.get(key), "physical prefix " + key)
         _same(
             tick.get("executed_slot"),
             raw_tick.get("executed_slot"),
