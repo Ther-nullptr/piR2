@@ -127,6 +127,7 @@ def build_catalog(
                         "execution_coupling": run["execution_coupling"],
                         "execution_prefix_steps": run["execution_prefix_steps"],
                         "async_overlap_steps": run["async_overlap_steps"],
+                        "policy_variant": run["policy_variant"],
                     }
                     if run["kind"] == "deployment"
                     else {}

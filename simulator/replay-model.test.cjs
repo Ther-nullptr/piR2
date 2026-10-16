@@ -17,6 +17,47 @@ const clean = {
   instrumented: false,
   output: { status: "recorded" },
 };
+test("policy identity uses worker metadata, never filenames or scheduling labels", () => {
+  assert.equal(R.policyVariant({ label: "pir2 checkpoint-10000" }), null);
+  assert.equal(R.policyVariant({ configuration: { variant: "pir2" } }), null);
+  const run = {
+    kind: "deployment",
+    policy_variant: "pir2",
+    policy_identity: {
+      variant: "pir2",
+      predicted_horizon: 40,
+      decoded_horizon: 40,
+      training: { global_step: 10000 },
+    },
+  };
+  assert.equal(R.policyVariant(run), "pir2");
+  assert.match(R.policyLabel(run), /πR².*10000/);
+  assert.match(R.policyNote(run), /独立.*S2/);
+  assert.doesNotMatch(R.policyNote(run), /Flow4|解码16/);
+  assert.equal(R.policyVariant({ ...run, policy_variant: "flow" }), "invalid");
+  assert.equal(
+    R.policyVariant({ ...run, configuration: { variant: "flow" } }),
+    "invalid",
+  );
+});
+test("legacy and current stream projections cannot change the resolved policy cohort", () => {
+  const descriptor = { id: "test", kind: "deployment", precision: "bf16" };
+  const pir2 = { ...descriptor, policy_variant: "pir2" };
+  const flow = { ...descriptor, policy_variant: "flow" };
+  assert.equal(R.matchesDescriptor(pir2, descriptor, null, "pir2"), true);
+  assert.equal(R.matchesDescriptor(flow, descriptor, null, "pir2"), false);
+  assert.equal(
+    R.matchesDescriptor(descriptor, descriptor, null, "pir2"),
+    false,
+  );
+  assert.equal(R.matchesDescriptor(pir2, descriptor, null, null), false);
+  assert.equal(R.matchesDescriptor(descriptor, descriptor, null, null), true);
+  assert.equal(R.matchesDescriptor(flow, pir2), false);
+  assert.equal(
+    R.matchesDescriptor(pir2, { ...descriptor, policy_variant: null }),
+    false,
+  );
+});
 test("execution cadence selects an explicit matched set and treats legacy runs as paced", () => {
   assert.equal(typeof R.deploymentCadence, "function");
   assert.equal(typeof R.replayDescriptors, "function");

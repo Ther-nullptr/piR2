@@ -4,6 +4,7 @@ from pathlib import Path
 
 from coexecution.queue_report import summarize_episode
 
+from .policy import pir2_episode_evidence, policy_identity
 from .schema import (
     PRECISIONS,
     VERSION,
@@ -380,6 +381,7 @@ def deployment_run(root, media):
     config = read_json(root / "config.json")
     if config.get("protocol") != "deployment":
         raise ValueError("Robot replay requires actual deployment traces")
+    policy, policy_sources = policy_identity(config)
     execution_clock = config.get("execution_clock", "paced")
     if execution_clock not in ("paced", "ready"):
         raise ValueError("Unknown deployment execution clock")
@@ -394,7 +396,11 @@ def deployment_run(root, media):
     metadata = read_jsonl(root / "episodes.jsonl")
     run_id = "deployment-" + digest(str(root))[:20]
     episodes, identities = [], set()
-    provenance = [source(root / "config.json"), source(root / "episodes.jsonl")]
+    provenance = [
+        source(root / "config.json"),
+        source(root / "episodes.jsonl"),
+        *policy_sources,
+    ]
     for episode in metadata:
         if episode.get("execution_clock", execution_clock) != execution_clock:
             raise ValueError("Episode and configuration execution clocks disagree")
@@ -475,6 +481,11 @@ def deployment_run(root, media):
                 row["request_id"] = model_request_id
             previous_applied = applied
         queue = summarize_episode(events, episode)
+        policy_evidence = (
+            pir2_episode_evidence(events, episode, queue, policy)
+            if policy["variant"] == "pir2"
+            else None
+        )
         if queue["execution_clock"] != execution_clock:
             raise ValueError(
                 "Controller trace and configuration execution clocks disagree"
@@ -541,6 +552,7 @@ def deployment_run(root, media):
                 else None,
                 "same_input_comparison": False,
                 "queue": queue,
+                "policy_evidence": policy_evidence,
                 "ticks": ticks,
                 "phases": phases,
                 "cycles": cycles,
@@ -555,6 +567,8 @@ def deployment_run(root, media):
         "kind": "deployment",
         "execution_clock": execution_clock,
         "execution_coupling": execution_coupling,
+        "policy_variant": policy["variant"],
+        "policy_identity": policy,
         **schedule,
         "label": root.parent.name,
         "precision": _precision(config),

@@ -5,8 +5,212 @@ import inspect
 import json
 import subprocess
 import sys
+from copy import deepcopy
 
 import pytest
+
+
+def pir2_identity_config(tmp_path):
+    from coexecution.replay.schema import source
+
+    checkpoint = tmp_path / "trained"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "streaming": True,
+                "streaming_schedule_mode": "pir2",
+                "action_horizon": 40,
+            }
+        )
+    )
+    (checkpoint / "trainer_state.json").write_text(json.dumps({"global_step": 10000}))
+    worker = {
+        "variant": "pir2",
+        "checkpoint": str(checkpoint),
+        "predicted_horizon": 40,
+        "decoded_horizon": 40,
+        "sha256": {
+            "config.json": source(checkpoint / "config.json")["sha256"],
+            "model.safetensors": "a" * 64,
+        },
+    }
+    return {
+        "variant": "pir2",
+        "execution_coupling": "asynchronous",
+        "checkpoint": {**worker, "role": "action"},
+        "slow_checkpoint": {**deepcopy(worker), "role": "vlm"},
+    }
+
+
+def test_policy_identity_requires_worker_evidence_and_verified_checkpoint_config(
+    tmp_path,
+):
+    from coexecution.replay.policy import policy_identity
+
+    config = pir2_identity_config(tmp_path)
+    identity, provenance = policy_identity(config)
+    assert identity["variant"] == "pir2"
+    assert identity["streaming"] is True
+    assert identity["schedule_mode"] == "pir2"
+    assert identity["predicted_horizon"] == identity["decoded_horizon"] == 40
+    assert identity["training"]["global_step"] == 10000
+    assert len(provenance) == 2
+    assert policy_identity({"variant": "pir2"})[0]["variant"] is None
+    assert policy_identity({"label": "pir2 checkpoint-10000"})[0]["training"] is None
+    del config["slow_checkpoint"]
+    assert policy_identity(config)[0]["variant"] is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda c: c["slow_checkpoint"].update(variant="flow"),
+        lambda c: c["checkpoint"].update(decoded_horizon=16),
+        lambda c: c["slow_checkpoint"]["sha256"].update(
+            {"model.safetensors": "b" * 64}
+        ),
+        lambda c: c["checkpoint"]["sha256"].update({"config.json": "c" * 64}),
+        lambda c: c.update(execution_coupling="chunked_async"),
+    ],
+)
+def test_policy_identity_rejects_disagreeing_worker_or_protocol_claims(
+    tmp_path, mutation
+):
+    from coexecution.replay.policy import policy_identity
+
+    config = pir2_identity_config(tmp_path)
+    mutation(config)
+    with pytest.raises(ValueError):
+        policy_identity(config)
+
+
+def pir2_events():
+    return [
+        {
+            "kind": "action_submitted",
+            "request_tick": 2,
+            "state_tick": 2,
+            "committed_start_tick": 2,
+            "committed_end_tick": 3,
+            "delay_ticks": 1,
+        },
+        {
+            "kind": "request_completed",
+            "audit": {
+                "request_tick": 2,
+                "d_request": 1,
+                "buffer_origin_after": 3,
+                "extra_buffer_shift": 0,
+                "buffer_restarted": False,
+                "forward_counts": {"vlm": 0, "dit": 1},
+                "cache": {"source_tick": 1, "capture_s": 10.05, "vlm_forward_calls": 1},
+            },
+            "client_timing": {
+                "feature_source_tick": 1,
+                "feature_capture_s": 10.05,
+                "feature_sequence": 1,
+                "state_tick": 2,
+            },
+        },
+        {
+            "kind": "vision_request",
+            "source_tick": 1,
+            "capture_s": 10.05,
+            "started_s": 10.05,
+            "completed_s": 10.09,
+        },
+        {
+            "kind": "feature_published",
+            "source_tick": 1,
+            "capture_s": 10.05,
+            "rpc_completed_s": 10.09,
+            "feature_sequence": 1,
+        },
+        {
+            "kind": "vision_request",
+            "source_tick": 2,
+            "capture_s": 10.1,
+            "started_s": 10.1,
+            "completed_s": 10.14,
+        },
+    ]
+
+
+def test_pir2_forward_evidence_separates_boot_normal_recovery_and_unknown_s2():
+    from coexecution.replay.policy import pir2_episode_evidence
+
+    events = pir2_events()
+    recovery = deepcopy(events[1])
+    recovery["kind"] = "unused_result_at_episode_end"
+    recovery["audit"].update(
+        request_tick=42,
+        buffer_restarted=True,
+        extra_buffer_shift=40,
+        buffer_origin_after=43,
+        forward_counts={"vlm": 0, "dit": 5},
+    )
+    events += [recovery]
+    queue = {"requests": [{"role": "S1", "request_tick": 2}]}
+    result = pir2_episode_evidence(
+        events, {"bootstrap_forward_counts": {"vlm": 1, "dit": 4}}, queue
+    )
+    assert result["s1"]["normal_requests"] == 1
+    assert result["s1"]["recovery_requests"] == 1
+    assert result["s1"]["dit_forward_calls"] == 6
+    assert result["bootstrap"]["forward_counts"] == {"vlm": 1, "dit": 4}
+    assert result["s2"]["requests"] == 2
+    assert result["s2"]["verified_vlm_forward_calls"] == 1
+    assert result["s2"]["unknown_requests"] == 1
+    assert result["s2"]["vlm_forward_calls"] is None
+    request = queue["requests"][0]["policy_evidence"]
+    assert request["committed_prefix"] == {"start_tick": 2, "end_tick": 3, "steps": 1}
+    assert request["audit"]["buffer_origin_after"] == 3
+    assert request["client_timing"]["state_tick"] == 2
+
+
+def test_pir2_forward_evidence_missing_is_unknown_and_wrong_counts_rejected():
+    from coexecution.replay.policy import pir2_episode_evidence
+
+    events = pir2_events()
+    del events[1]["audit"]["forward_counts"]
+    result = pir2_episode_evidence(events, {}, {"requests": []})
+    assert result["bootstrap"]["forward_counts"] is None
+    assert result["s1"]["dit_forward_calls"] is None
+    for counts in (
+        {"vlm": 1, "dit": 4},
+        {"vlm": 0, "dit": 5},
+        {"vlm": False, "dit": 1},
+    ):
+        events[1]["audit"]["forward_counts"] = counts
+        with pytest.raises(ValueError):
+            pir2_episode_evidence(events, {}, {"requests": []})
+
+
+def test_pir2_reused_observation_requires_exact_feature_sequence_for_s2_counts():
+    from coexecution.replay.policy import pir2_episode_evidence
+
+    events = pir2_events()
+    another = {**events[2], "started_s": 10.12, "completed_s": 10.16}
+    events.extend(
+        [another, {**events[3], "rpc_completed_s": 10.16, "feature_sequence": 2}]
+    )
+    result = pir2_episode_evidence(events, {}, {"requests": []})
+    assert result["s2"]["verified_vlm_forward_calls"] == 1
+    assert result["s2"]["unknown_requests"] == 2
+    with pytest.raises(ValueError, match="accounting"):
+        pir2_episode_evidence(events, {"vlm_work": {"completed": 4}}, {"requests": []})
+    events[1]["client_timing"]["feature_source_tick"] = 3
+    with pytest.raises(ValueError, match="feature source"):
+        pir2_episode_evidence(events, {}, {"requests": []})
+
+
+def test_pir2_decoded_horizon_matches_actual_bootstrap_slots():
+    from coexecution.replay.policy import pir2_episode_evidence
+
+    events = [{"kind": "control_start", "bootstrap_action_slots": 16}, *pir2_events()]
+    with pytest.raises(ValueError, match="decoded horizon"):
+        pir2_episode_evidence(events, {}, {"requests": []}, {"decoded_horizon": 40})
 
 
 def test_import_and_cli_do_not_load_neural_or_array_frameworks():

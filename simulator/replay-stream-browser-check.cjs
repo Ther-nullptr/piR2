@@ -983,6 +983,87 @@ async function main() {
       },
     );
 
+    const policyDescriptors = ["bf16", "w8a8"].map((precision) => ({
+      id: `policy-${precision}`,
+      kind: "deployment",
+      precision,
+      execution_coupling: "asynchronous",
+      execution_clock: "paced",
+      path: `runs/policy-${precision}.json`,
+      label: fixtureNote,
+    }));
+    const policyRun = (id, variant = "pir2") => ({
+      ...run(id),
+      ...policyDescriptors.find((d) => d.id === id),
+      policy_variant: variant,
+      episodes: [],
+      clean_requests: [],
+    });
+    await check(
+      "legacy SSE descriptors bind the policy variant and reject Flow4 or unknown replacements",
+      async ({ page }) => {
+        const bf16 = await waitForSource(page, "policy-bf16");
+        const w8 = await waitForSource(page, "policy-w8a8");
+        const status = (precision) =>
+          page.locator(
+            `.precision-card[data-precision="${precision}"] .card-status`,
+          );
+        assert.doesNotMatch(await status("bf16").innerText(), /policy variant/);
+        assert.equal(
+          await page.locator("#execution-prefix-label").isVisible(),
+          false,
+        );
+        assert.equal(
+          await page.locator("#async-overlap-label").isVisible(),
+          false,
+        );
+        await emit(
+          page,
+          bf16,
+          event("policy-bf16", 8, {
+            projection: {
+              op: "replace",
+              run: policyRun("policy-bf16", "flow"),
+            },
+          }),
+        );
+        assert.match(await status("bf16").innerText(), /policy variant/);
+        await emit(
+          page,
+          w8,
+          event("policy-w8a8", 8, {
+            projection: { op: "replace", run: policyRun("policy-w8a8", null) },
+          }),
+        );
+        assert.match(await status("w8a8").innerText(), /policy variant/);
+        await emit(
+          page,
+          bf16,
+          event("policy-bf16", 9, {
+            projection: { op: "replace", run: policyRun("policy-bf16") },
+          }),
+        );
+        assert.doesNotMatch(await status("bf16").innerText(), /policy variant/);
+        assert.match(await status("w8a8").innerText(), /policy variant/);
+      },
+      {
+        catalog: {
+          ...catalog(false),
+          default_view: "deployment",
+          default_execution_coupling: "asynchronous",
+          default_execution_clock: "paced",
+          runs: policyDescriptors,
+          streams: policyDescriptors.map((r) => ({
+            run_id: r.id,
+            snapshot_path: `streams/${r.id}/snapshot.json`,
+            journal_path: `streams/${r.id}/events.jsonl`,
+          })),
+        },
+        run: policyRun,
+        snapshot: (id) => ({ ...snapshot(id), run: policyRun(id) }),
+      },
+    );
+
     const matrix = [
       [1, 1],
       [4, 1],

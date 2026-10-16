@@ -220,6 +220,43 @@
       "asynchronous"
     );
   }
+  function policyVariant(run) {
+    const claims = [];
+    if (Object.hasOwn(run, "policy_variant")) claims.push(run.policy_variant);
+    if (run.policy_identity && Object.hasOwn(run.policy_identity, "variant"))
+      claims.push(run.policy_identity.variant);
+    const config = run.configuration;
+    if (config) {
+      const workers = [config.checkpoint];
+      if (deploymentCoupling(run) === "asynchronous")
+        workers.push(config.slow_checkpoint);
+      const values = [config.variant, ...workers.map((w) => w?.variant)];
+      const known = values.filter((v) => v != null);
+      if (known.some((v) => v !== known[0])) return "invalid";
+      if (claims.some((v) => v != null && known.some((k) => k !== v)))
+        return "invalid";
+      if (values.every((v) => v != null)) claims.push(values[0]);
+    }
+    if (
+      claims.some((v) => ![null, "pir2", "flow"].includes(v)) ||
+      claims.some((v) => v !== claims[0])
+    )
+      return "invalid";
+    return claims[0] ?? null;
+  }
+  function policyLabel(run) {
+    const variant = policyVariant(run);
+    if (variant === "pir2") {
+      const step = run.policy_identity?.training?.global_step;
+      return `πR²${Number.isInteger(step) && step > 0 ? ` · trained ${step} steps` : " · training provenance unknown"}`;
+    }
+    return variant === "flow" ? "GR00T Flow4" : "Policy identity unknown";
+  }
+  function policyNote(run) {
+    if (policyVariant(run) !== "pir2") return policyLabel(run);
+    const p = run.policy_identity ?? {};
+    return `${policyLabel(run)}：独立 S2 VLM 更新视觉缓存，S1 使用实际消费的缓存与本轮新鲜本体状态，滚动缓冲常态每次 1 步 DiT 去噪并固定已承诺前缀。H${p.predicted_horizon ?? "?"} / 原生解码${p.decoded_horizon ?? "?"}；bootstrap 4 步与整缓冲恢复 5 步单独计数。K/D 完整策略预取不适用于此协议；轨道为实际 RPC 区间，不是 GPU 内核计时。`;
+  }
   function isFullPolicyAsync(run) {
     return ["one_step_async", "chunked_async"].includes(
       deploymentCoupling(run),
@@ -280,7 +317,12 @@
       null
     );
   }
-  function matchesDescriptor(run, descriptor, resolvedSchedule = undefined) {
+  function matchesDescriptor(
+    run,
+    descriptor,
+    resolvedSchedule = undefined,
+    resolvedPolicy = undefined,
+  ) {
     if (
       run.id !== descriptor.id ||
       run.kind !== descriptor.kind ||
@@ -289,7 +331,17 @@
       return false;
     if (run.kind !== "deployment") return true;
     const expected = deploymentSchedule(descriptor);
+    const policy = policyVariant(run),
+      declaredPolicy = policyVariant(descriptor);
+    const explicitPolicy =
+      Object.hasOwn(descriptor, "policy_variant") ||
+      Object.hasOwn(descriptor.policy_identity ?? {}, "variant") ||
+      declaredPolicy != null;
     return (
+      policy !== "invalid" &&
+      declaredPolicy !== "invalid" &&
+      (!explicitPolicy || policy === declaredPolicy) &&
+      (resolvedPolicy === undefined || policy === resolvedPolicy) &&
       deploymentCoupling(run) === deploymentCoupling(descriptor) &&
       deploymentCadence(run) === deploymentCadence(descriptor) &&
       (expected == null || sameSchedule(deploymentSchedule(run), expected)) &&
@@ -505,6 +557,9 @@
     normalizeEpisode,
     deploymentCadence,
     deploymentCoupling,
+    policyVariant,
+    policyLabel,
+    policyNote,
     deploymentSchedule,
     isFullPolicyAsync,
     sameSchedule,

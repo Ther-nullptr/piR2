@@ -111,6 +111,27 @@ Browser dependencies are development-only. Playwright 1.51.1 was used with the o
 
 ## Quantization and robot debugger
 
+模型协议与动作调度分开标识。`policy_variant=pir2` 来自评测配置和 S1/S2
+worker 的一致身份；`execution_coupling=asynchronous` 本身不能证明使用 πR²。
+πR² 回放使用独立 S2 VLM 缓存和 S1 滚动去噪，常态每次 1 次 DiT forward，
+初始 bootstrap 的 VLM 1 / DiT 4 与整缓冲恢复的 DiT 5 单独显示。完整
+VLM + Flow4 的同步、单步预取、K/D 分块预取属于不同策略路径；πR² 缓存模式
+不显示 K/D 控件。预测及原生解码长度从 worker identity 读取，不固定写成 16。
+
+导入器可读取 checkpoint 的 `config.json`，但必须与 worker 记录的 SHA256
+一致，才显示 streaming/schedule 字段；同目录 `trainer_state.json` 的
+`global_step` 和文件哈希作为训练来源保留，不据此宣称任务质量。缺少来源时
+训练状态留空，不从路径名猜测。跨精度卡片和后续 SSE 投影绑定同一 policy
+variant，包括首次加载时解析的旧版 descriptor；未知身份不能替代已知 πR²。
+
+点击 S1 块可检查真实消费的 feature ID、视觉来源、本体状态 tick、承诺前缀、
+`buffer_origin_after`、额外 shift 和恢复标记。轨道沿用实际 RPC 起止时间，
+没有服务端分段就不绘制假 VLM/DiT 内核区间。每回合 `policy_evidence` 保存
+bootstrap 与所有已记录请求（含末尾未采用结果）的计数审计。旧版 S2 事件
+可能没保存 forward counter：只有精确匹配 publication/source/feature sequence
+的 consumed cache 能补充计数，同一缓存的多次消费只证明一次 S2 工作；其余
+显示 unknown，并与已记录 RPC 数区分。预热、独占校准不计入回合 forward 总数。
+
 机器人闭环视图可切换 `paced` 固定 20 Hz 墙钟节拍与 `ready`
 “就绪即接纳（StreamingVLA式调度，GR00T）”。后者使用真实重新录制的
 GR00T 轨迹，在原子仿真步结束后接纳完成结果；物理步长仍为 0.05 s。

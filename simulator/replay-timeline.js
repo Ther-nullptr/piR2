@@ -287,7 +287,11 @@
             adopted: stage === "action" ? r.adopted_s : null,
             description: lookahead
               ? `Obs ${r.source_tick ?? "?"} → ${chunked ? "plan" : "action"} ${r.target_tick ?? "?"}${chunked ? " · native " + (r.decoded_horizon ?? "?") + " / accepted " + (r.accepted_prefix_steps ?? "?") + " / executed " + (r.executed_prefix_steps ?? "?") : ""}${r.disposition === "unused" ? " · unused final" : ""}`
-              : null,
+              : row.run.policy_variant === "pir2"
+                ? stage === "action"
+                  ? `πR² ${r.policy_evidence?.category ?? "unknown"} · DiT NFE ${r.policy_evidence?.forward_counts?.dit ?? "?"} · visual ${r.feature_source_tick ?? "?"} / state ${r.state_tick ?? "?"} · buffer origin ${r.policy_evidence?.audit?.buffer_origin_after ?? "?"}`
+                  : `πR² S2 visual tick ${r.source_tick ?? "?"} · observed VLM calls ${r.policy_evidence?.vlm_forward_calls ?? "?"}`
+                : null,
             consumed:
               stage === "vlm"
                 ? requests

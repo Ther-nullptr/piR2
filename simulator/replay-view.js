@@ -33,6 +33,8 @@
     // Undefined only while resolving a new load. Null is a bound unknown
     // schedule, as for the cached-worker protocol; it is not a wildcard.
     cohortSchedule: undefined,
+    // Null is a bound unknown policy, never permission to mix policy variants.
+    cohortPolicy: undefined,
     type: "clean",
     scope: "prepared_model",
     precision: "all",
@@ -206,12 +208,18 @@
   function normalizeRun(run, descriptor) {
     if (
       descriptor &&
-      !R.matchesDescriptor(run, descriptor, state.cohortSchedule)
+      !R.matchesDescriptor(
+        run,
+        descriptor,
+        state.cohortSchedule,
+        state.cohortPolicy,
+      )
     )
       return {
         ...descriptor,
         descriptor,
-        error: "Run / stream changed the selected precision or K/D schedule",
+        error:
+          "Run / stream changed the selected precision, K/D schedule or policy variant",
         episodes: [],
         clean_requests: [],
         profile_requests: [],
@@ -507,6 +515,7 @@
     state.rows = [];
     state.runs = [];
     state.cohortSchedule = undefined;
+    state.cohortPolicy = undefined;
     loadingControls(true);
     state.events = [];
     state.selected = null;
@@ -604,6 +613,9 @@
           .map(R.deploymentSchedule)
           .find((schedule) => schedule != null) ??
         null;
+      state.cohortPolicy = R.policyVariant(
+        state.runs.find((run) => !run.error) ?? {},
+      );
       state.runs = state.runs.map((run) => normalizeRun(run, run.descriptor));
     }
     loadingControls(false);
@@ -716,8 +728,10 @@
     $("scope-label").hidden = state.kind !== "model";
     $("execution-clock-label").hidden = state.kind !== "deployment";
     $("execution-coupling-label").hidden = state.kind !== "deployment";
-    $("execution-prefix-label").hidden = state.kind !== "deployment";
-    $("async-overlap-label").hidden = state.kind !== "deployment";
+    $("execution-prefix-label").hidden =
+      state.kind !== "deployment" || state.executionCoupling === "asynchronous";
+    $("async-overlap-label").hidden =
+      state.kind !== "deployment" || state.executionCoupling === "asynchronous";
     $("sample-label").textContent =
       state.kind === "model" ? "输入 / 随机种子" : "任务 / 回合";
     const modelChannels = [
@@ -796,15 +810,17 @@
       );
       $("evidence-note").textContent =
         `${couplingLabels[state.executionCoupling]} · ${cadenceLabel(state.executionClock)} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
-        (state.executionCoupling === "synchronous"
-          ? " 每个周期先完成实际 VLM + Flow4，再执行记录中的动作段；推理与执行阶段互斥。20 Hz 仅适用于 paced 的执行段，全局固定频率有效性不适用。视频停帧按真实采集时间映射，墙钟继续推进而 physics clock 暂停。"
-          : state.executionCoupling === "chunked_async"
-            ? ` 配置 K=${state.schedule?.k ?? "?"} / D=${state.schedule?.d ?? "?"}：在当前前缀剩余 D 步时捕获观测、提交下一完整 VLM + Flow4；到边界才接纳，未就绪则等待，不增执行旧动作。实际滞后为 bootstrap 的 offset，其余 D+offset。墙钟摊销 = 控制总时长 / 实际动作数；块内动作间隔 P50 不能代表吞吐。终止后的未用推理完整保留。`
-            : state.executionCoupling === "one_step_async"
-              ? " 当前动作执行前捕获观测并提前推理下一步；每份结果只执行第 1 个动作，未完成则显式等待。首次 bootstrap 使用当前观测，其余动作滞后 1 个物理步；墙钟 AoI 独立报告。末次未使用推理保留至排空完成，机器人停在真实末帧。实际 RPC 从 worker 输入准备之后计时，不能直接与同步完整调用边界作速度比。"
-              : state.executionClock === "ready"
-                ? " 每次 env.step 仍推进 0.05 s 仿真时间；上一步结束即接纳已完成计划，不额外等待 50 ms。实际墙钟执行率与实时倍率分别显示。沿用 GR00T Flow4 / H40 / 解码16，无 StreamingVLA AFM/AEO 权重；视频按原始帧时间映射，不加速伪装。"
-                : " 控制目标为每 50 ms 执行一步，实际时序单独验证。") +
+        (state.cohortPolicy === "pir2"
+          ? ` ${R.policyNote(runs.find((run) => !run.error) ?? {})} 控制目标为每 50 ms 执行一步，实际时序与 AoI 独立报告；推理、执行与相机记录可能争用资源。`
+          : state.executionCoupling === "synchronous"
+            ? " 每个周期先完成实际 VLM + Flow4，再执行记录中的动作段；推理与执行阶段互斥。20 Hz 仅适用于 paced 的执行段，全局固定频率有效性不适用。视频停帧按真实采集时间映射，墙钟继续推进而 physics clock 暂停。"
+            : state.executionCoupling === "chunked_async"
+              ? ` 配置 K=${state.schedule?.k ?? "?"} / D=${state.schedule?.d ?? "?"}：在当前前缀剩余 D 步时捕获观测、提交下一完整 VLM + Flow4；到边界才接纳，未就绪则等待，不增执行旧动作。实际滞后为 bootstrap 的 offset，其余 D+offset。墙钟摊销 = 控制总时长 / 实际动作数；块内动作间隔 P50 不能代表吞吐。终止后的未用推理完整保留。`
+              : state.executionCoupling === "one_step_async"
+                ? " 当前动作执行前捕获观测并提前推理下一步；每份结果只执行第 1 个动作，未完成则显式等待。首次 bootstrap 使用当前观测，其余动作滞后 1 个物理步；墙钟 AoI 独立报告。末次未使用推理保留至排空完成，机器人停在真实末帧。实际 RPC 从 worker 输入准备之后计时，不能直接与同步完整调用边界作速度比。"
+                : state.executionClock === "ready"
+                  ? " 每次 env.step 仍推进 0.05 s 仿真时间；上一步结束即接纳已完成计划，不额外等待 50 ms。实际墙钟执行率与实时倍率分别显示。模型身份以各运行的 worker 与 checkpoint 证据为准；视频按原始帧时间映射，不加速伪装。"
+                  : " 控制目标为每 50 ms 执行一步，实际时序单独验证。") +
         " 当前为调试示例，不是套件成功率；记录相机拷贝会带来开销。";
     }
     const canPlay =
@@ -922,7 +938,7 @@
       state.rows
         .map(
           ({ run }, i) =>
-            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2>${state.kind === "deployment" ? `<span class="coupling-badge">${R.deploymentCoupling(run) === "synchronous" ? "Synchronous" : R.deploymentCoupling(run) === "one_step_async" ? "One-step async" : R.deploymentCoupling(run) === "chunked_async" ? "Chunked async" : "Asynchronous"}</span>` : ""}<select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置">${state.descriptors
+            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2>${state.kind === "deployment" ? `<span class="coupling-badge">${R.policyVariant(run) === "pir2" ? "πR² · cached VLM / rolling DiT" : R.deploymentCoupling(run) === "synchronous" ? "Synchronous" : R.deploymentCoupling(run) === "one_step_async" ? "One-step async" : R.deploymentCoupling(run) === "chunked_async" ? "Chunked async" : "Asynchronous"}</span>` : ""}<select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置">${state.descriptors
               .filter(
                 (d) =>
                   d.kind === state.kind &&
@@ -1071,6 +1087,9 @@
           lookahead = R.isFullPolicyAsync(run),
           schedule = R.deploymentSchedule(run),
           prefix = R.currentPrefix(episode, at.tick),
+          pir2 = R.policyVariant(run) === "pir2",
+          policy = run.policy_identity ?? {},
+          counts = episode.policy_evidence ?? {},
           waits = R.waitStats(episode),
           fullPolicy = synchronous || lookahead,
           timing = episode.queue?.metrics ?? {},
@@ -1111,6 +1130,51 @@
           },
         );
         metrics.innerHTML = metricsHTML([
+          ["Policy", R.policyLabel(run), ""],
+          ...(pir2
+            ? [
+                [
+                  "Predicted / native decoded horizon",
+                  `${policy.predicted_horizon ?? "?"} / ${policy.decoded_horizon ?? "?"}`,
+                  "steps",
+                ],
+                [
+                  "S1 normal / recovery requests",
+                  `${counts.s1?.normal_requests ?? "?"} / ${counts.s1?.recovery_requests ?? "?"}`,
+                  "1 / 5 DiT NFE",
+                ],
+                [
+                  "S1 total DiT calls (incl. final unused)",
+                  counts.s1?.dit_forward_calls ?? null,
+                  "calls",
+                ],
+                [
+                  "S1 unknown count records",
+                  counts.s1?.unknown_requests ?? null,
+                  "requests",
+                ],
+                [
+                  "Bootstrap VLM / DiT calls",
+                  `${counts.bootstrap?.forward_counts?.vlm ?? "?"} / ${counts.bootstrap?.forward_counts?.dit ?? "?"}`,
+                  "before control",
+                ],
+                [
+                  "S2 completed RPCs",
+                  counts.s2?.requests ?? null,
+                  "incl. final drain",
+                ],
+                [
+                  "S2 verified VLM calls / unknown",
+                  `${counts.s2?.verified_vlm_forward_calls ?? "?"} / ${counts.s2?.unknown_requests ?? "?"}`,
+                  "exact-source audit",
+                ],
+                [
+                  "Consumed visual / current state tick",
+                  `${queue?.executedRequest?.feature_source_tick ?? "?"} / ${queue?.executedRequest?.state_tick ?? "?"}`,
+                  "tick",
+                ],
+              ]
+            : []),
           ...(fullPolicy
             ? [
                 [
@@ -1327,6 +1391,7 @@
       data = {
         precision: event.precision,
         tick: event.tick.tick,
+        policy_identity: event.run.policy_identity ?? null,
         control_wall_s: event.tick.relative_s,
         command_units: event.episode.robot?.command_units,
         command: event.tick.action,
@@ -1346,6 +1411,7 @@
     } else if (event.request)
       data = {
         precision: event.precision,
+        policy_identity: event.run.policy_identity ?? null,
         request: event.request,
         source: event.run.provenance,
       };
@@ -1367,6 +1433,7 @@
         status: run.status,
         error: run.error,
         mode: run.mode,
+        policy_identity: run.policy_identity ?? null,
         configuration: run.configuration,
         checkpoint: run.checkpoint,
         device: run.device,
@@ -1384,6 +1451,7 @@
               id: episode.id,
               status: episode.status,
               metadata: episode.metadata,
+              policy_evidence: episode.policy_evidence ?? null,
               robot: {
                 status: episode.robot?.status,
                 error: episode.robot?.error,
@@ -1540,7 +1608,9 @@
               ? `控制墙钟 · K=${state.schedule?.k ?? "?"} / D=${state.schedule?.d ?? "?"}：Policy RPC 与每个实际物理步分轨；Execute 显示 plan / tick / native offset，同一前缀共享精确 DiT→VLM 来源。Wait/Drain 不推进物理；unused final 保留全部服务端工作。`
               : state.executionCoupling === "one_step_async"
                 ? "控制墙钟：VLM / DiT 是真实服务端分段；Policy RPC 与 Execute/Wait/Drain 分轨显示实际重叠。Obs k → action k+1 表示 1 步观测滞后，首次 bootstrap 除外；unused final 计算仍展示。"
-                : "控制墙钟：VLM / DiT 任务块为完整请求区间。") +
+                : state.cohortPolicy === "pir2"
+                  ? "πR² 控制墙钟：独立 S2 VLM RPC 更新缓存；S1 RPC 进行滚动去噪（常态 1 NFE / 恢复 5 NFE）。bootstrap 只有聚合计数，未伪造分段。"
+                  : "控制墙钟：VLM / DiT 任务块为完整请求区间。") +
           " S1[xx].k 实际使用 S2-xx 的特征；点击高亮已记录来源，随游标向左流动。"
         : tracks.some((track) => track.blocks.length)
           ? "按该次真实模块时间移动；CUDA 跨度含内核间隙。点击任务块或展开算子明细。"
