@@ -94,6 +94,12 @@ test("an unrecorded completion has no invented duration or percentage", () => {
   assert.equal(T.phase(block, 2).key, "unknown");
 });
 
+test("an unknown RPC outcome remains unknown after the error was observed", () => {
+  const block = { start: 1, end: 2, status: "unknown", basis: "rpc" };
+  assert.equal(T.phase(block, 3).key, "unknown");
+  assert.equal(T.phase(block, 3).progress, null);
+});
+
 test("canonical Profile records can declare their boundary in the run summary", () => {
   const rows = [
     {
@@ -248,5 +254,316 @@ test("model range follows recorded progress without inventing a request duration
       stage_spans: [{ start_ms: NaN, end_ms: null }],
     }),
     0,
+  );
+});
+
+function synchronousRow() {
+  return {
+    run: { id: "sync", precision: "w8a8", execution_coupling: "synchronous" },
+    episode: {
+      queue: {
+        duration_s: 3,
+        requests: [
+          {
+            id: "v0",
+            role: "S2",
+            feature_sequence: 8,
+            start_s: 0.01,
+            end_s: 0.07,
+            timing_scope: "server_vlm_stage",
+          },
+          {
+            id: "a0",
+            role: "S1",
+            feature_sequence: 8,
+            request_tick: 5,
+            start_s: 0.07,
+            end_s: 0.12,
+            timing_scope: "server_action_stage",
+          },
+          // A newer unrelated action is closer in time to execution; it is not its source.
+          {
+            id: "a1",
+            role: "S1",
+            feature_sequence: 8,
+            request_tick: 9,
+            start_s: 0.13,
+            end_s: 0.14,
+            timing_scope: "server_action_stage",
+          },
+        ],
+      },
+      phases: [
+        {
+          id: "p0",
+          phase: "inference",
+          cycle: 0,
+          request_tick: 5,
+          start_s: 0,
+          end_s: 0.15,
+          simulation_paused: true,
+        },
+        {
+          id: "p1",
+          phase: "execution",
+          cycle: 0,
+          request_tick: 5,
+          start_s: 0.16,
+          end_s: 0.56,
+          physics_start_tick: 5,
+          physics_end_tick: 13,
+        },
+        {
+          id: "p2",
+          phase: "inference",
+          cycle: 1,
+          request_tick: 13,
+          start_s: 0.6,
+          end_s: 0.8,
+          simulation_paused: true,
+        },
+      ],
+    },
+  };
+}
+
+test("synchronous task tracks preserve measured server stages and separate wall-control phases", () => {
+  const row = synchronousRow(),
+    before = JSON.stringify(row);
+  const tracks = T.tracks([row], "deployment");
+  assert.deepEqual(
+    tracks.map((t) => t.stage),
+    ["vlm", "action", "phase"],
+  );
+  assert.equal(tracks[0].blocks[0].basis, "server_stage");
+  assert.equal(tracks[1].blocks[0].basis, "server_stage");
+  assert.equal(tracks[1].blocks[0].timingScope, "server_action_stage");
+  assert.equal(tracks[1].blocks[0].sourceId, "v0");
+  assert.match(
+    T.basisLabel(tracks[1].blocks[0].basis),
+    /服务端.*非独立 RPC.*非 GPU/,
+  );
+  const phases = tracks[2].blocks;
+  assert.deepEqual(
+    phases.map((b) => [b.start, b.end]),
+    [
+      [0, 0.15],
+      [0.16, 0.56],
+      [0.6, 0.8],
+    ],
+  );
+  assert.deepEqual(
+    phases.map((b) => b.basis),
+    ["inference_rpc", "execution_phase", "inference_rpc"],
+  );
+  assert.equal(tracks[2].unit, "s");
+  assert.equal(tracks[2].clockId, "control_wall");
+  assert.equal(T.phase(phases[0], 0.1).key, "running");
+  assert.equal(T.phase(phases[1], 0.1).key, "future");
+  assert.equal(T.phase(phases[0], 0.2).key, "completed");
+  assert.equal(T.phase(phases[1], 0.2).key, "running");
+  assert.equal(JSON.stringify(row), before);
+});
+
+test("execution phase source uses its recorded request identity, never the nearest task", () => {
+  const tracks = T.tracks([synchronousRow()], "deployment");
+  const phase = tracks[2].blocks[1];
+  assert.equal(phase.sourceId, "a0");
+  assert.equal(phase.sourceLabel, "S1[00].1");
+  assert.deepEqual(
+    T.sourceBlocks(tracks, phase.id).map((b) => b.id),
+    ["a0", "v0"],
+  );
+  assert.deepEqual(
+    T.sourceBlocks(tracks, "a1").map((b) => b.id),
+    ["v0"],
+  );
+  assert.deepEqual(T.sourceBlocks(tracks, "absent"), []);
+});
+
+test("missing or ambiguous execution producer remains unknown without timestamp fallback", () => {
+  for (const requestTick of [undefined, null, 99]) {
+    const row = synchronousRow();
+    row.episode.phases[1].request_tick = requestTick;
+    const phase = T.tracks([row], "deployment")[2].blocks[1];
+    assert.equal(phase.sourceId, null);
+    assert.equal(phase.sourceLabel, null);
+  }
+  const row = synchronousRow();
+  row.episode.queue.requests.push({
+    ...row.episode.queue.requests[1],
+    id: "duplicate",
+  });
+  assert.equal(T.tracks([row], "deployment")[2].blocks[1].sourceId, null);
+});
+
+test("missing synchronous phase evidence does not fabricate durations or RPC timings", () => {
+  const row = synchronousRow();
+  delete row.episode.phases;
+  const tracks = T.tracks([row], "deployment");
+  assert.equal(tracks[2].blocks.length, 0);
+  assert.ok(tracks[2].unavailable);
+  delete row.episode.queue.requests[0].timing_scope;
+  assert.equal(T.tracks([row], "deployment")[0].blocks[0].basis, "unknown");
+});
+
+test("partial and invalid phase records do not invent completion", () => {
+  const row = synchronousRow();
+  row.episode.phases = [
+    {
+      id: "open",
+      phase: "inference",
+      start_s: 0,
+      end_s: null,
+      status: "running",
+    },
+    { id: "invalid", phase: "execution", start_s: 2, end_s: 1 },
+    { id: "missing-start", phase: "inference", end_s: 3 },
+  ];
+  const blocks = T.tracks([row], "deployment")[2].blocks;
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].end, null);
+  assert.equal(T.phase(blocks[0], 2).progress, null);
+});
+
+function completeSynchronousCycles() {
+  const row = synchronousRow();
+  row.episode.phases = [0, 1, 2].flatMap((cycle) => {
+    const start = cycle * 0.45;
+    return [
+      {
+        id: `i${cycle}`,
+        cycle,
+        phase: "inference",
+        start_s: start,
+        end_s: start + 0.04,
+      },
+      {
+        id: `e${cycle}`,
+        cycle,
+        phase: "execution",
+        start_s: start + 0.04,
+        end_s: start + 0.44,
+      },
+    ];
+  });
+  return row;
+}
+
+test("synchronous auto window fits two recorded cycles and keeps the current execution producers visible", () => {
+  const row = completeSynchronousCycles(),
+    before = JSON.stringify(row);
+  const span = T.synchronousSpan([row], 1.34);
+  assert.ok(Math.abs(span - 0.89) < 1e-9);
+  const start = T.viewport(0.1, 1.34, span);
+  assert.ok(start.start <= 0 && start.end >= 0.89);
+  const executing = T.viewport(0.7, 1.34, span);
+  for (const block of [
+    { start: 0.45, end: 0.47 }, // observed VLM producer
+    { start: 0.47, end: 0.49 }, // observed DiT producer
+    { start: 0.49, end: 0.89 }, // execution phase
+  ]) {
+    const geometry = T.geometry(block, executing);
+    assert.equal(geometry.visible, true);
+    assert.ok(geometry.left >= 0 && geometry.left + geometry.width <= 100);
+  }
+  assert.equal(JSON.stringify(row), before);
+  assert.equal(T.synchronousSpan([row], 0.2), 0.2);
+});
+
+test("synchronous auto window falls back for missing or incomplete cycles without estimating their duration", () => {
+  assert.equal(T.synchronousSpan([], 3), 0.3);
+  for (const status of ["unknown", "incomplete", "running"]) {
+    const row = completeSynchronousCycles();
+    row.episode.phases[3].status = status;
+    // Neither complete cycle on either side is adjacent to another complete one.
+    assert.equal(T.synchronousSpan([row], 3), 0.3);
+  }
+  for (const end of [null, undefined, NaN, -1]) {
+    const row = completeSynchronousCycles();
+    row.episode.phases[3].end_s = end;
+    assert.equal(T.synchronousSpan([row], 3), 0.3);
+  }
+  const row = completeSynchronousCycles();
+  row.episode.phases = row.episode.phases.slice(0, 2);
+  assert.equal(T.synchronousSpan([row], 3), 0.3);
+  row.run.execution_coupling = "asynchronous";
+  row.episode.phases = completeSynchronousCycles().episode.phases;
+  assert.equal(T.synchronousSpan([row], 3), 0.3);
+});
+
+test("synchronous auto viewport retains the executing cycle sources near the end of unequal cycles", () => {
+  const row = completeSynchronousCycles();
+  row.episode.phases = [
+    {
+      id: "i0",
+      cycle: 0,
+      request_tick: 5,
+      phase: "inference",
+      start_s: 0,
+      end_s: 0.15,
+    },
+    {
+      id: "e0",
+      cycle: 0,
+      request_tick: 5,
+      phase: "execution",
+      start_s: 0.16,
+      end_s: 0.56,
+    },
+    {
+      id: "i1",
+      cycle: 1,
+      request_tick: 9,
+      phase: "inference",
+      start_s: 0.6,
+      end_s: 0.7,
+    },
+    {
+      id: "e1",
+      cycle: 1,
+      request_tick: 9,
+      phase: "execution",
+      start_s: 0.71,
+      end_s: 3.71,
+    },
+  ];
+  const before = JSON.stringify(row);
+  for (const execution of row.episode.phases.filter(
+    (p) => p.phase === "execution",
+  )) {
+    const cursor = execution.end_s - 1e-7;
+    const view = T.synchronousViewport([row], cursor, 3.71);
+    const inference = row.episode.phases.find(
+      (p) => p.cycle === execution.cycle && p.phase === "inference",
+    );
+    assert.ok(view.start <= inference.start_s);
+    assert.ok(view.end >= cursor && view.end <= 3.71);
+    assert.ok(view.span >= cursor - inference.start_s);
+  }
+  assert.equal(JSON.stringify(row), before);
+});
+
+test("one recorded complete cycle anchors execution history without estimating a second cycle", () => {
+  const row = synchronousRow();
+  row.episode.phases = row.episode.phases.slice(0, 2);
+  assert.equal(T.synchronousSpan([row], 0.56), 0.3);
+  const cursor = 0.56 - 1e-7,
+    view = T.synchronousViewport([row], cursor, 0.56);
+  for (const block of T.sourceBlocks(T.tracks([row], "deployment"), "p1")) {
+    assert.ok(view.start <= block.start);
+    assert.ok(view.end >= block.end);
+  }
+  assert.equal(view.start, 0);
+  assert.equal(view.end, 0.56);
+  row.episode.phases[0].status = "unknown";
+  assert.deepEqual(
+    T.synchronousViewport([row], cursor, 0.56),
+    T.viewport(cursor, 0.56, 0.3),
+  );
+  delete row.episode.phases;
+  assert.deepEqual(
+    T.synchronousViewport([row], cursor, 0.56),
+    T.viewport(cursor, 0.56, 0.3),
   );
 });

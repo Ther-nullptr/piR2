@@ -10,11 +10,13 @@ import fcntl
 import json
 import math
 import os
+import re
 import signal
 import socket
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from coexecution.libero.features import validate_feature_options
 from coexecution.libero.scheduling import (
@@ -80,6 +82,18 @@ def validate_plan(plan):
         type(value) is not int or value < 0 for value in plan["gpus"].values()
     ):
         raise ValueError("Declare physical CUDA devices for all three roles")
+    if "gpu_uuids" in plan and (
+        not isinstance(plan["gpu_uuids"], dict)
+        or set(plan["gpu_uuids"]) != set(plan["gpus"])
+        or any(
+            not isinstance(value, str)
+            or not re.fullmatch(
+                r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value
+            )
+            for value in plan["gpu_uuids"].values()
+        )
+    ):
+        raise ValueError("Declare a full GPU UUID for each role")
     if (
         set(plan["ports"]) != {"action", "vlm"}
         or any(
@@ -118,6 +132,35 @@ def validate_plan(plan):
     add_optimization_arguments(parser)
     for case in plan["conditions"]:
         for protocol in plan["protocols"]:
+            from coexecution.libero.synchronous import validate_synchronous_controls
+
+            defaults = {
+                "execution_coupling": "asynchronous",
+                "execution_clock": "paced",
+                "synchronous_chunk_steps": 8,
+                "async_overlap_steps": None,
+                "synchronous_warmup_timeout_seconds": 900,
+                "server_layout": "split",
+                "feature_transport": "numpy_fp32",
+                "feature_rpc": "separate",
+                "action_min_service_ms": 0,
+                "vision_min_service_ms": 0,
+                "vision_max_hz": 0,
+                "deployment_fixed_delay": None,
+                "artificial_compute_wait": 0,
+            }
+            validate_synchronous_controls(
+                SimpleNamespace(
+                    **{
+                        key: _prefix_steps(plan, case)
+                        if key == "synchronous_chunk_steps"
+                        else case.get(key, plan.get(key, value))
+                        for key, value in defaults.items()
+                    },
+                    protocol=protocol,
+                    variant=case["variant"],
+                )
+            )
             validate_execution_clock(
                 case.get("execution_clock", plan.get("execution_clock", "paced")),
                 protocol=protocol,
@@ -155,6 +198,22 @@ def validate_plan(plan):
             )
 
 
+def _prefix_steps(plan, case):
+    for settings in (plan, case):
+        if (
+            "execution_prefix_steps" in settings
+            and "synchronous_chunk_steps" in settings
+            and settings["execution_prefix_steps"]
+            != settings["synchronous_chunk_steps"]
+        ):
+            raise ValueError("Conflicting execution prefix aliases")
+    for settings in (case, plan):
+        for key in ("execution_prefix_steps", "synchronous_chunk_steps"):
+            if key in settings:
+                return settings[key]
+    return 8
+
+
 def build_commands(plan, case, protocol, output):
     root = Path(plan["runtime_root"])
     commands = {}
@@ -164,6 +223,9 @@ def build_commands(plan, case, protocol, output):
     )
     feature_rpc = case.get("feature_rpc", plan.get("feature_rpc", "separate"))
     layout = case.get("server_layout", plan.get("server_layout", "split"))
+    coupling = case.get(
+        "execution_coupling", plan.get("execution_coupling", "asynchronous")
+    )
     feature_controls = []
     if "feature_transport" in case or "feature_transport" in plan:
         feature_controls = ["--feature-transport", feature_transport]
@@ -177,14 +239,32 @@ def build_commands(plan, case, protocol, output):
             [
                 "--execution-clock",
                 case.get("execution_clock", plan.get("execution_clock", "paced")),
+                "--execution-coupling",
+                coupling,
+                "--synchronous-chunk-steps",
+                str(_prefix_steps(plan, case)),
+                "--synchronous-warmup-timeout-seconds",
+                str(
+                    case.get(
+                        "synchronous_warmup_timeout_seconds",
+                        plan.get("synchronous_warmup_timeout_seconds", 900),
+                    )
+                ),
             ]
         )
+        overlap = case.get("async_overlap_steps", plan.get("async_overlap_steps"))
+        if overlap is not None:
+            deployment_controls.extend(["--async-overlap-steps", str(overlap)])
         fixed_delay = case.get(
             "deployment_fixed_delay", plan.get("deployment_fixed_delay")
         )
         if fixed_delay is not None:
             deployment_controls.extend(["--deployment-fixed-delay", str(fixed_delay)])
-    for role in ("action", "vlm"):
+    for role in (
+        ("action",)
+        if coupling in ("synchronous", "one_step_async", "chunked_async")
+        else ("action", "vlm")
+    ):
         commands[role] = [
             str(plan["model_python"]),
             "-m",
@@ -341,6 +421,21 @@ def validate_launch_paths(plan):
         plan["upstream"]
     ).resolve():
         raise ValueError("Runtime upstream path does not match the declared source")
+    from coexecution.libero.loading import checkpoint_decoded_horizon
+
+    # Preflight every condition before run() admits devices or starts any child.
+    # A later condition with an invalid native prefix must not waste earlier runs.
+    for case in plan["conditions"]:
+        coupling = case.get(
+            "execution_coupling", plan.get("execution_coupling", "asynchronous")
+        )
+        if coupling in ("synchronous", "one_step_async", "chunked_async"):
+            decoded = checkpoint_decoded_horizon(case["checkpoint"])
+            prefix = _prefix_steps(plan, case)
+            if prefix > decoded:
+                raise ValueError(
+                    f"Condition {case['name']}: execution prefix {prefix} exceeds native decoded horizon {decoded}"
+                )
 
 
 def environment(plan, role):
@@ -348,7 +443,7 @@ def environment(plan, role):
     root = Path(plan["runtime_root"])
     gpu = plan["gpus"][role]
     env.update(
-        CUDA_VISIBLE_DEVICES=str(gpu),
+        CUDA_VISIBLE_DEVICES=plan.get("gpu_uuids", {}).get(role, str(gpu)),
         PYTHONUNBUFFERED="1",
         OMP_NUM_THREADS="2",
         MAX_JOBS="2",
@@ -448,6 +543,30 @@ class OwnedProcesses:
 
 
 def _admit_devices(plan):
+    verified = {}
+    if "gpu_uuids" in plan:
+        observed = {}
+        for gpu in set(plan["gpus"].values()):
+            result = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "-i",
+                    str(gpu),
+                    "--query-gpu=index,uuid",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+            )
+            index, uuid = (value.strip() for value in result.strip().split(","))
+            if int(index) != gpu:
+                raise RuntimeError("GPU UUID/index mismatch during admission")
+            observed[gpu] = uuid
+        for role, gpu in plan["gpus"].items():
+            if observed[gpu].lower() != plan["gpu_uuids"][role].lower():
+                raise RuntimeError(
+                    f"GPU UUID/index mismatch for {role}: physical {gpu} is {observed[gpu]}"
+                )
+            verified[role] = {"physical_index": gpu, "uuid": observed[gpu]}
     for gpu in set(plan["gpus"].values()):
         # A completed condition can leave a briefly nonzero resource sample.
         # Recheck without launching anything; visible compute jobs reject at once.
@@ -487,6 +606,7 @@ def _admit_devices(plan):
     for port in plan["ports"].values():
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
+    return verified
 
 
 def deployment_report(plan, output, *, report_output=None):
@@ -567,11 +687,16 @@ def run(plan, output):
             condition_output = output / case["name"]
             owned = OwnedProcesses(plan)
             try:
-                _admit_devices(plan)
+                verified_gpus = _admit_devices(plan)
+                condition_output.mkdir(parents=True, exist_ok=True)
+                _write(
+                    condition_output / "gpu-admission.json",
+                    {"verified_role_mapping": verified_gpus},
+                )
                 commands = build_commands(
                     plan, case, plan["protocols"][0], condition_output
                 )
-                for role in ("paired",) if "paired" in commands else ("action", "vlm"):
+                for role in (name for name in commands if name != "evaluate"):
                     worker_output = condition_output / (role + "-server")
                     owned.start(
                         role,
@@ -613,12 +738,22 @@ def run(plan, output):
                             "condition": protocol,
                             "role_gpus": {
                                 "S1": plan["gpus"]["action"],
-                                "S2": plan["gpus"]["vlm"],
+                                "S2": plan["gpus"]["vlm"]
+                                if "vlm" in commands or "paired" in commands
+                                else plan["gpus"]["action"],
                             },
                             "inference_gpus": sorted(
-                                {plan["gpus"]["action"], plan["gpus"]["vlm"]}
+                                {
+                                    plan["gpus"]["action"],
+                                    *(
+                                        [plan["gpus"]["vlm"]]
+                                        if "vlm" in commands or "paired" in commands
+                                        else []
+                                    ),
+                                }
                             ),
                             "renderer_gpu": plan["gpus"]["simulation"],
+                            "verified_role_mapping": verified_gpus,
                             "returncode": process.returncode,
                         },
                     )

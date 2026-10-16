@@ -870,6 +870,260 @@ async function main() {
       },
     );
 
+    const legacyDescriptors = ["bf16", "w8a8"].map((precision) => ({
+      id: `legacy-${precision}`,
+      kind: "deployment",
+      precision,
+      episodes: 0,
+      execution_coupling: "synchronous",
+      execution_clock: "ready",
+      path: `runs/legacy-${precision}.json`,
+      label: fixtureNote,
+    }));
+    let legacyPrefix = 8;
+    const legacyRun = (id, k = legacyPrefix) => ({
+      ...run(id),
+      ...legacyDescriptors.find((r) => r.id === id),
+      configuration: { synchronous_chunk_steps: k },
+      episodes: [],
+      clean_requests: [],
+    });
+    await check(
+      "legacy SSE projections stay bound to the first resolved actual K/D cohort",
+      async ({ page }) => {
+        const bf16 = await waitForSource(page, "legacy-bf16");
+        const w8 = await waitForSource(page, "legacy-w8a8");
+        const status = (precision) =>
+          page.locator(
+            `.precision-card[data-precision="${precision}"] .card-status`,
+          );
+        assert.doesNotMatch(await status("bf16").innerText(), /K\/D schedule/);
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+        await emit(
+          page,
+          bf16,
+          event("legacy-bf16", 8, {
+            projection: { op: "replace", run: legacyRun("legacy-bf16", 1) },
+          }),
+        );
+        assert.match(
+          await status("bf16").innerText(),
+          /K\/D schedule/,
+          "K1 cannot silently replace one card in a resolved K8 cohort",
+        );
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+        assert.equal(
+          await page
+            .locator('.precision-card[data-precision="bf16"] video')
+            .count(),
+          0,
+        );
+        assert.equal(
+          await page
+            .locator('.precision-card[data-precision="bf16"] .metrics')
+            .innerText(),
+          "",
+        );
+        await emit(
+          page,
+          w8,
+          event("legacy-w8a8", 8, {
+            projection: { op: "replace", run: legacyRun("legacy-w8a8", 1) },
+          }),
+        );
+        assert.match(
+          await status("w8a8").innerText(),
+          /K\/D schedule/,
+          "the binding must survive rejection, even if both streams drift",
+        );
+        await emit(
+          page,
+          bf16,
+          event("legacy-bf16", 9, {
+            projection: { op: "replace", run: legacyRun("legacy-bf16", 8) },
+          }),
+        );
+        await emit(
+          page,
+          w8,
+          event("legacy-w8a8", 9, {
+            projection: { op: "replace", run: legacyRun("legacy-w8a8", 8) },
+          }),
+        );
+        assert.doesNotMatch(await status("bf16").innerText(), /K\/D schedule/);
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+        legacyPrefix = 1;
+        await page.selectOption("#execution-coupling", "synchronous");
+        await page.waitForFunction(
+          () =>
+            document.querySelector("#data-status").dataset.state === "ready",
+        );
+        assert.doesNotMatch(
+          await status("bf16").innerText(),
+          /K\/D schedule/,
+          "explicit cohort reload resolves a new matching schedule",
+        );
+        assert.doesNotMatch(await status("w8a8").innerText(), /K\/D schedule/);
+      },
+      {
+        catalog: {
+          ...catalog(false),
+          default_view: "deployment",
+          default_execution_coupling: "synchronous",
+          default_execution_clock: "ready",
+          runs: legacyDescriptors,
+          streams: legacyDescriptors.map((r) => ({
+            run_id: r.id,
+            snapshot_path: `streams/${r.id}/snapshot.json`,
+            journal_path: `streams/${r.id}/events.jsonl`,
+          })),
+        },
+        run: legacyRun,
+        snapshot: (id) => ({ ...snapshot(id), run: legacyRun(id) }),
+      },
+    );
+
+    const matrix = [
+      [1, 1],
+      [4, 1],
+      [4, 2],
+      [8, 1],
+      [8, 4],
+    ].flatMap(([k, d]) =>
+      ["bf16", "w8a8", "w4a4"].map((precision) => ({
+        id: `${precision}-k${k}-d${d}`,
+        kind: "deployment",
+        precision,
+        execution_clock: "ready",
+        execution_coupling: "chunked_async",
+        execution_prefix_steps: k,
+        async_overlap_steps: d,
+        path: `runs/${precision}-k${k}-d${d}.json`,
+        episodes: 0,
+        label: fixtureNote,
+      })),
+    );
+    await check(
+      "matrix selectors load one cohort and keep K/D through populated and empty catalog refresh",
+      async ({ page, catalog: data, requests }) => {
+        const ready = () =>
+          page.waitForFunction(
+            () =>
+              document.querySelector("#data-status").dataset.state === "ready",
+          );
+        const ids = () =>
+          page
+            .locator(".run-select")
+            .evaluateAll((xs) => xs.map((x) => x.value));
+        assert.deepEqual(await ids(), [
+          "bf16-k4-d2",
+          "w8a8-k4-d2",
+          "w4a4-k4-d2",
+        ]);
+        assert.equal(
+          requests.filter((p) => p.includes("/api/replay/run/")).length,
+          3,
+          "only the selected schedule is fetched",
+        );
+        await page.selectOption("#execution-prefix-steps", "8");
+        await ready();
+        assert.equal(
+          await page.locator("#async-overlap-steps").inputValue(),
+          "1",
+          "invalid D2 falls back to recorded D1",
+        );
+        await page.selectOption("#async-overlap-steps", "4");
+        await ready();
+        assert.deepEqual(await ids(), [
+          "bf16-k8-d4",
+          "w8a8-k8-d4",
+          "w4a4-k8-d4",
+        ]);
+        assert.equal(
+          requests.filter((p) => p.includes("/api/replay/run/")).length,
+          9,
+        );
+        const before = await selection(page);
+        data.runs.push(
+          ...matrix
+            .filter(
+              (r) =>
+                r.execution_prefix_steps === 8 && r.async_overlap_steps === 4,
+            )
+            .map((r) => ({
+              ...r,
+              id: r.id + "-repeat",
+              path: `runs/${r.id}-repeat.json`,
+            })),
+        );
+        data.created_at = "matrix-repetition-added";
+        await page.waitForSelector(
+          '.run-select option[value="bf16-k8-d4-repeat"]',
+          { state: "attached", timeout: 6500 },
+        );
+        assert.deepEqual(await selection(page), before);
+        assert.equal(
+          requests.filter((p) => p.includes("/api/replay/run/")).length,
+          9,
+          "refresh does not fetch unselected repetitions",
+        );
+        data.runs = [];
+        data.created_at = "matrix-empty-refresh";
+        await page.waitForFunction(
+          () =>
+            document
+              .querySelector("#catalog-meta")
+              .textContent.includes("matrix-empty-refresh"),
+          null,
+          { timeout: 6500 },
+        );
+        assert.equal(
+          await page.locator("#execution-prefix-steps").inputValue(),
+          "8",
+        );
+        assert.equal(
+          await page.locator("#async-overlap-steps").inputValue(),
+          "4",
+        );
+        assert.deepEqual(await selection(page), before);
+        data.runs = matrix.filter((r) => r.execution_prefix_steps === 4);
+        data.created_at = "matrix-selected-schedule-removed";
+        await page.waitForFunction(
+          () =>
+            document.querySelector("#execution-prefix-steps").value === "4" &&
+            document.querySelector("#data-status").dataset.state === "ready",
+          null,
+          { timeout: 6500 },
+        );
+        assert.equal(
+          await page.locator("#async-overlap-steps").inputValue(),
+          "1",
+        );
+        assert.deepEqual(await ids(), [
+          "bf16-k4-d1",
+          "w8a8-k4-d1",
+          "w4a4-k4-d1",
+        ]);
+      },
+      {
+        catalog: {
+          ...catalog(false),
+          default_view: "deployment",
+          default_execution_coupling: "chunked_async",
+          default_execution_clock: "ready",
+          default_execution_prefix_steps: 4,
+          default_async_overlap_steps: 2,
+          runs: matrix,
+        },
+        run: (id) => ({
+          ...run(id),
+          ...matrix.find((r) => r.id === id),
+          episodes: [],
+          clean_requests: [],
+        }),
+      },
+    );
+
     await check(
       "legacy catalogs keep static replay and never probe SSE or snapshots",
       async ({ page, requests }) => {

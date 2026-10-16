@@ -170,6 +170,8 @@ def serve(backend, spec, identity, optimization=None, record_runtime_receipt=Fal
             requires_input=False,
         )
         names = ["reset", "bootstrap", "vision", "install", "plan"]
+        if hasattr(backend, "synchronous_plan"):
+            names.append("synchronous_plan")
         if hasattr(backend, "feature_control"):
             names.append("feature_control")
         for name in names:
@@ -340,6 +342,14 @@ def main():
                 "installation": "owned tensors on endpoint CUDA stream, complete before plan",
             },
             "feature_rpc_modes": ["separate", "combined"],
+            "execution_endpoints": ["bootstrap", "plan"]
+            + (
+                ["synchronous_plan"]
+                if args.variant == "flow"
+                and len(layout) == 1
+                and spec["role"] == "action"
+                else []
+            ),
             "timing_version": TIMING_VERSION,
         }
         if exchange is not None:
