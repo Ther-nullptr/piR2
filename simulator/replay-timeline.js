@@ -84,6 +84,63 @@
         label: "主机已提交 · GPU 完成未知",
         progress: 1,
       };
+    if (
+      block.publication ||
+      (block.stage === "action" && block.basis === "rpc")
+    ) {
+      const p = block.publication;
+      if (!p)
+        return {
+          key: "unknown",
+          label: "RPC 已完成 · 发布 / 执行证据未知",
+          progress: 1,
+        };
+      if (
+        p.status === "unused_final" &&
+        (!finite(p.unused_at_s) || cursor >= p.unused_at_s)
+      )
+        return { key: "unused", label: "已完成 · 最终未使用结果", progress: 1 };
+      if (!finite(p.processed_s) || cursor < p.processed_s)
+        return {
+          key: "ready",
+          label: "RPC 已完成 · 等待控制线程读取",
+          progress: 1,
+        };
+      if (p.installed_slots === 0)
+        return {
+          key: "discarded",
+          label: `已读取 · 0 入队 / 过期 ${p.expired_slots ?? "?"} / 受保护 ${p.protected_slots ?? "?"}`,
+          progress: 1,
+        };
+      if (!Number.isInteger(p.installed_slots))
+        return { key: "unknown", label: "已读取 · 发布数量未知", progress: 1 };
+      const executed = (p.executions ?? []).filter(
+        (r) => finite(r.applied_s) && r.applied_s <= cursor,
+      ).length;
+      if (executed)
+        return {
+          key: executed < p.installed_slots ? "partial" : "executed",
+          label: `已执行 ${executed} / 入队 ${p.installed_slots}${p.expired_slots || p.protected_slots ? ` · 过期 ${p.expired_slots ?? "?"} / 受保护 ${p.protected_slots ?? "?"}` : ""}`,
+          progress: 1,
+        };
+      if (p.executed_slots == null)
+        return {
+          key: "unknown",
+          label: `已入队 ${p.installed_slots} · 执行证据未知`,
+          progress: 1,
+        };
+      if (finite(p.control_end_s) && cursor >= p.control_end_s)
+        return {
+          key: "unused",
+          label: `已入队 ${p.installed_slots} · 回合结束前未执行`,
+          progress: 1,
+        };
+      return {
+        key: "queued",
+        label: `已入队 ${p.installed_slots} · 等待有效 tick${p.expired_slots ? ` · 部分过期 ${p.expired_slots}` : ""}`,
+        progress: 1,
+      };
+    }
     if (finite(block.adopted) && block.adopted <= cursor)
       return { key: "adopted", label: "动作已接纳", progress: 1 };
     if (block.consumed?.some((t) => finite(t) && t <= cursor))
@@ -285,10 +342,10 @@
               : parent || (!lookahead && !visualCounts.has(r.feature_sequence))
                 ? (aliases.actions.get(r.request_tick)?.label ?? "S1[?]")
                 : "S1[?]";
-          const end = finite(r.end_s)
-            ? r.end_s
-            : finite(r.completed_s)
-              ? r.completed_s
+          const end = finite(r.completed_s)
+            ? r.completed_s
+            : finite(r.end_s)
+              ? r.end_s
               : null;
           return {
             id: r.id,
@@ -309,11 +366,12 @@
             sourceLabel: stage === "action" ? (parent?.label ?? null) : null,
             sourceId: stage === "action" ? (parent?.request?.id ?? null) : null,
             adopted: stage === "action" ? r.adopted_s : null,
+            publication: stage === "action" ? r.publication : null,
             description: lookahead
               ? `Obs ${r.source_tick ?? "?"} → ${chunked ? "plan" : "action"} ${r.target_tick ?? "?"}${chunked ? " · native " + (r.decoded_horizon ?? "?") + " / accepted " + (r.accepted_prefix_steps ?? "?") + " / executed " + (r.executed_prefix_steps ?? "?") : ""}${r.disposition === "unused" ? " · unused final" : ""}`
               : row.run.policy_variant === "pir2"
                 ? stage === "action"
-                  ? `πR² ${r.policy_evidence?.category ?? "unknown"} · DiT NFE ${r.policy_evidence?.forward_counts?.dit ?? "?"} · visual ${r.feature_source_tick ?? "?"} / state ${r.state_tick ?? "?"} · buffer origin ${r.policy_evidence?.audit?.buffer_origin_after ?? "?"}`
+                  ? `πR² ${r.policy_evidence?.category ?? "unknown"} · DiT NFE ${r.policy_evidence?.forward_counts?.dit ?? "?"} · visual ${r.feature_source_tick ?? "?"} / state ${r.state_tick ?? "?"} · buffer origin ${r.policy_evidence?.audit?.buffer_origin_after ?? "?"} · valid [${r.publication?.valid_start_tick ?? r.valid_start_tick ?? "?"}, ${r.publication?.valid_end_tick ?? r.valid_end_tick ?? "?"}) · committed [${r.publication?.committed_prefix?.start_tick ?? "?"}, ${r.publication?.committed_prefix?.end_tick ?? "?"})${r.publication?.delay_policy_decision ? ` · d ${r.publication.delay_policy_decision.previous_delay_ticks}→${r.publication.delay_policy_decision.chosen_delay_ticks} ${r.publication.delay_policy_decision.reason}` : ""}`
                   : `πR² S2 visual tick ${r.source_tick ?? "?"} · observed VLM calls ${r.policy_evidence?.vlm_forward_calls ?? "?"}`
                 : null,
             consumed:

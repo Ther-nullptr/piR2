@@ -34,6 +34,10 @@ from coexecution.libero.resident import (
 from coexecution.libero.scheduling import (
     AdmissionSchedule,
     ExecutionCadence,
+    FutureSignal,
+    ResponsiveDelayBudget,
+    publish_completed_result,
+    validate_deployment_scheduling_policy,
     validate_execution_clock,
 )
 
@@ -77,6 +81,10 @@ class RealClock:
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
+
+    @staticmethod
+    def wait_for_signal(signal, deadline):
+        signal.wait(max(0.0, deadline - time.monotonic()))
 
 
 def validate_service_floor(value):
@@ -570,9 +578,15 @@ def run_control_loop(
     fixed_delay=None,
     replay_recorder=None,
     execution_clock="paced",
+    deployment_scheduling_policy="conservative",
 ):
     """The actor/vision interfaces are injectable so clock contracts can be tested."""
     clock = clock or RealClock()
+    validate_deployment_scheduling_policy(
+        deployment_scheduling_policy,
+        execution_clock=execution_clock,
+        fixed_delay=fixed_delay,
+    )
     validate_execution_clock(execution_clock, fixed_delay=fixed_delay)
     if execution_clock == "ready" and initial_delay != 1:
         raise ValueError("Ready execution uses a one-step committed prefix")
@@ -599,8 +613,16 @@ def run_control_loop(
         if not cadence.paced
         else "fixed"
         if fixed_delay is not None
+        else "responsive_rolling_p95"
+        if deployment_scheduling_policy == "responsive"
         else "adaptive_nondecreasing"
     )
+    budget_policy = (
+        ResponsiveDelayBudget(initial_delay, period)
+        if deployment_scheduling_policy == "responsive"
+        else None
+    )
+    ready_signal = None
     bootstrap_feature = {
         "sequence": 0,
         "meta": {"source_tick": 0, "capture_s": initial_capture_s},
@@ -615,6 +637,8 @@ def run_control_loop(
         max_steps=max_steps,
         initial_delay_ticks=initial_delay,
         delay_policy=delay_policy,
+        deployment_scheduling_policy=deployment_scheduling_policy,
+        delay_policy_config=budget_policy.config if budget_policy else None,
         initial_capture_s=initial_capture_s,
         bootstrap_action_slots=len(initial_plan),
         **feature_dependency(bootstrap_feature),
@@ -633,52 +657,55 @@ def run_control_loop(
     observation_events = []
     plan_ready_times = {}
     applied_requests = set()
-    for tick in range(max_steps):
-        target = cadence.wait(clock, tick)
-        tick_started = clock.now()
-        # Paced observations remain withheld until Tk; ready observations retain
-        # their actual post-step capture time and are released at this boundary.
-        capture = next_capture if tick == 0 or not cadence.paced else tick_started
-        current = Observation(next_data, tick, capture)
-        observation_events.append((tick, tick_started, target, capture))
-        vision.offer(current)
+
+    def ingest(tick):
+        nonlocal pending, ready_signal, expired, protected, misses, over_budget, delay
         if pending is not None and pending.done():
+            observed = clock.now()
             result = pending.result()
             pending = None
+            ready_signal = None
             audit = result["audit"]
             timing = result["client_timing"]
-            publication = timeline.publish(
-                audit["request_tick"],
-                audit["valid_start_tick"],
-                result["actions"],
+            record = publish_completed_result(
+                timeline,
+                result,
                 next_tick=tick,
+                observed_s=observed,
+                clock=clock,
             )
-            expired += publication.expired
-            protected += publication.protected
+            expired += record["expired_slots"]
+            protected += record["protected_slots"]
             late = None
             if cadence.paced:
                 late = timing["completed_s"] > timing["deadline_s"]
                 misses += int(late)
-                budget, ood = latency_budget(
-                    timing["completed_s"] - timing["submitted_s"] + 0.005, period
-                )
-                over_budget += int(ood)
-                if late and fixed_delay is None:
-                    delay = max(delay, budget)
+                if budget_policy is not None:
+                    decision = budget_policy.observe(
+                        submitted_s=timing["submitted_s"],
+                        completed_s=timing["completed_s"],
+                        scheduled_s=cadence.target(audit["request_tick"]),
+                        deadline_s=timing["deadline_s"],
+                    )
+                    delay = budget_policy.delay
+                    over_budget += int(decision["over_training_budget"])
+                    record["delay_policy_decision"] = decision
+                    events.emit(
+                        "delay_policy_decision",
+                        request_tick=audit["request_tick"],
+                        next_unexecuted_tick=tick,
+                        **decision,
+                    )
+                else:
+                    budget, ood = latency_budget(
+                        timing["completed_s"] - timing["submitted_s"] + 0.005, period
+                    )
+                    over_budget += int(ood)
+                    if late and fixed_delay is None:
+                        delay = max(delay, budget)
             adopted = clock.now()
             plan_ready_times[audit["request_tick"]] = timing["completed_s"]
-            record = {
-                "kind": "request_completed",
-                "t_s": adopted,
-                "consumed_at_tick": tick,
-                "ready_to_adopt_seconds": adopted - timing["completed_s"],
-                "expired_slots": publication.expired,
-                "protected_slots": publication.protected,
-                "installed_slots": publication.installed,
-                "deadline_miss": late,
-                "audit": audit,
-                "client_timing": timing,
-            }
+            record["deadline_miss"] = late
             request_records.append(record)
             events.emit(**record)
             events.emit(
@@ -688,118 +715,147 @@ def run_control_loop(
                 completed_s=timing["completed_s"],
                 ready_to_adopt_seconds=adopted - timing["completed_s"],
                 adopted_at_tick=tick,
-                installed_slots=publication.installed,
-                expired_slots=publication.expired,
-                protected_slots=publication.protected,
+                installed_slots=record["installed_slots"],
+                expired_slots=record["expired_slots"],
+                protected_slots=record["protected_slots"],
                 valid_start_tick=audit["valid_start_tick"],
                 valid_end_tick=audit["valid_end_tick"],
                 deadline_miss=late,
             )
-        if pending is None and tick >= next_request:
-            prefix = timeline.reserve(tick, delay)
-            visual = vision.ready(current)
-            submitted = clock.now()
-            events.emit(
-                "action_submitted",
-                t_s=submitted,
-                request_tick=tick,
-                state_tick=current.tick,
-                state_capture_s=current.capture_s,
-                delay_ticks=delay,
-                deadline_s=cadence.target(tick + delay),
-                committed_start_tick=tick,
-                committed_end_tick=tick + delay,
-                **feature_dependency(visual or bootstrap_feature),
+
+    try:
+        for tick in range(max_steps):
+            target = cadence.target(tick)
+            if (
+                budget_policy is not None
+                and ready_signal is not None
+                and ready_signal.wait_until(clock, target)
+            ):
+                ingest(tick)
+            cadence.wait(clock, tick)
+            tick_started = clock.now()
+            # Release post-step sensors only at their physical boundary.
+            capture = next_capture if tick == 0 or not cadence.paced else tick_started
+            current = Observation(next_data, tick, capture)
+            observation_events.append((tick, tick_started, target, capture))
+            vision.offer(current)
+            ingest(tick)
+            if pending is None and tick >= next_request:
+                prefix = timeline.reserve(tick, delay)
+                visual = vision.ready(current)
+                submitted = clock.now()
+                events.emit(
+                    "action_submitted",
+                    t_s=submitted,
+                    request_tick=tick,
+                    state_tick=current.tick,
+                    state_capture_s=current.capture_s,
+                    delay_ticks=delay,
+                    deadline_s=cadence.target(tick + delay),
+                    committed_start_tick=tick,
+                    committed_end_tick=tick + delay,
+                    **feature_dependency(visual or bootstrap_feature),
+                )
+                pending = actor.submit(
+                    current,
+                    tick,
+                    delay,
+                    prefix,
+                    visual,
+                    cadence.target(tick + delay),
+                    submitted,
+                )
+                if budget_policy is not None:
+                    ready_signal = FutureSignal(pending)
+                next_request = tick + delay
+            action, fallback, command_age = timeline.execute(tick)
+            buffer_snapshot = timeline.snapshot()
+            camera_snapshot = vision.snapshot() if hasattr(vision, "snapshot") else None
+            fallbacks += int(fallback)
+            applied = clock.now()
+            producer = timeline.last_execution.get("producer_request_tick")
+            ready_at = plan_ready_times.get(producer)
+            first_application = (
+                ready_at is not None and producer not in applied_requests
             )
-            pending = actor.submit(
-                current,
-                tick,
-                delay,
-                prefix,
-                visual,
-                cadence.target(tick + delay),
-                submitted,
-            )
-            next_request = tick + delay
-        action, fallback, command_age = timeline.execute(tick)
-        buffer_snapshot = timeline.snapshot()
-        camera_snapshot = vision.snapshot() if hasattr(vision, "snapshot") else None
-        fallbacks += int(fallback)
-        applied = clock.now()
-        producer = timeline.last_execution.get("producer_request_tick")
-        ready_at = plan_ready_times.get(producer)
-        first_application = ready_at is not None and producer not in applied_requests
-        if first_application:
-            applied_requests.add(producer)
-        next_data, success, terminated = step_fn(action)
-        computed = clock.now()
-        next_data = copy_observation(next_data)
-        next_capture = computed
-        row = {
-            "kind": "control_tick",
-            "tick": tick,
-            "scheduled_s": target,
-            "applied_s": applied,
-            "lateness_s": max(0, applied - target) if target is not None else None,
-            "sensor_capture_s": capture,
-            "sensor_release_s": tick_started,
-            "next_observation_computed_s": computed,
-            "next_observation_release_not_before_s": cadence.target(tick + 1),
-            "execution_clock": execution_clock,
-            "physics_step_seconds": period,
-            "simulated_elapsed_seconds": (tick + 1) * period,
-            "command_ready_s": ready_at,
-            "ready_to_apply_seconds": applied - ready_at
-            if ready_at is not None
-            else None,
-            "first_application_of_request": first_application,
-            "environment_step_s": computed - applied,
-            "action": action.tolist(),
-            "fallback": fallback,
-            "command_age_ticks": command_age,
-            "action_delay_budget_ticks": delay,
-            "action_request_pending": pending is not None and not pending.done(),
-            "executed_slot": timeline.last_execution,
-            "action_buffer": buffer_snapshot,
-            "action_buffer_phase": "after_execute",
-            "camera_queue": camera_snapshot,
-        }
-        if replay_recorder is not None:
-            row["robot_response"] = replay_recorder.step(current.data, next_data, row)
-        ticks.append(row)
-        events.emit(t_s=applied, **row)
-        if record_video:
-            frames.append(next_data["video.image"].copy())
-        if success or terminated:
-            reason = "success" if success else "environment_terminated"
-            cadence.wait(clock, tick + 1)
-            break
-    else:
-        cadence.wait(clock, max_steps)
-    controlled_end = clock.now()
-    events.emit(
-        "control_end", t_s=controlled_end, control_steps=len(ticks), reason=reason
-    )
-    vision.request_stop(controlled_end)
-    # Waiting is allowed only after the timed control episode has ended.
-    if pending is not None:
-        result = pending.result()
-        expired_at_end = max(
-            0,
-            min(
-                len(result["actions"]), len(ticks) - result["audit"]["valid_start_tick"]
-            ),
-        )
-        expired += expired_at_end
+            if first_application:
+                applied_requests.add(producer)
+            next_data, success, terminated = step_fn(action)
+            computed = clock.now()
+            next_data = copy_observation(next_data)
+            next_capture = computed
+            row = {
+                "kind": "control_tick",
+                "tick": tick,
+                "scheduled_s": target,
+                "applied_s": applied,
+                "lateness_s": max(0, applied - target) if target is not None else None,
+                "sensor_capture_s": capture,
+                "sensor_release_s": tick_started,
+                "next_observation_computed_s": computed,
+                "next_observation_release_not_before_s": cadence.target(tick + 1),
+                "execution_clock": execution_clock,
+                "physics_step_seconds": period,
+                "simulated_elapsed_seconds": (tick + 1) * period,
+                "command_ready_s": ready_at,
+                "ready_to_apply_seconds": applied - ready_at
+                if ready_at is not None
+                else None,
+                "first_application_of_request": first_application,
+                "environment_step_s": computed - applied,
+                "action": action.tolist(),
+                "fallback": fallback,
+                "command_age_ticks": command_age,
+                "action_delay_budget_ticks": delay,
+                "action_request_pending": pending is not None and not pending.done(),
+                "executed_slot": timeline.last_execution,
+                "action_buffer": buffer_snapshot,
+                "action_buffer_phase": "after_execute",
+                "camera_queue": camera_snapshot,
+            }
+            if replay_recorder is not None:
+                row["robot_response"] = replay_recorder.step(
+                    current.data, next_data, row
+                )
+            ticks.append(row)
+            events.emit(t_s=applied, **row)
+            if record_video:
+                frames.append(next_data["video.image"].copy())
+            if success or terminated:
+                reason = "success" if success else "environment_terminated"
+                cadence.wait(clock, tick + 1)
+                break
+        else:
+            cadence.wait(clock, max_steps)
+        controlled_end = clock.now()
         events.emit(
-            "unused_result_at_episode_end",
-            expired_before_episode_end=expired_at_end,
-            unneeded_future_slots=len(result["actions"]) - expired_at_end,
-            audit=result["audit"],
-            client_timing=result["client_timing"],
+            "control_end", t_s=controlled_end, control_steps=len(ticks), reason=reason
         )
-    actor.close()
-    vlm_stats = vision.close()
+        vision.request_stop(controlled_end)
+        # Waiting is allowed only after the timed control episode has ended.
+        if pending is not None:
+            result = pending.result()
+            expired_at_end = max(
+                0,
+                min(
+                    len(result["actions"]),
+                    len(ticks) - result["audit"]["valid_start_tick"],
+                ),
+            )
+            expired += expired_at_end
+            events.emit(
+                "unused_result_at_episode_end",
+                expired_before_episode_end=expired_at_end,
+                unneeded_future_slots=len(result["actions"]) - expired_at_end,
+                audit=result["audit"],
+                client_timing=result["client_timing"],
+            )
+    finally:
+        vision.request_stop(clock.now())
+        try:
+            actor.close()
+        finally:
+            vlm_stats = vision.close()
     for timing, elapsed in zip(
         vlm_stats.get("rpc_times", []), vlm_stats.get("rpc_seconds", []), strict=True
     ):
@@ -921,6 +977,8 @@ def run_control_loop(
         "initial_action_delay_ticks": initial_delay,
         "final_action_delay_ticks": delay,
         "action_delay_policy": delay_policy,
+        "deployment_scheduling_policy": deployment_scheduling_policy,
+        "delay_policy_config": budget_policy.config if budget_policy else None,
         "vlm_work": {
             k: v for k, v in vlm_stats.items() if k not in {"rpc_seconds", "rpc_times"}
         },
@@ -1079,6 +1137,14 @@ def deployment_episode(env, observation, client, args, seed, trace):
     feature_transport = getattr(args, "feature_transport", "numpy_fp32")
     fixed_delay = getattr(args, "deployment_fixed_delay", None)
     execution_clock = getattr(args, "execution_clock", "paced")
+    scheduling_policy = getattr(args, "deployment_scheduling_policy", "conservative")
+    validate_deployment_scheduling_policy(
+        scheduling_policy,
+        variant=getattr(args, "variant", "flow"),
+        execution_clock=execution_clock,
+        execution_coupling=getattr(args, "execution_coupling", "asynchronous"),
+        fixed_delay=fixed_delay,
+    )
     validate_execution_clock(
         execution_clock,
         variant=getattr(args, "variant", "flow"),
@@ -1254,6 +1320,7 @@ def deployment_episode(env, observation, client, args, seed, trace):
             fixed_delay=fixed_delay,
             replay_recorder=recorder,
             execution_clock=execution_clock,
+            deployment_scheduling_policy=scheduling_policy,
         )
     finally:
         if gc_was_enabled:
@@ -1273,6 +1340,8 @@ def deployment_episode(env, observation, client, args, seed, trace):
         "feature_transport": feature_transport,
         "server_layout": getattr(args, "server_layout", "split"),
         "deployment_fixed_delay": fixed_delay,
+        "deployment_scheduling_policy": scheduling_policy,
+        "delay_policy_config": result.get("delay_policy_config"),
         "execution_clock": execution_clock,
         "delay_selection": "one atomic physics step committed; solo RPC calibration is evidence only"
         if execution_clock == "ready"

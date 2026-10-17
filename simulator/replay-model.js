@@ -298,6 +298,29 @@
       return "invalid";
     return claims[0] ?? null;
   }
+  function controllerPolicy(run) {
+    const claims = [];
+    for (const [object, key] of [
+      [run, "deployment_scheduling_policy"],
+      [run.controller_identity, "policy"],
+      [run.configuration, "deployment_scheduling_policy"],
+    ]) {
+      if (object && Object.hasOwn(object, key)) claims.push(object[key]);
+    }
+    if (
+      claims.some((v) => ![null, "conservative", "responsive"].includes(v)) ||
+      claims.some((v) => v !== claims[0])
+    )
+      return "invalid";
+    return claims[0] ?? null;
+  }
+  function controllerLabel(value) {
+    return value === "responsive"
+      ? "Responsive · 延迟回退 / 及时入队"
+      : value === "conservative"
+        ? "Conservative · 保守调度"
+        : "历史控制策略未记录";
+  }
   function policyLabel(run) {
     const variant = policyVariant(run);
     if (variant === "pir2") {
@@ -376,6 +399,7 @@
     descriptor,
     resolvedSchedule = undefined,
     resolvedPolicy = undefined,
+    resolvedController = undefined,
   ) {
     if (
       run.id !== descriptor.id ||
@@ -385,6 +409,11 @@
       return false;
     if (run.kind !== "deployment") return true;
     const expected = deploymentSchedule(descriptor);
+    const controller = controllerPolicy(run),
+      declaredController = controllerPolicy(descriptor);
+    const explicitController =
+      Object.hasOwn(descriptor, "deployment_scheduling_policy") ||
+      Object.hasOwn(descriptor.controller_identity ?? {}, "policy");
     const policy = policyVariant(run),
       declaredPolicy = policyVariant(descriptor);
     const explicitPolicy =
@@ -392,6 +421,10 @@
       Object.hasOwn(descriptor.policy_identity ?? {}, "variant") ||
       declaredPolicy != null;
     return (
+      controller !== "invalid" &&
+      declaredController !== "invalid" &&
+      (!explicitController || controller === declaredController) &&
+      (resolvedController === undefined || controller === resolvedController) &&
       policy !== "invalid" &&
       declaredPolicy !== "invalid" &&
       (!explicitPolicy || policy === declaredPolicy) &&
@@ -465,12 +498,14 @@
     cadence,
     coupling = "asynchronous",
     schedule = undefined,
+    controller = undefined,
   ) {
     return descriptors.filter(
       (run) =>
         run.kind === kind &&
         (kind !== "deployment" ||
-          (deploymentCadence(run) === cadence &&
+          ((controller === undefined || controllerPolicy(run) === controller) &&
+            deploymentCadence(run) === cadence &&
             deploymentCoupling(run) === coupling &&
             (!isFullPolicyAsync(run) || deploymentSchedule(run) != null) &&
             (schedule === undefined ||
@@ -613,6 +648,8 @@
     deploymentCoupling,
     policyVariant,
     policyLabel,
+    controllerPolicy,
+    controllerLabel,
     policyNote,
     deploymentSchedule,
     isFullPolicyAsync,

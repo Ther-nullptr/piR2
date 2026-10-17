@@ -188,3 +188,30 @@ so these historical rows are excluded from Clean P50/P95. Their own raw request
 wall/output remains viewable. Historical profile aggregates without request
 annotations stay in `profile_summary`; the importer never converts them into a
 per-request kernel timeline.
+
+
+### Controller policy and publication evidence
+
+Deployment runs/catalog descriptors retain `deployment_scheduling_policy` and
+`controller_identity`, separate from the model's `policy_variant`. The global
+controller selector binds conservative/responsive across precision cards;
+per-card choices remain recorded clock conditions. SSE replacements must retain
+the selected controller, model and K/D cohort. Historical traces can prove
+conservative through recorded `adaptive_nondecreasing`/fixed delay policy;
+otherwise policy stays null and the UI labels it unknown.
+
+Cached-worker S1 requests carry derived `publication` evidence joined from raw
+`request_completed` and `action_adopted` counters. A result read is distinct from
+installed, expired and protected actions. Execution uses the exact
+`control_tick.executed_slot.producer_request_tick` with producer kind `request`;
+bootstrap/fallback never acquire a request by temporal proximity. Missing
+legacy counts or incomplete execution coverage remain unknown. The timeline
+separates RPC ready awaiting the controller, queued awaiting a valid tick,
+partial/executed, discarded, and final unused results. Zero-installed results
+are never labelled adopted. Valid intervals, committed prefixes and recorded
+delay decisions remain inspectable with source evidence.
+
+Between-tick changes use recorded `publication_snapshots`, never inferred buffer
+state. Terminal RPC completion can extend the inference drain timeline beyond
+`controlled_end_s`; robot media still holds its own recorded terminal frame.
+The original trace files and RPC/GPU timing boundaries remain unchanged.

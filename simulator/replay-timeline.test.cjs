@@ -707,3 +707,55 @@ test("one recorded complete cycle anchors execution history without estimating a
     T.viewport(cursor, 0.56, 0.3),
   );
 });
+
+test("result read is distinct from publication and exact execution", () => {
+  const block = {
+    start: 0,
+    end: 0.02,
+    stage: "action",
+    basis: "rpc",
+    adopted: 0.03,
+    status: "completed",
+    publication: {
+      status: "discarded",
+      processed_s: 0.03,
+      installed_slots: 0,
+      expired_slots: 1,
+      protected_slots: 0,
+      executions: [],
+      executed_slots: 0,
+    },
+  };
+  assert.equal(T.phase(block, 0.025).key, "ready");
+  assert.equal(T.phase(block, 0.04).key, "discarded");
+  assert.doesNotMatch(T.phase(block, 0.04).label, /已接纳/);
+  block.publication = {
+    ...block.publication,
+    status: "installed",
+    installed_slots: 2,
+    expired_slots: 1,
+    executions: [
+      { tick: 3, applied_s: 0.15 },
+      { tick: 4, applied_s: 0.2 },
+    ],
+    executed_slots: 2,
+  };
+  assert.equal(T.phase(block, 0.04).key, "queued");
+  assert.equal(T.phase(block, 0.16).key, "partial");
+  assert.equal(T.phase(block, 0.21).key, "executed");
+  block.publication = {
+    ...block.publication,
+    status: "unused_final",
+    processed_s: null,
+  };
+  assert.equal(T.phase(block, 0.21).key, "unused");
+  block.publication = {
+    ...block.publication,
+    status: "unknown",
+    processed_s: 0.03,
+    installed_slots: null,
+  };
+  assert.equal(T.phase(block, 0.04).key, "unknown");
+  delete block.publication;
+  assert.equal(T.phase(block, 0.04).key, "unknown");
+});

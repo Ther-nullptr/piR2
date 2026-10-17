@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 from coexecution.libero.features import validate_feature_options
 from coexecution.libero.scheduling import (
+    validate_deployment_scheduling_policy,
     validate_execution_clock,
     validate_vision_max_hz,
 )
@@ -161,6 +162,23 @@ def validate_plan(plan):
                     variant=case["variant"],
                 )
             )
+            validate_deployment_scheduling_policy(
+                case.get(
+                    "deployment_scheduling_policy",
+                    plan.get("deployment_scheduling_policy", "conservative"),
+                ),
+                protocol=protocol,
+                variant=case["variant"],
+                execution_coupling=case.get(
+                    "execution_coupling", plan.get("execution_coupling", "asynchronous")
+                ),
+                execution_clock=case.get(
+                    "execution_clock", plan.get("execution_clock", "paced")
+                ),
+                fixed_delay=case.get(
+                    "deployment_fixed_delay", plan.get("deployment_fixed_delay")
+                ),
+            )
             validate_execution_clock(
                 case.get("execution_clock", plan.get("execution_clock", "paced")),
                 protocol=protocol,
@@ -237,6 +255,11 @@ def build_commands(plan, case, protocol, output):
     if protocol == "deployment":
         deployment_controls.extend(
             [
+                "--deployment-scheduling-policy",
+                case.get(
+                    "deployment_scheduling_policy",
+                    plan.get("deployment_scheduling_policy", "conservative"),
+                ),
                 "--execution-clock",
                 case.get("execution_clock", plan.get("execution_clock", "paced")),
                 "--execution-coupling",

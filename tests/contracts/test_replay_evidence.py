@@ -1079,3 +1079,162 @@ def test_known_config_missing_instrumentation_never_builds_comparison_keys(tmp_p
         assert row["comparison_key"] is None
         assert row["difference_from_bf16"] is None
         assert row["output"]["status"] == "recorded"
+
+
+@pytest.mark.parametrize(
+    "installed, expired, protected",
+    [(0, 1, 0), (0, 0, 1), (1, 1, 0), (2, 0, 0), (None, None, None)],
+)
+def test_publication_counts_are_independent_from_read_and_exact_execution(
+    installed, expired, protected
+):
+    from coexecution.replay import policy
+
+    assert hasattr(policy, "attach_publication_evidence")
+    counts = {
+        "installed_slots": installed,
+        "expired_slots": expired,
+        "protected_slots": protected,
+    }
+    events = [
+        {
+            "kind": "request_completed",
+            "t_s": 10.03,
+            "consumed_at_tick": 1,
+            **counts,
+            "audit": {"request_tick": 0, "valid_start_tick": 1, "valid_end_tick": 3},
+            "client_timing": {"completed_s": 10.02},
+        },
+        {"kind": "action_adopted", "t_s": 10.03, "request_tick": 0, **counts},
+        {
+            "kind": "control_tick",
+            "t_s": 10.05,
+            "tick": 1,
+            "executed_slot": {
+                "producer_kind": "request" if installed else "fallback",
+                "producer_request_tick": 0,
+            },
+        },
+    ]
+    events.append(
+        {
+            "kind": "control_tick",
+            "t_s": 10.0,
+            "tick": 0,
+            "executed_slot": {"producer_kind": "bootstrap"},
+        }
+    )
+    original = deepcopy(events)
+    queue = {"requests": [{"role": "S1", "request_tick": 0}]}
+    policy.attach_publication_evidence(events, queue, 10)
+    value = queue["requests"][0]["publication"]
+    assert value["installed_slots"] == installed
+    assert value["expired_slots"] == expired
+    assert value["protected_slots"] == protected
+    assert value["executed_slots"] == (1 if installed else 0)
+    assert value["processed_s"] == pytest.approx(0.03)
+    assert value["rpc_completed_s"] == pytest.approx(0.02)
+    assert value["status"] == (
+        "unknown" if installed is None else "installed" if installed else "discarded"
+    )
+    assert events == original
+
+
+def test_unused_and_missing_execution_evidence_stay_distinct_from_zero():
+    from coexecution.replay import policy
+
+    assert hasattr(policy, "attach_publication_evidence")
+    events = [
+        {
+            "kind": "unused_result_at_episode_end",
+            "t_s": 10.4,
+            "audit": {"request_tick": 2},
+            "client_timing": {"completed_s": 10.3},
+        },
+        {"kind": "control_tick", "t_s": 10.1, "tick": 0},
+    ]
+    queue = {"requests": [{"role": "S1", "request_tick": 2}]}
+    policy.attach_publication_evidence(events, queue, 10)
+    value = queue["requests"][0]["publication"]
+    assert value["status"] == "unused_final"
+    assert value["installed_slots"] is None
+    assert value["executed_slots"] is None
+    assert value["processed_s"] is None
+
+
+def test_controller_identity_records_unknown_legacy_and_rejects_mixed_policy():
+    from coexecution.replay import policy
+
+    assert hasattr(policy, "controller_identity")
+    assert policy.controller_identity({})["policy"] is None
+    assert (
+        policy.controller_identity({}, {"delay_policy": "adaptive_nondecreasing"})[
+            "policy"
+        ]
+        == "conservative"
+    )
+    assert (
+        policy.controller_identity({"deployment_scheduling_policy": "responsive"})[
+            "policy"
+        ]
+        == "responsive"
+    )
+    with pytest.raises(ValueError, match="controller"):
+        policy.controller_identity(
+            {"deployment_scheduling_policy": "responsive"},
+            {"deployment_scheduling_policy": "conservative"},
+        )
+
+
+def test_replay_uses_recorded_lowering_publication_snapshot_and_real_drain():
+    from coexecution.replay import policy
+
+    queue = {
+        "requests": [{"role": "S1", "request_tick": 0}],
+        "delay_transitions": [],
+        "work_end_s": 10.1,
+    }
+    snapshot = {"committed_until": 1, "slots": [{"tick": 1}]}
+    decision = {
+        "kind": "delay_policy_decision",
+        "t_s": 10.025,
+        "request_tick": 0,
+        "previous_delay_ticks": 3,
+        "chosen_delay_ticks": 2,
+        "reason": "lower_full_window_hysteresis",
+    }
+    events = [
+        decision,
+        {
+            "kind": "request_completed",
+            "t_s": 10.025,
+            "installed_slots": 1,
+            "audit": {"request_tick": 0},
+            "action_buffer": snapshot,
+            "action_buffer_phase": "after_publication_before_next_tick",
+            "client_timing": {"completed_s": 10.02},
+        },
+        {"kind": "vision_request", "t_s": 10.2, "completed_s": 10.2},
+    ]
+    policy.attach_publication_evidence(events, queue, 10)
+    assert queue["delay_transitions"][0]["after"] == 2
+    assert queue["delay_policy_decisions"][0]["reason"] == decision["reason"]
+    assert queue["publication_snapshots"][0]["action_buffer"] == snapshot
+    assert queue["work_end_s"] == 10.2
+
+
+def test_omitted_execution_tick_does_not_claim_a_known_zero():
+    from coexecution.replay.policy import attach_publication_evidence
+
+    events = [
+        {
+            "kind": "control_tick",
+            "t_s": 10.1,
+            "tick": 2,
+            "executed_slot": {"producer_kind": "bootstrap"},
+        },
+        {"kind": "control_end", "t_s": 10.2, "control_steps": 3},
+    ]
+    queue = {"requests": [{"role": "S1", "request_tick": 0}]}
+    attach_publication_evidence(events, queue, 10)
+    assert queue["requests"][0]["publication"]["executed_slots"] is None

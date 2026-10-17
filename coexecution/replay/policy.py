@@ -319,3 +319,198 @@ def pir2_episode_evidence(events, metadata, queue, identity=None):
             "records": vision,
         },
     }
+
+
+def controller_identity(config, *records):
+    """Separate controller scheduling from model identity; never infer by label."""
+    claims, bases = [], []
+    for index, record in enumerate((config, *records)):
+        explicit = record.get("deployment_scheduling_policy")
+        delay = record.get("delay_policy", record.get("action_delay_policy"))
+        inferred = (
+            "responsive"
+            if delay == "responsive_rolling_p95"
+            else "conservative"
+            if delay in ("adaptive_nondecreasing", "fixed", "one_step_committed")
+            else None
+        )
+        for value in (explicit, inferred):
+            if value is not None:
+                if value not in ("conservative", "responsive"):
+                    raise ValueError("Invalid controller policy")
+                claims.append(value)
+        if explicit is not None:
+            bases.append("configuration" if index == 0 else "recorded_controller")
+        elif inferred is not None:
+            bases.append("recorded_delay_policy")
+    return {
+        "policy": _consistent(claims, "controller"),
+        "basis": sorted(set(bases)) or ["legacy_unspecified"],
+    }
+
+
+def attach_publication_evidence(events, queue, origin_s):
+    """Join raw read/publication counts and exact executed-slot ownership.
+
+    This creates derived replay fields only. Legacy action_adopted is a result
+    read marker, not proof of installed actions. Missing counters remain null.
+    """
+    result_rows = [
+        r
+        for r in events
+        if r.get("kind") in ("request_completed", "unused_result_at_episode_end")
+    ]
+    results = _unique(
+        result_rows,
+        lambda r: r.get("audit", {}).get("request_tick"),
+        "publication result",
+    )
+    adopted = _unique(
+        [r for r in events if r.get("kind") == "action_adopted"],
+        lambda r: r.get("request_tick"),
+        "publication read",
+    )
+    submitted = _unique(
+        [r for r in events if r.get("kind") == "action_submitted"],
+        lambda r: r.get("request_tick"),
+        "publication submission",
+    )
+    executions = {}
+    ticks = [r for r in events if r.get("kind") == "control_tick"]
+    control_end = next((r for r in events if r.get("kind") == "control_end"), {})
+    controlled_end = control_end.get("t_s", origin_s + queue.get("duration_s", 0))
+    execution_complete = (
+        bool(ticks)
+        and sorted(r["tick"] for r in ticks) == list(range(len(ticks)))
+        and control_end.get("control_steps", len(ticks)) == len(ticks)
+    )
+    for tick in ticks:
+        slot = tick.get("executed_slot") or {}
+        kind, producer = slot.get("producer_kind"), slot.get("producer_request_tick")
+        if kind not in ("bootstrap", "fallback", "request") or (
+            kind == "request" and type(producer) is not int
+        ):
+            execution_complete = False
+        if kind == "request" and type(producer) is int:
+            executions.setdefault(producer, []).append(
+                {
+                    "tick": tick["tick"],
+                    "applied_s": tick.get("applied_s", tick["t_s"]) - origin_s,
+                }
+            )
+
+    def relative(value):
+        from .schema import optional_number
+
+        value = optional_number(value)
+        return value - origin_s if value is not None else None
+
+    snapshots = []
+    for request in queue.get("requests", []):
+        if request.get("role") != "S1":
+            continue
+        key = request.get("request_tick")
+        result, read, submission = (
+            results.get(key, {}),
+            adopted.get(key, {}),
+            submitted.get(key, {}),
+        )
+        audit, timing = result.get("audit", {}), result.get("client_timing", {})
+        unused = result.get("kind") == "unused_result_at_episode_end"
+        counters = {}
+        for field in ("installed_slots", "expired_slots", "protected_slots"):
+            value = _consistent(
+                [result.get(field), read.get(field)], "publication " + field
+            )
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("Invalid publication counter")
+            counters[field] = value
+        installed = counters["installed_slots"]
+        status = (
+            "unused_final"
+            if unused
+            else "unknown"
+            if installed is None
+            else "installed"
+            if installed > 0
+            else "discarded"
+        )
+        processed = (
+            None
+            if unused
+            else relative(
+                result.get("controller_processed_s", result.get("t_s", read.get("t_s")))
+            )
+        )
+        actual = sorted(executions.get(key, []), key=lambda r: r["tick"])
+        prefix = {
+            "start_tick": submission.get("committed_start_tick"),
+            "end_tick": submission.get("committed_end_tick"),
+        }
+        request["publication"] = {
+            **counters,
+            "status": status,
+            "unused_at_s": relative(result.get("t_s")) if unused else None,
+            "control_end_s": relative(control_end.get("t_s")),
+            "processed_s": processed,
+            "controller_ready_observed_s": relative(
+                result.get("controller_ready_observed_s")
+            ),
+            "rpc_completed_s": relative(timing.get("completed_s")),
+            "next_unexecuted_tick": result.get(
+                "consumed_at_tick", read.get("adopted_at_tick")
+            ),
+            "valid_start_tick": audit.get(
+                "valid_start_tick", read.get("valid_start_tick")
+            ),
+            "valid_end_tick": audit.get("valid_end_tick", read.get("valid_end_tick")),
+            "committed_prefix": prefix
+            if all(v is not None for v in prefix.values())
+            else None,
+            "executed_slots": len(actual) if execution_complete else None,
+            "executions": actual,
+            "execution_evidence_complete": execution_complete,
+            "delay_policy_decision": result.get("delay_policy_decision"),
+            "basis": "raw request_completed/action_adopted counters; exact control_tick.executed_slot producer",
+        }
+        if result.get("action_buffer") is not None and processed is not None:
+            snapshots.append(
+                {
+                    "t": processed,
+                    "request_tick": key,
+                    "next_unexecuted_tick": result.get("consumed_at_tick"),
+                    "action_buffer": result["action_buffer"],
+                    "phase": result.get("action_buffer_phase"),
+                    "basis": "recorded controller publication snapshot",
+                }
+            )
+    queue["publication_snapshots"] = sorted(snapshots, key=lambda r: r["t"])
+    decisions = [
+        {**r, "t": r["t_s"] - origin_s}
+        for r in events
+        if r.get("kind") == "delay_policy_decision"
+    ]
+    queue["delay_policy_decisions"] = sorted(decisions, key=lambda r: r["t"])
+    if decisions:
+        queue["delay_transitions"] = [
+            {**r, "before": r["previous_delay_ticks"], "after": r["chosen_delay_ticks"]}
+            for r in queue["delay_policy_decisions"]
+        ]
+    # The robot stops at control_end. Completed terminal RPCs retain their real
+    # wall endpoints in a separate drain tail; controlled metrics are unchanged.
+    completed = [
+        relative(r.get("completed_s"))
+        for r in events
+        if r.get("kind") in ("vision_request", "action_completed")
+    ] + [relative(r.get("client_timing", {}).get("completed_s")) for r in result_rows]
+    work_end = max(
+        [
+            queue.get("work_end_s", controlled_end),
+            *[origin_s + value for value in completed if value is not None],
+        ]
+    )
+    queue.update(
+        work_end_s=work_end,
+        work_duration_s=work_end - origin_s,
+        terminal_drain_s=max(0, work_end - controlled_end),
+    )

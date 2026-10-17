@@ -811,3 +811,23 @@ def test_one_step_preflight_requires_readable_native_processor(plan, tmp_path):
     (Path(plan["conditions"][0]["checkpoint"]) / "processor_config.json").unlink()
     with pytest.raises(ValueError, match="decoded action horizon"):
         m.validate_launch_paths(plan)
+
+
+def test_responsive_plan_global_and_condition_identity(plan):
+    plan["deployment_scheduling_policy"] = "responsive"
+    for case in plan["conditions"]:
+        case["variant"] = "pir2"
+        case["flags"] = []
+    plan["conditions"][1]["deployment_scheduling_policy"] = "conservative"
+    module().validate_plan(plan)
+    for case, expected in zip(
+        plan["conditions"], ("responsive", "conservative"), strict=True
+    ):
+        command = module().build_commands(plan, case, "deployment", Path("/out"))[
+            "evaluate"
+        ]
+        assert "--deployment-scheduling-policy" in command
+        assert command[command.index("--deployment-scheduling-policy") + 1] == expected
+    plan["conditions"][0]["deployment_fixed_delay"] = 1
+    with pytest.raises(ValueError, match="Responsive"):
+        module().validate_plan(plan)

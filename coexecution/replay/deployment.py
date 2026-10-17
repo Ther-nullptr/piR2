@@ -4,7 +4,12 @@ from pathlib import Path
 
 from coexecution.queue_report import summarize_episode
 
-from .policy import pir2_episode_evidence, policy_identity
+from .policy import (
+    attach_publication_evidence,
+    controller_identity,
+    pir2_episode_evidence,
+    policy_identity,
+)
 from .schema import (
     PRECISIONS,
     VERSION,
@@ -394,6 +399,7 @@ def deployment_run(root, media):
     ):
         raise ValueError("Unknown deployment execution coupling")
     metadata = read_jsonl(root / "episodes.jsonl")
+    controller_records = []
     run_id = "deployment-" + digest(str(root))[:20]
     episodes, identities = [], set()
     provenance = [
@@ -452,6 +458,9 @@ def deployment_run(root, media):
                 }
             )
             continue
+        controller_records.extend(
+            (episode, episode.get("service_controls", {}), begin[0])
+        )
         start, stop = interval(begin[0]["t_s"], end[0]["t_s"])
         ticks = sorted(
             (dict(row) for row in events if row.get("kind") == "control_tick"),
@@ -481,6 +490,8 @@ def deployment_run(root, media):
                 row["request_id"] = model_request_id
             previous_applied = applied
         queue = summarize_episode(events, episode)
+        if execution_coupling == "asynchronous":
+            attach_publication_evidence(events, queue, start)
         policy_evidence = (
             pir2_episode_evidence(events, episode, queue, policy)
             if policy["variant"] == "pir2"
@@ -559,6 +570,7 @@ def deployment_run(root, media):
                 "robot": robot,
             }
         )
+    controller = controller_identity(config, *controller_records)
     schedule = _deployment_schedule(config, episodes, execution_coupling)
     return {
         "schema": "pir2.replay.run",
@@ -568,6 +580,8 @@ def deployment_run(root, media):
         "execution_clock": execution_clock,
         "execution_coupling": execution_coupling,
         "policy_variant": policy["variant"],
+        "deployment_scheduling_policy": controller["policy"],
+        "controller_identity": controller,
         "policy_identity": policy,
         **schedule,
         "label": root.parent.name,

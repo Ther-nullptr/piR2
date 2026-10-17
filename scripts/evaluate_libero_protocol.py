@@ -352,6 +352,12 @@ def build_parser():
         help="Deployment: cap scored VLM admissions; zero keeps unlimited admission",
     )
     parser.add_argument(
+        "--deployment-scheduling-policy",
+        choices=("conservative", "responsive"),
+        default="conservative",
+        help="Deployment piR2: opt into bounded delay recovery and prompt result publication",
+    )
+    parser.add_argument(
         "--deployment-fixed-delay",
         type=int,
         choices=range(1, 6),
@@ -365,11 +371,20 @@ def validate_deployment_controls(args):
 
     from coexecution.libero.features import validate_feature_options
     from coexecution.libero.scheduling import (
+        validate_deployment_scheduling_policy,
         validate_execution_clock,
         validate_vision_max_hz,
     )
     from coexecution.libero.synchronous import validate_synchronous_controls
 
+    validate_deployment_scheduling_policy(
+        getattr(args, "deployment_scheduling_policy", "conservative"),
+        protocol=args.protocol,
+        variant=args.variant,
+        execution_coupling=getattr(args, "execution_coupling", "asynchronous"),
+        execution_clock=getattr(args, "execution_clock", "paced"),
+        fixed_delay=args.deployment_fixed_delay,
+    )
     validate_synchronous_controls(args)
     validate_execution_clock(
         getattr(args, "execution_clock", "paced"),
@@ -639,9 +654,15 @@ def main():
             "fallback": "zero Cartesian delta; retain last committed gripper",
             "flow_publication": "all native clean positions after committed prefix",
             "pir2_publication": "only next clean delay-sized segment",
+            "deployment_scheduling_policy": args.deployment_scheduling_policy,
+            "controller_result_ingestion": "controller-only during pacing after atomic step; callback signals only; no early sensor release or S1 submission"
+            if args.deployment_scheduling_policy == "responsive"
+            else "at physical tick boundary",
             "action_delay_budget": (
                 "fixed bootstrap and control delay; misses and expired/protected slots still recorded"
                 if args.deployment_fixed_delay is not None
+                else "solo calibrated initial d; completed RPC rolling8 P95+5ms; lower one tick after3 full-window supports; raise on deadline miss including dispatch lateness; clamp1..5"
+                if args.deployment_scheduling_policy == "responsive"
                 else "calibratedp95 plus5ms, nondecreasing within episode, maximum5ticks"
             ),
             "service_floor_contract": {

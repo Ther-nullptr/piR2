@@ -40,6 +40,7 @@ def main():
         "tests/contracts/test_replay_stream.py",
         "tests/contracts/test_runtime_receipt.py",
         "tests/contracts/test_libero_experiments.py",
+        "tests/contracts/test_responsive_scheduling.py",
         "tests/contracts/test_synchronous_execution.py",
         "tests/contracts/test_one_step_async.py",
         "tests/contracts/test_chunked_async.py",

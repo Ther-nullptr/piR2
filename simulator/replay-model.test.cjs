@@ -563,3 +563,63 @@ test("metric scaling preserves missing values while keeping measured zero", () =
   assert.equal(R.scaleMetric(0.25, 100), 25);
   assert.equal(R.scaleMetric(Number.MAX_VALUE, 1000), null);
 });
+
+test("controller policy is a bound cohort dimension across precision and SSE", () => {
+  assert.equal(typeof R.controllerPolicy, "function");
+  const descriptor = {
+    id: "b",
+    kind: "deployment",
+    precision: "bf16",
+    policy_variant: "pir2",
+    deployment_scheduling_policy: "responsive",
+  };
+  const other = {
+    ...descriptor,
+    id: "w",
+    precision: "w8a8",
+    deployment_scheduling_policy: "conservative",
+  };
+  assert.deepEqual(
+    R.replayDescriptors(
+      [descriptor, other],
+      "deployment",
+      "paced",
+      "asynchronous",
+      null,
+      "responsive",
+    ),
+    [descriptor],
+  );
+  assert.equal(
+    R.matchesDescriptor(
+      { ...descriptor },
+      descriptor,
+      null,
+      "pir2",
+      "responsive",
+    ),
+    true,
+  );
+  assert.equal(
+    R.matchesDescriptor(
+      { ...descriptor, deployment_scheduling_policy: "conservative" },
+      descriptor,
+      null,
+      "pir2",
+      "responsive",
+    ),
+    false,
+  );
+  const legacy = { id: "old", kind: "deployment", precision: "bf16" };
+  assert.equal(R.controllerPolicy(legacy), null);
+  assert.equal(
+    R.matchesDescriptor(
+      { ...legacy, deployment_scheduling_policy: "responsive" },
+      legacy,
+      null,
+      undefined,
+      null,
+    ),
+    false,
+  );
+});

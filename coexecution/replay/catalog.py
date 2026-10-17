@@ -128,6 +128,10 @@ def build_catalog(
                         "execution_prefix_steps": run["execution_prefix_steps"],
                         "async_overlap_steps": run["async_overlap_steps"],
                         "policy_variant": run["policy_variant"],
+                        "deployment_scheduling_policy": run[
+                            "deployment_scheduling_policy"
+                        ],
+                        "controller_identity": run["controller_identity"],
                     }
                     if run["kind"] == "deployment"
                     else {}

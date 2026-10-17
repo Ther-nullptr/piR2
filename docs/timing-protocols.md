@@ -96,7 +96,7 @@ Measured queue traces retain the existing `control_tick`, `request_completed`, `
 | `vision_started`, `feature_published` | In-flight frame ownership and feature availability; publication records `feature_sequence`, actual publish `t_s`, and separate `rpc_completed_s` |
 | `camera_queue` | Waiting/in-flight ticks and capture times, plus the asynchronous worker's published feature sequence/source/capture time |
 | `action_submitted`, `action_started`, `action_completed` | Request lifecycle keyed by `request_tick`; every stage records state and selected/consumed feature dependencies; completion uses the server's actual cache audit |
-| `action_adopted` | Controller tick accepting a result, including installed, expired and protected slot counts |
+| `action_adopted` | Compatibility result-processing marker, including installed, expired and protected slot counts; zero installed is not adoption |
 | `control_tick.executed_slot` | Producer metadata for the command just applied |
 | `control_tick.action_buffer` | Detached remaining-slot ownership after execution, with `committed_until` and `slots` |
 
@@ -107,6 +107,51 @@ Strict timing validity requires mean frequency within 2% of 20Hz, maximum contro
 The local LIBERO wrapper clears accumulated object-property samplers before hard model reload. This fixes non-reproducible fixture placement without changing task success predicates. Actual fixture-model, settled simulator-state and initial RGB hashes are compared across methods, rather than assuming seed/init-state equality suffices.
 
 Artifacts are generated below `artifacts/libero-protocols/<label>/`: per-condition config, episodes, traces and summary; stage comparison, initial-condition audit and report. They remain local. The publication checkout extracts two unchanged observation/video helpers from the obsolete evaluator into `libero_observations.py`; implementation hashes therefore differ from earlier live-workspace runs. Do not relabel those older results as a rerun of this publication checkout.
+
+## Responsive πR² scheduling (opt in)
+
+`--deployment-scheduling-policy conservative` remains the default. It keeps
+calibrated, nondecreasing d and tick-boundary result ingestion.
+`--deployment-scheduling-policy responsive` is available only for deployment
+πR² with cached asynchronous workers, paced physics and no fixed-delay override.
+Experiment plans accept `deployment_scheduling_policy` globally or per condition;
+a condition overrides the plan. Configuration, resume identity, episode metadata
+and `service_controls` retain the choice. Flow, ready, synchronous and complete
+policy lookahead modes keep their existing schedules.
+
+Responsive keeps the existing solo initial calibration. Each episode starts a
+fresh window of the last eight valid completed end-to-end S1 request durations
+(`completed_s - submitted_s`, including executor queue, cache install and RPC).
+P95 uses linear interpolation at `(n - 1) * 0.95`. The target is
+`ceil((P95_seconds + 0.005) / physical_period_seconds)`, clamped to 1..5 ticks.
+Only a full window can support a decrease; three consecutive observations with
+a target below current d decrease d by exactly one tick, then reset that streak.
+Invalid/nonfinite/negative samples are excluded and reset the lowering streak.
+A deadline miss raises immediately to the maximum of current d + 1, the latest
+request duration budget, and the completion budget measured from the request's
+scheduled physical boundary, all clamped to five. The last term includes launch
+lateness. Requirements beyond five remain explicit over-training-budget flags.
+
+A completed Future signals an Event only. The controller can ingest the result
+during idle pacing after the current atomic `env.step`; publication uses the
+next unexecuted physical tick. Waiting never extends beyond the next physical
+deadline. Sensors are still released at physical ticks, and new S1 requests are
+submitted only at ticks at or after the previous backend anchor `r + old_d`.
+No in-flight work is cancelled, no output valid interval is retimed, and no
+committed prefix is overwritten. A reduced d changes only later requests and
+their newly reserved prefix; ordinary πR² DiT NFE remains unchanged. Terminal
+results are drained as unused without publication after termination detection.
+
+`delay_policy_decision` records each sample window, candidate/chosen budgets,
+lowering streak, reason and over-budget flag. `request_completed` records
+`rpc_completed_s`, `controller_ready_observed_s`, `controller_processed_s`,
+publication counts and the actual post-publication buffer snapshot. Legacy
+`action_adopted` remains a compatibility read marker, including zero-installed
+results. Recorded-completion-to-processing and recorded-completion-to-first-execution are separate:
+earlier insertion may leave the first execution tick unchanged. Host-only
+contracts verify scheduling and accounting; success and real-time quality need
+matched conservative/responsive LIBERO closed-loop runs on the same checkpoint,
+fixtures, hardware clocks and precision settings.
 
 ## Controlled completion-release experiments
 
@@ -157,7 +202,7 @@ python scripts/evaluate_libero_protocol.py \
 
 The action floor starts at submission and includes worker queueing, feature installation and the real plan RPC. The vision floor starts at its worker RPC timestamp. Calibration uses the same floors; fixed d changes bootstrap and runtime scheduling while retaining deadline misses and per-slot rejection accounting. An over-target raw request is released without additional waiting, with `floor_miss` and raw/total overrun recorded. No extra model forward is introduced.
 
-`raw_completed_s` and `raw_service_seconds` precede the hold. `released_s`/`completed_s` are timestamps recorded just after the hold, **before** metadata recording, Future completion or the VLM publication lock. They are not exact consumer-visible availability timestamps. Use `feature_published` for cache visibility and `action_adopted` for actual controller adoption; S1 Future completion is not separately timestamped. `added_wait_seconds` includes bookkeeping and scheduling as well as sleeping.
+`raw_completed_s` and `raw_service_seconds` precede the hold. `released_s`/`completed_s` are timestamps recorded just after the hold, **before** metadata recording, Future completion or the VLM publication lock. They are not exact consumer-visible availability timestamps. Use `feature_published` for cache visibility. `action_adopted` records controller processing; its `installed_slots` proves enqueueing, and exact `control_tick.executed_slot` producer evidence proves execution. New traces additionally record `controller_ready_observed_s` and `controller_processed_s`; `rpc_completed_s` preserves the client recorded completion/release boundary (`client_timing.completed_s`). The actual S1 Future completion instant remains unmeasured; observing readiness does not timestamp when the Future first became done. `added_wait_seconds` includes bookkeeping and scheduling as well as sleeping.
 
 This intervention controls a minimum recorded release duration, not raw GPU computation, GPU frequency, or a hardware/quantization speedup. Sleeping releases CPU/GPU execution resources, so its contention pattern differs from slowing down an executing GPU kernel. Report raw and recorded-release durations, floor overruns, actual clocks, control validity, source lineage and AoI coverage separately. Failed or timing-invalid attempts remain evidence and do not silently increase paired-repeat counts.
 

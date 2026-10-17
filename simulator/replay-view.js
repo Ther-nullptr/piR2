@@ -35,6 +35,8 @@
     cohortSchedule: undefined,
     // Null is a bound unknown policy, never permission to mix policy variants.
     cohortPolicy: undefined,
+    controllerPolicy: null,
+    cohortController: undefined,
     type: "clean",
     scope: "prepared_model",
     precision: "all",
@@ -136,6 +138,36 @@
     );
     state.executionClock = $("execution-clock").value || "paced";
   }
+  function configureControllers(
+    preferred = state.controllerPolicy,
+    preserve = false,
+  ) {
+    const choices = [
+      ...new Set(
+        R.replayDescriptors(
+          state.descriptors.length ? state.descriptors : state.runs,
+          "deployment",
+          state.executionClock,
+          state.executionCoupling,
+        ).map(R.controllerPolicy),
+      ),
+    ].filter((v) => v !== "invalid");
+    if (preserve && !choices.includes(preferred)) choices.unshift(preferred);
+    const selected = choices.includes(preferred)
+      ? preferred
+      : choices.includes("conservative")
+        ? "conservative"
+        : (choices[0] ?? null);
+    options(
+      $("controller-policy"),
+      choices.map((v) => [v ?? "unknown", R.controllerLabel(v)]),
+      selected ?? "unknown",
+    );
+    state.controllerPolicy =
+      $("controller-policy").value === "unknown"
+        ? null
+        : $("controller-policy").value || null;
+  }
   function configureSchedules(preferred = state.schedule) {
     const choices = R.scheduleChoices(
       state.descriptors.length ? state.descriptors : state.runs,
@@ -169,6 +201,7 @@
       state.executionClock,
       state.executionCoupling,
       state.schedule,
+      state.controllerPolicy,
     );
   }
   const notice = (value, bad = false) => {
@@ -213,13 +246,14 @@
         descriptor,
         state.cohortSchedule,
         state.cohortPolicy,
+        state.cohortController,
       )
     )
       return {
         ...descriptor,
         descriptor,
         error:
-          "Run / stream changed the selected precision, K/D schedule or policy variant",
+          "Run / stream changed the selected precision, K/D schedule, model or controller policy",
         episodes: [],
         clean_requests: [],
         profile_requests: [],
@@ -372,6 +406,7 @@
         state.executionClock,
         state.executionCoupling,
         state.schedule,
+        state.controllerPolicy,
       ).filter((descriptor) => descriptor.precision === run.precision);
       if (!descriptors.some((descriptor) => descriptor.id === run.id))
         descriptors.unshift(run.descriptor ?? run);
@@ -412,6 +447,7 @@
         showCatalogMetadata();
         configureCouplings();
         configureCadences();
+        configureControllers(state.controllerPolicy, true);
         configureSchedules();
         const selected = selectedDescriptors();
         const changedSchedule =
@@ -436,6 +472,7 @@
             state.executionClock,
             state.executionCoupling,
             state.schedule,
+            state.controllerPolicy,
           ).length
         ) {
           await loadRuns();
@@ -450,6 +487,7 @@
               state.executionClock,
               state.executionCoupling,
               state.schedule,
+              state.controllerPolicy,
             ).map((run) => run.precision),
           ),
         ];
@@ -480,6 +518,7 @@
     "record-type",
     "execution-clock",
     "execution-coupling",
+    "controller-policy",
     "execution-prefix-steps",
     "async-overlap-steps",
     "scope",
@@ -516,6 +555,7 @@
     state.runs = [];
     state.cohortSchedule = undefined;
     state.cohortPolicy = undefined;
+    state.cohortController = undefined;
     loadingControls(true);
     state.events = [];
     state.selected = null;
@@ -536,6 +576,8 @@
         kind === "deployment" ? state.executionCoupling : null,
       execution_prefix_steps: kind === "deployment" ? state.schedule?.k : null,
       async_overlap_steps: kind === "deployment" ? state.schedule?.d : null,
+      deployment_scheduling_policy:
+        kind === "deployment" ? (state.controllerPolicy ?? "unknown") : null,
     })) {
       if (value == null) url.searchParams.delete(key);
       else url.searchParams.set(key, value);
@@ -547,6 +589,7 @@
         state.executionClock,
         state.executionCoupling,
         state.schedule,
+        state.controllerPolicy,
       ),
       precisions = [...new Set(descriptors.map((d) => d.precision))].sort(
         (a, b) =>
@@ -613,6 +656,9 @@
           .map(R.deploymentSchedule)
           .find((schedule) => schedule != null) ??
         null;
+      state.cohortController = R.controllerPolicy(
+        state.runs.find((run) => !run.error) ?? {},
+      );
       state.cohortPolicy = R.policyVariant(
         state.runs.find((run) => !run.error) ?? {},
       );
@@ -728,6 +774,7 @@
     $("scope-label").hidden = state.kind !== "model";
     $("execution-clock-label").hidden = state.kind !== "deployment";
     $("execution-coupling-label").hidden = state.kind !== "deployment";
+    $("controller-policy-label").hidden = state.kind !== "deployment";
     $("execution-prefix-label").hidden =
       state.kind !== "deployment" || state.executionCoupling === "asynchronous";
     $("async-overlap-label").hidden =
@@ -809,7 +856,7 @@
         (r) => r.episode && R.pairedEpisode(state.rows[0].episode, r.episode),
       );
       $("evidence-note").textContent =
-        `${couplingLabels[state.executionCoupling]} · ${cadenceLabel(state.executionClock)} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
+        `${couplingLabels[state.executionCoupling]} · ${cadenceLabel(state.executionClock)} · ${R.controllerLabel(state.cohortController)} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
         (state.cohortPolicy === "pir2"
           ? ` ${R.policyNote(runs.find((run) => !run.error) ?? {})} 墙钟目标是 t₀ + k×50 ms 执行第 k 步；提前完成的推理等到执行时刻，迟到则保留实测时间。Action execution 画出实际 env.step，Between steps 包含节拍等待和控制开销；50 ms 仿真推进量不等于 env.step 墙钟耗时。`
           : state.executionCoupling === "synchronous"
@@ -952,7 +999,8 @@
                   (state.kind !== "deployment" ||
                     (R.deploymentCadence(d) === state.executionClock &&
                       R.deploymentCoupling(d) === state.executionCoupling &&
-                      R.sameSchedule(R.deploymentSchedule(d), state.schedule))),
+                      R.sameSchedule(R.deploymentSchedule(d), state.schedule) &&
+                      R.controllerPolicy(d) === state.controllerPolicy)),
               )
               .map(
                 (d) =>
@@ -1312,7 +1360,7 @@
         ]);
         metrics.title =
           "实际执行前缀显示该前缀最终计数。当前动作的信息年龄 = 当前控制墙钟游标 − 该已执行命令实际来源的采集时刻；不是执行瞬间的汇总 AoI。回合结束后固定在终止时刻，不虚构后续执行。";
-        details.textContent = `位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · ${lookahead ? `K=${schedule?.k ?? "?"} / D=${schedule?.d ?? "?"} · 来源 obs ${at.tick?.source_tick ?? "未知"} → plan ${at.tick?.target_tick ?? "未知"} · offset ${at.tick?.executed_offset ?? "未知"}` : synchronous ? "每段至多 " + meta.synchronous_chunk_steps + " 步" : (R.deploymentCadence(run) === "ready" ? "承诺步数" : "d") + " " + (queue?.delay ?? "未知")} · 仿真 ${fmt(meta.simulated_elapsed_seconds)} s / 墙钟 ${fmt(meta.controlled_wall_seconds)} s · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
+        details.textContent = `${R.controllerLabel(R.controllerPolicy(run))} · 位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · ${lookahead ? `K=${schedule?.k ?? "?"} / D=${schedule?.d ?? "?"} · 来源 obs ${at.tick?.source_tick ?? "未知"} → plan ${at.tick?.target_tick ?? "未知"} · offset ${at.tick?.executed_offset ?? "未知"}` : synchronous ? "每段至多 " + meta.synchronous_chunk_steps + " 步" : (R.deploymentCadence(run) === "ready" ? "承诺步数" : "d") + " " + (queue?.delay ?? "未知")} · 仿真 ${fmt(meta.simulated_elapsed_seconds)} s / 墙钟 ${fmt(meta.controlled_wall_seconds)} s · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
         action.textContent = at.tick
           ? `检查动作 ${at.tick.tick} · ${at.tick.action?.map((v) => fmt(v, 3)).join(", ")}`
           : "游标前没有已执行命令";
@@ -1415,6 +1463,7 @@
         precision: event.precision,
         tick: event.tick.tick,
         policy_identity: event.run.policy_identity ?? null,
+        controller_identity: event.run.controller_identity ?? null,
         control_wall_s: event.tick.relative_s,
         execution_interval: event.control_interval ?? null,
         env_step_wall_ms: R.finite(event.control_interval?.end_s)
@@ -1439,6 +1488,9 @@
         state_aoi_ms: q?.stateAgeMs,
         cache_aoi_ms: q?.cacheAgeMs,
         slot: event.tick.executed_slot,
+        action_buffer: q?.actionBuffer ?? null,
+        action_buffer_recorded_s: q?.actionBufferTime ?? null,
+        action_buffer_phase: q?.actionBufferPhase ?? null,
         initial_feature:
           event.tick.executed_slot?.producer_kind === "bootstrap"
             ? event.episode.queue?.initial_feature
@@ -1448,6 +1500,7 @@
       data = {
         precision: event.precision,
         policy_identity: event.run.policy_identity ?? null,
+        controller_identity: event.run.controller_identity ?? null,
         request: event.request,
         source: event.run.provenance,
       };
@@ -1470,6 +1523,7 @@
         error: run.error,
         mode: run.mode,
         policy_identity: run.policy_identity ?? null,
+        controller_identity: run.controller_identity ?? null,
         configuration: run.configuration,
         checkpoint: run.checkpoint,
         device: run.device,
@@ -2034,6 +2088,7 @@
     });
     $("execution-clock").addEventListener("change", () => {
       state.executionClock = $("execution-clock").value;
+      configureControllers();
       configureSchedules();
       state.clock = 0;
       state.sample = null;
@@ -2042,7 +2097,17 @@
     $("execution-coupling").addEventListener("change", () => {
       state.executionCoupling = $("execution-coupling").value;
       configureCadences();
+      configureControllers();
       configureSchedules();
+      state.clock = 0;
+      state.sample = null;
+      loadRuns();
+    });
+    $("controller-policy").addEventListener("change", () => {
+      state.controllerPolicy =
+        $("controller-policy").value === "unknown"
+          ? null
+          : $("controller-policy").value;
       state.clock = 0;
       state.sample = null;
       loadRuns();
@@ -2074,6 +2139,7 @@
         state.executionClock,
         state.executionCoupling,
         state.schedule,
+        state.controllerPolicy,
       );
       const missing = descriptors.some(
         (descriptor) =>
@@ -2123,6 +2189,7 @@
           state.kind === "deployment" ? (state.schedule?.k ?? null) : null,
         async_overlap_steps:
           state.kind === "deployment" ? (state.schedule?.d ?? null) : null,
+        deployment_scheduling_policy: state.cohortController,
         record_type: state.type,
         cursor: state.clock,
         cursor_unit: state.kind === "model" ? "ms" : "control_wall_s",
@@ -2198,6 +2265,13 @@
         query.get("execution_clock") ??
           catalog.default_execution_clock ??
           "paced",
+      );
+      configureControllers(
+        query.get("deployment_scheduling_policy") === "unknown"
+          ? null
+          : (query.get("deployment_scheduling_policy") ??
+              catalog.default_deployment_scheduling_policy ??
+              "conservative"),
       );
       const queryInteger = (name, fallback) => {
         const value = query.get(name);
