@@ -496,17 +496,27 @@ def attach_publication_evidence(events, queue, origin_s):
             {**r, "before": r["previous_delay_ticks"], "after": r["chosen_delay_ticks"]}
             for r in queue["delay_policy_decisions"]
         ]
-    # The robot stops at control_end. Completed terminal RPCs retain their real
-    # wall endpoints in a separate drain tail; controlled metrics are unchanged.
+    # The robot stops at control_end. The drain retains both RPC completion
+    # and the later controller observation of terminal-unused work, so the final
+    # disposition remains reachable without extending execution or RPC spans.
     completed = [
         relative(r.get("completed_s"))
         for r in events
         if r.get("kind") in ("vision_request", "action_completed")
     ] + [relative(r.get("client_timing", {}).get("completed_s")) for r in result_rows]
+    terminal_observed = [
+        relative(r.get("t_s"))
+        for r in result_rows
+        if r.get("kind") == "unused_result_at_episode_end"
+    ]
     work_end = max(
         [
             queue.get("work_end_s", controlled_end),
-            *[origin_s + value for value in completed if value is not None],
+            *[
+                origin_s + value
+                for value in (*completed, *terminal_observed)
+                if value is not None
+            ],
         ]
     )
     queue.update(

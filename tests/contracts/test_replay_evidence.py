@@ -1238,3 +1238,31 @@ def test_omitted_execution_tick_does_not_claim_a_known_zero():
     queue = {"requests": [{"role": "S1", "request_tick": 0}]}
     attach_publication_evidence(events, queue, 10)
     assert queue["requests"][0]["publication"]["executed_slots"] is None
+
+
+def test_terminal_unused_observation_extends_drain_without_extending_control():
+    from coexecution.replay.policy import attach_publication_evidence
+
+    events = [
+        {"kind": "control_end", "t_s": 10.1, "control_steps": 0},
+        {
+            "kind": "unused_result_at_episode_end",
+            "t_s": 10.301,
+            "audit": {"request_tick": 0},
+            "client_timing": {"completed_s": 10.3},
+        },
+    ]
+    queue = {
+        "requests": [{"role": "S1", "request_tick": 0}],
+        "duration_s": 0.1,
+        "work_end_s": 10.1,
+    }
+    attach_publication_evidence(events, queue, 10)
+    publication = queue["requests"][0]["publication"]
+    assert queue["work_end_s"] == 10.301
+    assert queue["work_duration_s"] == pytest.approx(0.301)
+    assert queue["terminal_drain_s"] == pytest.approx(0.201)
+    assert publication["unused_at_s"] <= queue["work_duration_s"]
+    assert publication["rpc_completed_s"] == pytest.approx(0.3)
+    assert publication["control_end_s"] == pytest.approx(0.1)
+    assert queue["duration_s"] == 0.1

@@ -759,3 +759,43 @@ test("result read is distinct from publication and exact execution", () => {
   delete block.publication;
   assert.equal(T.phase(block, 0.04).key, "unknown");
 });
+
+test("missing legacy controller-read evidence remains unknown after RPC completion", () => {
+  const block = {
+    start: 0,
+    end: 0.02,
+    stage: "action",
+    basis: "rpc",
+    status: "completed",
+    publication: {
+      status: "unknown",
+      processed_s: null,
+      installed_slots: null,
+      executed_slots: null,
+      executions: [],
+    },
+  };
+  assert.equal(T.phase(block, 0.01).key, "running");
+  const after = T.phase(block, 0.03);
+  assert.equal(after.key, "unknown");
+  assert.match(after.label, /未记录|未知/);
+  assert.doesNotMatch(after.label, /等待控制线程/);
+});
+
+test("terminal-unused state is visible at the actual terminal observation time", () => {
+  const block = {
+    start: 0,
+    end: 0.3,
+    stage: "action",
+    basis: "rpc",
+    status: "completed",
+    publication: {
+      status: "unused_final",
+      unused_at_s: 0.301,
+      control_end_s: 0.1,
+      processed_s: null,
+    },
+  };
+  assert.equal(T.phase(block, 0.3).key, "ready");
+  assert.equal(T.phase(block, 0.301).key, "unused");
+});

@@ -100,6 +100,12 @@
         (!finite(p.unused_at_s) || cursor >= p.unused_at_s)
       )
         return { key: "unused", label: "已完成 · 最终未使用结果", progress: 1 };
+      if (!finite(p.processed_s) && p.status !== "unused_final")
+        return {
+          key: "unknown",
+          label: "RPC 已完成 · 控制线程读取时间未记录",
+          progress: 1,
+        };
       if (!finite(p.processed_s) || cursor < p.processed_s)
         return {
           key: "ready",
