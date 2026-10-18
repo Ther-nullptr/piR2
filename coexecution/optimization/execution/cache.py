@@ -7,6 +7,60 @@ does not synchronize GPU work or make submissions from different streams safe.
 import threading
 
 
+class ProjectionCacheClearer:
+    """Cold-bound group ownership; preserves the ordinary cache release protocol."""
+
+    def __init__(self, groups):
+        self.groups = tuple(groups)
+
+    def __call__(self):
+        for group in self.groups:
+            group._input = group._output = None
+            group._remaining.clear()
+
+
+def projection_cache_clearers(grouped, precision):
+    """Bind one active integer format and one root without hot discovery.
+
+    Every group, including inactive formats, must have an unambiguous root and
+    distinct mutable storage. Precision changes require rebinding after a full
+    clear; callers retain their original full callback for reset and teardown.
+    """
+    if precision not in ("w8a8", "w4a4"):
+        raise ValueError("Component cache clearing requires an integer precision")
+    bits = {"w8a8": 8, "w4a4": 4}[precision]
+    prefixes = {
+        "vlm": "backbone.",
+        "s1_feature": "action_head.vl_self_attention.",
+        "dit": "action_head.model.",
+    }
+    selected = {name: [] for name in prefixes}
+    seen = set()
+    if bits not in grouped:
+        raise ValueError("Selected integer precision has no projection inventory")
+    for group_bits, records in grouped.items():
+        for names, group in records:
+            owners = {
+                next(
+                    (
+                        name
+                        for name, prefix in prefixes.items()
+                        if site.startswith(prefix)
+                    ),
+                    None,
+                )
+                for site in names
+            }
+            if len(owners) != 1 or None in owners:
+                raise ValueError("Projection group must belong to exactly one root")
+            if id(group) in seen:
+                raise ValueError("Mutable projection group is shared across records")
+            seen.add(id(group))
+            if group_bits == bits:
+                selected[owners.pop()].append(group)
+    return {name: ProjectionCacheClearer(groups) for name, groups in selected.items()}
+
+
 class SerialForwardBoundary:
     """Clear per-call projection state and reject overlapping roots or resets.
 
@@ -14,9 +68,22 @@ class SerialForwardBoundary:
     Close before Graph/controller restoration. A Graph may restore an eager forward
     after a capture failure; adopt that target while retaining this outer boundary.
     Neither this wrapper nor its clear callback modifies the rolling action buffer.
+    Optional forward callbacks narrow cache ownership while retaining one shared
+    lock. Resets and close always use the original full clear callback.
     """
 
-    def __init__(self, modules, clear, *, reset_modules=()):
+    def __init__(self, modules, clear, *, reset_modules=(), forward_clears=()):
+        modules = tuple(modules)
+        known = {id(module) for module in modules}
+        per_root = {}
+        for module, callback in forward_clears:
+            if id(module) not in known or id(module) in per_root:
+                raise ValueError(
+                    "Each forward clear must name one distinct guarded root"
+                )
+            if not callable(callback):
+                raise TypeError("Forward cache clear must be callable")
+            per_root[id(module)] = callback
         self.clear = clear
         self.lock = threading.Lock()
         self.saved = []
@@ -31,12 +98,15 @@ class SerialForwardBoundary:
                 seen.add((id(module), name))
                 original = getattr(module, name)
                 self.saved.append((module, name, original, name in module.__dict__))
-                self._install(module, name, original)
+                callback = (
+                    per_root.get(id(module), clear) if name == "forward" else clear
+                )
+                self._install(module, name, original, callback)
         except BaseException:
             self.close()
             raise
 
-    def _install(self, module, name, original):
+    def _install(self, module, name, original, clear):
         target = original
 
         def forward(*args, **kwargs):
@@ -47,7 +117,7 @@ class SerialForwardBoundary:
                 self.lock.release()
                 raise RuntimeError("Optimized serial boundary is closed")
             try:
-                self.clear()
+                clear()
                 return target(*args, **kwargs)
             finally:
                 try:
@@ -57,7 +127,7 @@ class SerialForwardBoundary:
                     if current is not forward:
                         target = current
                         setattr(module, name, forward)
-                    self.clear()
+                    clear()
                 finally:
                     self.lock.release()
 

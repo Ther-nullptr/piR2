@@ -21,12 +21,15 @@ from tests.helpers.groot_streaming import assert_equal, rollout
 
 @pytest.mark.parametrize("precision", ["w8a8", "w4a4"])
 @pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("component_cache_clear", [False, True])
 @torch.inference_mode()
 def test_dit_component_recovers_partial_group_without_exiting_scope(
-    policy_and_inputs, precision, graph
+    policy_and_inputs, precision, graph, component_cache_clear
 ):
     policy, inputs = policy_and_inputs
     head = policy.model.action_head
+    # Preserve the complete policy's root inventory while bypassing the VLM.
+    policy.model.backbone = torch.nn.Identity().eval()
     # The shared fixture defaults this stage to Identity. Exercise the actual
     # S1 VL-transformer inventory without changing any existing fixture users.
     torch.manual_seed(217)
@@ -44,13 +47,25 @@ def test_dit_component_recovers_partial_group_without_exiting_scope(
     with GrootOptimizations(policy, OptimizationConfig(**common)):
         reference = rollout(head, inputs)
     with GrootOptimizations(
-        policy, OptimizationConfig(**common, dit_graph=graph)
+        policy,
+        OptimizationConfig(
+            **common, dit_graph=graph, component_cache_clear=component_cache_clear
+        ),
     ) as scope:
         selected = scope.coverage["linears"]
         assert all(name.startswith("action_head.") for name in selected)
         assert any(
             name.startswith("action_head.vl_self_attention.") for name in selected
         )
+        cache_policy = scope.evidence()["cache_clear_policy"]
+        if component_cache_clear:
+            assert cache_policy["mode"] == "active_precision_per_root"
+            assert cache_policy["precision"] == precision
+            assert cache_policy["groups"]["vlm"] == 0
+            assert cache_policy["groups"]["s1_feature"] > 0
+            assert cache_policy["groups"]["dit"] > 0
+        else:
+            assert cache_policy == {"mode": "global"}
 
         def fail_after_partial_group(_module, _inputs):
             # Q/K have run, but V has not consumed its grouped cache. For Graph,

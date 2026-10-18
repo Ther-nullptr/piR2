@@ -14,7 +14,10 @@ from coexecution.optimization.config import (
     optimization_config,
     selected_component,
 )
-from coexecution.optimization.execution.cache import SerialForwardBoundary
+from coexecution.optimization.execution.cache import (
+    SerialForwardBoundary,
+    projection_cache_clearers,
+)
 
 
 class Root:
@@ -41,6 +44,100 @@ def test_component_cli_default_and_explicit_selection():
         ).validate_variant("pir2")
     with pytest.raises(ValueError, match="component"):
         OptimizationConfig(component="vision")
+
+
+def test_component_cache_clear_is_explicit_integer_only_configuration():
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    assert not optimization_config(parser.parse_args([])).component_cache_clear
+    selected = optimization_config(
+        parser.parse_args(
+            [
+                "--inference-precision",
+                "w8a8",
+                "--component-cache-clear",
+            ]
+        )
+    )
+    assert selected.component_cache_clear
+    selected.validate_variant("flow")
+    with pytest.raises(ValueError, match="W8A8"):
+        OptimizationConfig(component_cache_clear=True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_flow_session_component_clears_preserve_default_full_cleanup(enabled):
+    from coexecution.optimization.execution.cache import ProjectionCacheClearer
+
+    model, head = SimpleNamespace(backbone=Root()), Root()
+    head.model, head.vl_self_attention = Root(), Root()
+    model.action_head = head
+    calls = []
+
+    class Remaining(set):
+        def __init__(self, key):
+            self.key = key
+            super().__init__()
+
+        def clear(self):
+            calls.append(self.key)
+            super().clear()
+
+    class Controller:
+        def __init__(self):
+            self.grouped = {
+                bits: [
+                    (
+                        [prefix + ".projection"],
+                        SimpleNamespace(
+                            _input=None,
+                            _output=None,
+                            _remaining=Remaining((bits, name)),
+                        ),
+                    )
+                    for name, prefix in (
+                        ("vlm", "backbone"),
+                        ("s1_feature", "action_head.vl_self_attention"),
+                        ("dit", "action_head.model"),
+                    )
+                ]
+                for bits in (8, 4)
+            }
+
+        def clear_projection_cache(self):
+            ProjectionCacheClearer(
+                group for records in self.grouped.values() for _, group in records
+            )()
+
+        def projection_cache_clearers(self, precision):
+            return projection_cache_clearers(self.grouped, precision)
+
+    controller = Controller()
+    scope = session.GrootOptimizations(
+        SimpleNamespace(model=model),
+        OptimizationConfig(precision="w8a8", component_cache_clear=enabled),
+    )
+    scope._bind_runtime_model(model)
+    scope._clear_cache = controller.clear_projection_cache
+    scope._install_boundary()
+    try:
+        assert model.backbone.forward("frame") == "frame"
+        if enabled:
+            assert calls == [(8, "vlm")] * 2
+            assert scope.evidence()["cache_clear_policy"]["groups"] == {
+                "vlm": 1,
+                "s1_feature": 1,
+                "dit": 1,
+            }
+        else:
+            assert len(calls) == 12
+        calls.clear()
+        head.reset_streaming_buffer()
+        assert len(calls) == 12 and sum(bits == 4 for bits, _ in calls) == 6
+        calls.clear()
+    finally:
+        scope.close()
+    assert len(calls) == 6 and sum(bits == 4 for bits, _ in calls) == 3
 
 
 @pytest.mark.parametrize(
@@ -378,3 +475,121 @@ def test_graph_failure_keeps_outer_serial_boundary_and_eager_fallback(
         assert model.forward("fallback") == "fallback"
         assert state.events.count("clear") == before + 2
     assert state.events.index("graph-close") < state.events.index("integer-close")
+
+
+def test_root_specific_clears_keep_one_guard_and_full_reset_close_cleanup():
+    first, second, head = Root(), Root(), Root()
+    calls = []
+    boundary = SerialForwardBoundary(
+        [first, second],
+        lambda: calls.append("full"),
+        reset_modules=[head],
+        forward_clears=[
+            (first, lambda: calls.append("first")),
+            (second, lambda: calls.append("second")),
+        ],
+    )
+    assert first.forward(1) == 1
+    assert calls == ["first", "first"]
+    with pytest.raises(RuntimeError, match="serial submissions"):
+        first.forward(second.forward)
+    assert calls[-2:] == ["first", "first"]
+    second.forward(2)
+    assert calls[-2:] == ["second", "second"]
+    head.reset_streaming_buffer()
+    assert calls[-2:] == ["full", "full"]
+    boundary.close()
+    assert calls[-1] == "full"
+
+
+def test_root_specific_clear_failure_still_cleans_and_restores_guard():
+    root = Root()
+    calls = []
+
+    def clear():
+        calls.append("root")
+        if len(calls) == 1:
+            raise RuntimeError("clear failed")
+
+    boundary = SerialForwardBoundary(
+        [root], lambda: calls.append("full"), forward_clears=[(root, clear)]
+    )
+    with pytest.raises(RuntimeError, match="clear failed"):
+        root.forward()
+    assert calls == ["root", "root"]
+    assert root.forward(3) == 3
+    boundary.close()
+    assert calls[-1] == "full"
+
+
+@pytest.mark.parametrize("invalid", ["unknown", "duplicate", "noncallable"])
+def test_root_clear_validation_precedes_module_modification(invalid):
+    root, other = Root(), Root()
+    entries = {
+        "unknown": [(other, lambda: None)],
+        "duplicate": [(root, lambda: None), (root, lambda: None)],
+        "noncallable": [(root, None)],
+    }[invalid]
+    with pytest.raises((ValueError, TypeError)):
+        SerialForwardBoundary([root], lambda: None, forward_clears=entries)
+    assert "forward" not in root.__dict__
+
+
+def test_projection_clearers_touch_only_active_precision_and_called_component():
+    counts = {}
+
+    class Remaining(set):
+        def __init__(self, key):
+            super().__init__([0, 1])
+            self.key = key
+
+        def clear(self):
+            counts[self.key] = counts.get(self.key, 0) + 1
+            super().clear()
+
+    prefixes = {
+        "vlm": "backbone.text",
+        "s1_feature": "action_head.vl_self_attention.block",
+        "dit": "action_head.model.block",
+    }
+    grouped, groups = {}, {}
+    for bits in (8, 4):
+        grouped[bits] = []
+        for component, prefix in prefixes.items():
+            group = SimpleNamespace(
+                _input=object(),
+                _output=object(),
+                _remaining=Remaining((bits, component)),
+            )
+            grouped[bits].append(([prefix + ".q", prefix + ".k"], group))
+            groups[bits, component] = group
+    clearers = projection_cache_clearers(grouped, "w8a8")
+    clearers["s1_feature"]()
+    assert counts == {(8, "s1_feature"): 1}
+    assert groups[8, "s1_feature"]._input is None
+    assert groups[8, "s1_feature"]._output is None
+    assert all(
+        group._input is not None and group._output is not None and group._remaining
+        for key, group in groups.items()
+        if key != (8, "s1_feature")
+    )
+    projection_cache_clearers(grouped, "w4a4")["vlm"]()
+    assert counts == {(8, "s1_feature"): 1, (4, "vlm"): 1}
+    assert {name: len(clearer.groups) for name, clearer in clearers.items()} == {
+        "vlm": 1,
+        "s1_feature": 1,
+        "dit": 1,
+    }
+
+
+@pytest.mark.parametrize("invalid", ["mixed", "unknown", "empty", "shared"])
+def test_projection_clear_partition_rejects_ambiguous_ownership(invalid):
+    group = SimpleNamespace()
+    records = {
+        "mixed": [(["backbone.q", "action_head.model.k"], group)],
+        "unknown": [(["elsewhere.q"], group)],
+        "empty": [([], group)],
+        "shared": [(["backbone.q"], group), (["backbone.k"], group)],
+    }[invalid]
+    with pytest.raises(ValueError):
+        projection_cache_clearers({8: records, 4: []}, "w8a8")
