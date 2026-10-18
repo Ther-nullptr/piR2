@@ -26,6 +26,8 @@ class OptimizationConfig:
     fp_shared_inputs: bool = False
     fp_grouped: bool = False
     fp_swiglu: bool = False
+    fp_gelu: bool = False
+    fp_rmsnorm: bool = False
     fp_smoothquant: Path | None = None
     component: str = "all"
     input_preparation: bool = False
@@ -71,6 +73,8 @@ class OptimizationConfig:
             raise ValueError("Fast FP8 quantization requires precision=fp8")
         if self.fp_smoothquant is not None and self.precision not in ("fp8", "fp4"):
             raise ValueError("SmoothQuant profile requires precision=fp8 or fp4")
+        if (self.fp_gelu or self.fp_rmsnorm) and self.precision not in ("fp8", "fp4"):
+            raise ValueError("Floating producers require precision=fp8 or fp4")
         if self.fp4_swap_ab and self.precision != "fp4":
             raise ValueError("FP4 Swap-AB requires precision=fp4")
         if self.fp_shared_inputs and self.precision not in ("fp8", "fp4"):
@@ -181,6 +185,8 @@ def add_optimization_arguments(parser):
     parser.add_argument("--fp-shared-inputs", action="store_true")
     parser.add_argument("--fp-grouped", action="store_true")
     parser.add_argument("--fp-swiglu", action="store_true")
+    parser.add_argument("--fp-gelu", action="store_true")
+    parser.add_argument("--fp-rmsnorm", action="store_true")
     parser.add_argument(
         "--fp-smoothquant",
         type=Path,
@@ -219,6 +225,8 @@ def optimization_config(args):
         fp_shared_inputs=args.fp_shared_inputs,
         fp_grouped=args.fp_grouped,
         fp_swiglu=args.fp_swiglu,
+        fp_gelu=getattr(args, "fp_gelu", False),
+        fp_rmsnorm=getattr(args, "fp_rmsnorm", False),
         fp_smoothquant=getattr(args, "fp_smoothquant", None),
     )
 

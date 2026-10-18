@@ -24,6 +24,7 @@ _CAPTURED_FIELDS = (
     "bits",
     "tactic",
     "shape_tactics",
+    "smoothing_scale",
     "linear",
     "silu_lut",
     "lut",

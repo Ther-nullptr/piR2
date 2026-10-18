@@ -26,6 +26,8 @@ class FloatingProjections:
         shared_inputs=False,
         grouped=False,
         swiglu=False,
+        gelu=False,
+        rmsnorm=False,
         smoothquant=None,
     ):
         if precision not in ("fp8", "fp4"):
@@ -33,7 +35,7 @@ class FloatingProjections:
         if fp4_swap_ab and precision != "fp4":
             raise ValueError("FP4 Swap-AB requires precision=fp4")
         alignment = 16 if precision == "fp8" else 32
-        all_sites, groups, _, text = inventory(model, expanded=True)
+        all_sites, groups, activations, text = inventory(model, expanded=True)
         selected = all_sites if expanded else inventory(model)[0]
         if executed is not None:
             selected = {
@@ -80,6 +82,8 @@ class FloatingProjections:
             "shared_input_groups": [],
             "merged_projection_groups": [],
             "swiglu_producers": [],
+            "gelu_producers": [],
+            "rmsnorm_producers": [],
         }
         for name, (module, role, scope) in all_sites.items():
             reason = None
@@ -242,6 +246,104 @@ class FloatingProjections:
                                 "gemms": "Independent original weight scales and tactics",
                             }
                         )
+            if gelu:
+                from coexecution.kernels.common.fused import prepare_gelu
+                from coexecution.optimization.backends.thor.packing import (
+                    prepare_gelu_packed,
+                )
+
+                for module, attr, down, approximate in activations:
+                    if down not in selected:
+                        continue
+                    weight = selected[down][0].weight
+                    lut = prepare_gelu(weight.device, weight.dtype, approximate)
+                    smooth = self.smoothing_scales.get(down)
+                    original = getattr(module, attr)
+                    self.saved.append((module, original, attr in module.__dict__, attr))
+
+                    def forward(x, lut=lut, smooth=smooth):
+                        return prepare_gelu_packed(
+                            x,
+                            lut,
+                            precision,
+                            smoothing_scale=smooth,
+                        )
+
+                    setattr(module, attr, forward)
+                    self.coverage["gelu_producers"].append(down)
+                    if attr == "gelu":
+                        # Diffusers places eval Dropout between GELU and the
+                        # consumer. Its mathematical identity must also accept
+                        # the packed carrier without trying a Tensor operation.
+                        from coexecution.optimization.backends.thor.packing import (
+                            FloatingPacked,
+                        )
+
+                        parents = [
+                            m
+                            for m in model.modules()
+                            if hasattr(m, "net")
+                            and len(m.net) >= 3
+                            and m.net[0] is module
+                        ]
+                        if len(parents) != 1:
+                            raise ValueError(
+                                "GELU producer requires a unique FFN owner"
+                            )
+                        dropout = parents[0].net[1]
+                        if (
+                            not isinstance(dropout, torch.nn.Dropout)
+                            or dropout.training
+                        ):
+                            raise ValueError("GELU producer requires eval Dropout")
+                        original_dropout = dropout.forward
+                        self.saved.append(
+                            (dropout, original_dropout, "forward" in dropout.__dict__)
+                        )
+
+                        def identity(x, dropout=dropout, original=original_dropout):
+                            if isinstance(x, FloatingPacked):
+                                if dropout.training:
+                                    raise ValueError(
+                                        "Packed activations require eval Dropout"
+                                    )
+                                return x
+                            return original(x)
+
+                        dropout.forward = identity
+            if rmsnorm:
+                from coexecution.optimization.backends.thor.packing import (
+                    prepare_rmsnorm_packed,
+                )
+
+                module_names = {
+                    id(module): name for name, module in model.named_modules()
+                }
+                for layer in model.modules():
+                    if type(layer).__name__ != "Qwen3VLTextDecoderLayer":
+                        continue
+                    gate = layer.mlp.gate_proj
+                    name = module_names[id(gate)]
+                    up_name = module_names[id(layer.mlp.up_proj)]
+                    if name not in selected or up_name not in selected:
+                        continue
+                    norm = layer.post_attention_layernorm
+                    if type(norm).__name__ != "Qwen3VLTextRMSNorm":
+                        raise ValueError("RMSNorm producer requires Qwen3VLTextRMSNorm")
+                    self.saved.append((norm, norm.forward, "forward" in norm.__dict__))
+                    smooth = self.smoothing_scales.get(name)
+
+                    def forward(x, norm=norm, smooth=smooth):
+                        return prepare_rmsnorm_packed(
+                            x,
+                            norm.weight,
+                            precision,
+                            eps=norm.variance_epsilon,
+                            smoothing_scale=smooth,
+                        )
+
+                    norm.forward = forward
+                    self.coverage["rmsnorm_producers"].append(name)
             buffers = [
                 *self.linears.values(),
                 *(
@@ -265,11 +367,13 @@ class FloatingProjections:
         return self._scale_by_module[id(module)]
 
     def close(self):
-        for module, forward, had_forward in reversed(self.saved):
+        for entry in reversed(self.saved):
+            module, forward, had_forward = entry[:3]
+            attr = entry[3] if len(entry) == 4 else "forward"
             if had_forward:
-                module.forward = forward
+                setattr(module, attr, forward)
             else:
-                del module.forward
+                delattr(module, attr)
         self.saved.clear()
         for group in self.groups:
             group.active, group.cache = False, None

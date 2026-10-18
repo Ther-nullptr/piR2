@@ -672,7 +672,7 @@ the packed weight copy contains the compensation. Finite-precision rounding
 means this is not a claim of bitwise equivalence to unsmoothed BF16 inference.
 
 Input compensation is fused into packing, including the opt-in SwiGLU,
-AdaLN and residual/normalization producers. AdaLN compensation is applied
+GELU, RMSNorm, AdaLN and residual/normalization producers. AdaLN compensation is applied
 after both conditional scale and shift. QKV/KV/gate-up consumers share one
 channel scale, preserving shared-packing and merged-projection compatibility.
 The profile is loaded and verified before Graph capture; activation-dependent
@@ -684,7 +684,25 @@ add the matching profile:
 ```bash
 # Existing FP8 command: --inference-precision fp8 --fp-smoothquant /path/fp8.pt
 # Existing FP4 command: --inference-precision fp4 --fp-smoothquant /path/fp4.pt
+# Optional activation producers: --fp-gelu --fp-swiglu
+# Optional text MLP RMSNorm producer: --fp-rmsnorm
 ```
+
+All options remain disabled by default. `--fp-gelu` uses the existing native
+BF16 GELU lookup (including its approximation mode), then applies channel
+balancing and packs the result without writing a separate smoothed tensor.
+Diffusers' intervening eval Dropout accepts the packed carrier; training
+Dropout is rejected and installation is rolled back. `--fp-rmsnorm` targets
+Qwen3VL text MLP input normalization only when both gate/up consumers are
+quantized. Its reduction order may differ from the native normalization;
+validate action error separately before enabling it. These options do not
+alter attention masks, image resolution, S1/S2 scheduling or GEMM tactics.
+
+FP4 writes packed E2M1 data and block-16 UE4M3 scales directly. FP8 still
+requires a tensor-wide maximum followed by scaling/casting; the fusion does
+not remove that global dependency or promise a single kernel. LayerNorm and
+RMSNorm retain explicit BF16 output stages but are not claimed bitwise equal
+to the native reductions. Original forwards are restored when the scope exits.
 
 The reusable Python APIs `ActivationCalibration`, `channel_scales` and
 `projection_groups` live in
@@ -705,6 +723,19 @@ weight packing, Graph capture and warmup are outside inference timing. The
 GPU tests in `tests/gpu/test_smoothquant_gpu.py` exercise compensation, producer
 compatibility, Graph updates, weight identity and restoration; they do not
 establish task-quality acceptance.
+
+On an otherwise configured Thor environment, run these explicit GPU checks:
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q \
+  tests/gpu/test_smoothquant_gpu.py \
+  tests/gpu/test_smoothquant_producers_gpu.py \
+  tests/gpu/test_floating_fusion_gpu.py
+```
+
+Keep profiles, calibration samples, traces and measured figures in ignored
+local directories. Complete-policy results that include other Graph or
+transport optimizations cannot be attributed to these producers alone.
 
 ## Measured LIBERO queue reports
 

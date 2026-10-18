@@ -56,6 +56,10 @@
       "version": "c61476d728e42ae0d8a35e7e78494edcac3237b5",
       "sha256": "74daf140e0efd00082ec536200aa1d18d7b1ca516b6aa70a3cb96439f4d4e88b",
       "local_adapter": "coexecution/optimization/backends/thor/smoothquant.py",
+      "local_fusion_adapters": [
+        "coexecution/optimization/backends/thor/packing.py",
+        "coexecution/optimization/groot/floating.py"
+      ],
       "license": "MIT",
       "license_file": "licenses/SMOOTHQUANT_LICENSE"
     },

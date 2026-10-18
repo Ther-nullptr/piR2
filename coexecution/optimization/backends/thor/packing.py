@@ -350,6 +350,105 @@ def prepare_smoothed(matrix, precision, smoothing_scale):
 
 
 @triton.jit
+def _gelu_pack(
+    X,
+    Lut,
+    Output,
+    Auxiliary,
+    Smooth,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FP4: tl.constexpr,
+    SMOOTH: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    value = tl.load(X + row * K + col, col < K, 0)
+    value = tl.load(Lut + value.to(tl.uint16, bitcast=True).to(tl.int32))
+    _store_producer(value, row, Output, Auxiliary, Smooth, K, BLOCK, FP4, SMOOTH)
+
+
+def prepare_gelu_packed(x, lut, precision, *, smoothing_scale=None):
+    """Native BF16 GELU lookup, channel balancing and packing in one pass."""
+    _check_smoothing_metadata(smoothing_scale, x)
+    if not x.is_contiguous():
+        raise ValueError("GELU packing requires contiguous activations")
+    if lut.shape != (65536,) or lut.device != x.device or lut.dtype != x.dtype:
+        raise ValueError("GELU packing requires a native BF16 lookup table")
+    output, auxiliary, rows, k = _producer_buffers(x, precision)
+    _gelu_pack[(rows,)](
+        x,
+        lut,
+        output,
+        auxiliary,
+        smoothing_scale,
+        k,
+        triton.next_power_of_2(k),
+        precision == "fp4",
+        smoothing_scale is not None,
+        num_warps=4 if k <= 2048 else 8,
+        enable_fp_fusion=False,
+    )
+    return _finish_producer(output, auxiliary, x.shape, precision, smoothing_scale)
+
+
+@triton.jit
+def _rmsnorm_pack(
+    X,
+    Weight,
+    Output,
+    Auxiliary,
+    Smooth,
+    K: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FP4: tl.constexpr,
+    SMOOTH: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    x = tl.load(X + row * K + col, col < K, 0).to(tl.float32)
+    weight = tl.load(Weight + col, col < K, 0).to(tl.float32)
+    variance = tl.sum(x * x, 0) / K
+    normalized = (x * tl.rsqrt(variance + EPS)).to(tl.bfloat16).to(tl.float32)
+    value = (normalized * weight).to(tl.bfloat16)
+    _store_producer(value, row, Output, Auxiliary, Smooth, K, BLOCK, FP4, SMOOTH)
+
+
+def prepare_rmsnorm_packed(x, weight, precision, *, eps, smoothing_scale=None):
+    """RMSNorm and optional SmoothQuant to packed input, preserving BF16 stages."""
+    _check_smoothing_metadata(smoothing_scale, x)
+    if (
+        not x.is_contiguous()
+        or weight.shape != (x.shape[-1],)
+        or weight.device != x.device
+        or weight.dtype != x.dtype
+        or not weight.is_contiguous()
+        or not math.isfinite(eps)
+        or eps <= 0
+    ):
+        raise ValueError(
+            "RMSNorm packing requires contiguous BF16 and positive epsilon"
+        )
+    output, auxiliary, rows, k = _producer_buffers(x, precision)
+    _rmsnorm_pack[(rows,)](
+        x,
+        weight,
+        output,
+        auxiliary,
+        smoothing_scale,
+        k,
+        float(eps),
+        triton.next_power_of_2(k),
+        precision == "fp4",
+        smoothing_scale is not None,
+        num_warps=4 if k <= 2048 else 8,
+        enable_fp_fusion=False,
+    )
+    return _finish_producer(output, auxiliary, x.shape, precision, smoothing_scale)
+
+
+@triton.jit
 def _fp8_partial_amax(X, Partial, N: tl.constexpr, BLOCK: tl.constexpr):
     block = tl.program_id(0)
     offsets = block * BLOCK + tl.arange(0, BLOCK)
