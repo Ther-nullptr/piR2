@@ -1,59 +1,94 @@
-# S1/S2 measurement boundaries
+# 量化收益、模型时延与 S1/S2 争用实验
+
+本项目用三层证据连接算子加速与机器人响应：在固定真实输入上测模型，在独立 S1/S2 工作负载上解释争用，最后在 LIBERO 闭环中观察动作是否及时生效。每层保持明确的输入、工作量和计时边界，因而能够区分量化收益、运行时开销与调度收益。
+
+| 要回答的问题                                      | 入口                                        | 输入与结果                                                         |
+| ------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------ |
+| 量化后完整模型快多少，输入准备占多少？            | `python -m coexecution.libero.measurement`  | 官方 Spatial 真实输入；独立模型/原始策略计时与分开采集的 profile   |
+| 优化后的 Flow4 在串行、并发、协作调度下怎样变化？ | `scripts/profile_libero_contention.py flow` | 官方非 streaming H40/NFE4；S1/S2 response、pair makespan、数值漂移 |
+| πR² 的一步 DiT 与真实 VLM 如何争用 GPU？          | 同脚本 `campaign` / `worker`                | 训练后的 streaming H40；固定输入/rolling buffer、Nsight 与硬件计数 |
+| 这些变化是否改善真实动作的及时性与任务表现？      | [LIBERO 声明条件 runner](libero.md)         | 匹配初态的闭环；成功率、实际延迟、AoI、采用/执行与 fallback        |
+
+本页给出实验操作；开关与实现细节集中在[算子参考](../coexecution/README.md)，控制节拍、动作提交与缓存语义集中在[时序协议](timing-protocols.md)。代码帮助和离线分析不加载模型，模型计算使用 CUDA。
+
+## 比较口径
+
+对照固定 checkpoint、真实输入或闭环初态、随机种子、精度覆盖、attention、layout、fusion、Graph 设置与硬件状态。改变运行时开关时保持精度不变；比较精度时共用相同的系统优化。稳态计时包含 online activation quant/pack，安装、编译、权重 packing、预热和 capture 单列。
+
+| 指标                            | 含义                                             | 使用方式                                           |
+| ------------------------------- | ------------------------------------------------ | -------------------------------------------------- |
+| Raw policy wall                 | 原始观测进入策略，到同步完成并得到动作           | 衡量输入准备、模型和解码合在一起的调用成本         |
+| Prepared/model-only wall        | 常驻准备输入上的完整模型调用，到同步完成         | 隔离输入准备、传输、解码、RPC 与仿真               |
+| S1/S2 response                  | release 到 worker 观察到本次 CUDA output ready   | 含提交、唤醒和协作等待，用于评估请求响应           |
+| Pair makespan                   | 一对 S1/S2 请求从开始到共同完成                  | 联合评估调度，使用同条件 serial pair 为分母        |
+| CUDA event span                 | stream 上两个 event 的跨度                       | 含队列/提交空隙，不等于 GPU 活跃时间               |
+| GPU activity sum / union / span | 实际 kernel/memcpy/memset 区间的总和、并集和跨度 | 在独立 profile 中解释工作量与重叠                  |
+| LIBERO 控制指标                 | 真实请求、提交、采用和执行时间及来源             | 将模型加速关联到动作等待、AoI、fallback 与任务结果 |
+
+这些范围有重叠，不能把 wall 减 event span 当作纯 CPU 时间，也不能将孤立 S1/S2 中位数相加代替 serial pair。host RPC 重叠与 CUDA stream priority 均不能证明 kernel 抢占；实际重叠需检查 CUDA activity。缺失计数/时间戳保留 unknown 或 null，不填零。
+
+先按[环境配置](environment.md)准备固定源、完整任务权重及数据。计时使用空闲物理 GPU，保留 UUID、compute processes、实际时钟、软件和 profiler 版本；有外来负载的时段单独标记。各入口的 GPU 准入责任不同，见下文。结果、计划和原始 trace 留在忽略的 `.local/` 或 `artifacts/`。
+
+## Independent model measurement
+
+`coexecution.libero.measurement` 同时支持两种边界：
+
+| `--measurement-boundary` | 实验组织                                                                                                       |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `model-only`             | 每个 precision/runtime block 一次准备并持有固定真实输入，预热后回放；每次重算完整 VLM 与 Flow4，不缓存神经输出 |
+| `comparison`（默认）     | 分别测 raw-policy、准备/传输与 prepared-model probes；每轮随机模式/观测顺序，相同输入和 seed 配对              |
+
+model-only 将观测选择、图像处理、collation、输入复制、RPC、仿真、动作解码、数值验证和写文件全部移出模型 timer；最多常驻 16 个观测，可用 `--max-prepared-observations` 调整。runtime block 内不穿插 raw 调用，评估时间漂移时另行记录或反转 block 顺序。
+
+每次使用尚不存在的 `--output` 目录，保留上一条件的原始记录。以下示例假定已选择空闲 CUDA 设备并准备好模型环境：
+
+```bash
+python -m coexecution.libero.measurement \
+  --checkpoint /path/to/GR00T-N1.7-LIBERO/libero_spatial \
+  --dataset /path/to/groot-libero-spatial \
+  --output .local/model-paired --precisions bf16 w8a8 \
+  --measurement-boundary model-only --modes compiled kv_reuse \
+  --action-cuda-graph --operator-fusion \
+  --observations 3 --rounds 20 --warmup 2 \
+  --profile-rounds 1 --replay-assets --runtime-receipt
+```
+
+此例在同一精度内比较 `compiled` 与 `kv_reuse`，两者只相差 Flow4 内的 cross-attention K/V reuse。测量入口通过 mode 管理开关，因此拒绝全局 `--action-kv-reuse`；服务入口则接受该 flag。支持 BF16/W8A8/W4A4，各精度应按实际研究范围显式列出。
+
+runtime modes 按下表逐项累加；默认运行 `baseline` 到 `graph`，新增 host 优化需显式选择：
+
+| Mode        | 新增机制                                      |
+| ----------- | --------------------------------------------- |
+| `baseline`  | 原始运行时                                    |
+| `prepared`  | 输入字段分离                                  |
+| `tokenized` | 精确文本 token 缓存                           |
+| `static`    | 固定 VLM 元数据                               |
+| `graph`     | 完整 VLM Graph                                |
+| `images`    | ndarray 图像准备                              |
+| `compiled`  | 编译 host guards                              |
+| `kv_reuse`  | Flow4 内 K/V 复用，要求 `--action-cuda-graph` |
+
+`baseline` 存在时作为同精度参考，否则用所选列表的第一个 mode，并记录其身份。model-only 接纳前比较 raw policy 的 decoded actions 与 CPU/CUDA RNG；timed graph 调用必须只有 replay，没有 capture。whole-action 模式要求每次完整 replay 对应四次逻辑 DiT 工作。
+
+clean latency 不分配 timing events 或 profiler scopes。`--cuda-events` 显式增加 CUDA span/host-return 信息；`--profile-rounds N` 另开带 request/VLM/action 标注的 profile pass，model-only 输入在 profile 开始前准备好。样本保留 precision、observation、request 和 seed；`--replay-assets` 在计时外导出真实输入，`--runtime-receipt` 记录源码和已加载算子身份。前端使用方式见[回放合同](../coexecution/replay/README.md)。
 
 ## LIBERO VLM/DiT contention profiling
 
-Use `scripts/profile_libero_contention.py` to measure a trained H40 streaming
-πR² checkpoint with real LIBERO observations. Shared code lives in
-`coexecution/profiling`; the script only dispatches commands. This opt-in
-diagnostic is separate from closed-loop success evaluation and from the older
-SO100 replay described below.
+streaming 入口测训练后的 πR² H40 检查点：每次 S1 使用一次 DiT、slide=1、image-delay embedding=3，S2 使用真实 LIBERO 观测。每对请求恢复相同输入、RNG 和动作缓冲；S1 消费上一代已完成的特征，S2 的新特征经 CUDA completion event 后发布。共同 BF16 bootstrap 使用四次 DiT，位于计时外。
 
-**中文：** 此入口比较 VLM 独跑、DiT 独跑、串行、同优先级并发、DiT
-高优先级以及 VLM 层边界协作让出。输入、随机数和动作缓冲固定，DiT
-读取上一代已经完成的特征，下一代特征只在 CUDA 完成事件之后发布。
-每个配置先检查同精度下的串行与并发输出是否逐值一致，再预热和采集。
-它不运行机器人闭环，不能把速度或一致性检查当作任务成功率。
+支持 BF16/W8A8/W4A4，以及 `component=all/vlm/dit`。量化保留原 BF16 参数和整数格式，memory 字段表示诊断进程占用；实际传输字节由独立 DRAM counters 给出。该入口排除观测/状态预处理、RPC、动作解码和仿真，结果用于解释组件争用。
 
-The supported diagnostic precisions are BF16, W8A8 and W4A4, with quantization
-selected for both components, VLM only or DiT only. Streaming inference uses
-H40, one DiT evaluation per call, slide length one and image-delay embedding
-three. The common BF16 bootstrap uses four DiT evaluations and is excluded from
-measurement. Observations and state preprocessing, RPC, action decoding and
-simulator execution are also excluded. Integer quantization can change policy
-quality; a W4A4 hardware measurement is not deployment acceptance.
-The diagnostic controller retains the original BF16 parameters and prepares
-integer weights, so allocated/reserved memory is the diagnostic process footprint,
-not the minimum deployment footprint of a pure W8/W4 model. Use the independent
-DRAM counters to compare actual transferred bytes.
+调度包括独跑、serial、同优先级 concurrent、DiT priority 和 VLM 层边界 cooperative。cooperative 等待已完成层边界，运行 DiT 后恢复 VLM；`vlm_only_cooperative` 测纯 fence 开销，offset 和一/两 block 粒度为显式参数。这个入口在计时前要求同精度 serial/concurrent tensors 逐值相等；下节 Flow4 入口则保留结构、finite、RNG 门槛并报告数值漂移，二者准入规则分别记录。
 
-CUDA stream priority is a scheduling hint, not proof of interrupting a running
-kernel. Cooperative mode explicitly waits for a completed VLM layer boundary,
-runs DiT and resumes VLM; `vlm_only_cooperative` measures the layer-fence overhead
-without DiT. Arrival offsets and one/two-block boundaries are explicit inputs.
+### 冻结计划并采集
 
-### Set up and collect
-
-Use the CUDA environment and pinned GR00T setup from
-[environment setup](environment.md) and [upstream provenance](upstream.md).
-Initialize or select compatible CUTLASS headers as described in
-[Contributing](../CONTRIBUTING.md#cutlass-dependency--cutlass-依赖).
-Supply a trained streaming checkpoint and the corresponding LeRobot dataset;
-the tool does not download them or train a model. CPU CI only exercises metadata,
-scheduling and parsing contracts.
-
-Select an idle physical GPU explicitly. The campaign waits for no compute
-processes, zero reported GPU utilization and at most 200 MiB used memory, then
-keeps the same GPU UUID throughout the run. If another process appears, only the
-campaign's own processes are stopped and the attempt is marked invalid. No
-clock or power settings are changed.
+campaign 管理 GPU 准入与 owned processes：等待无 compute process、GPU utilization=0%、memory.used≤200 MiB，之后固定 UUID；检测到外来 process 时停止自身实验进程并将 attempt 标为 invalid。campaign 不修改频率或功率。低层 `worker` 要求显式 GPU mask，调用方自行承担准入。
 
 ```bash
-# Inspect device occupancy and use the intended profiler versions.
 nvidia-smi
 nsys --version
 ncu --version
 
-# Creates a frozen local plan; it does not start a model.
 .venv/bin/python scripts/profile_libero_contention.py campaign prepare \
   --plan artifacts/contention/plan.json \
   --checkpoint outputs/my-pir2/checkpoint-10000 \
@@ -61,7 +96,7 @@ ncu --version
   --groot-root upstream/learning/Isaac-GR00T \
   --gpus 2 --offline --analyze
 
-# Copy the exact plan hash printed by prepare. The two commands validate it.
+# 用 prepare 输出的准确 hash 替换 PLAN_SHA256。
 .venv/bin/python scripts/profile_libero_contention.py campaign check \
   --plan artifacts/contention/plan.json --plan-sha256 PLAN_SHA256
 .venv/bin/python scripts/profile_libero_contention.py campaign run \
@@ -69,15 +104,9 @@ ncu --version
   --output artifacts/contention/run
 ```
 
-`--nsys`, `--ncu`, `--python`, `--cpu-set`, `--stages`, `--nsys-metrics-set` and
-`--ncu-metrics` select tools and collection settings explicitly. Inspect each
-command's `--help` for details. Profiler binaries otherwise resolve through
-`PATH`; confirm the selected versions. The hardware-counter path was developed
-with Nsight Systems 2025.3, Nsight Compute 2025.1 and RTX 6000 Ada. Other devices
-need their own supported metrics and kernel backends; missing counters are not
-silently filled with zero.
+`prepare` 创建冻结计划，不启动模型。`--nsys`、`--ncu`、`--python`、`--cpu-set`、`--stages`、`--nsys-metrics-set`、`--ncu-metrics` 显式选择工具/采集配置，其他选项见 `--help`。硬件计数路径的已用环境为 Nsight Systems 2025.3、Nsight Compute 2025.1、RTX 6000 Ada；其他硬件选择其实际支持的 metrics/backend。
 
-For a custom matrix, `--cases-json` accepts a list such as:
+用 `--cases-json` 指定矩阵，例如：
 
 ```json
 [
@@ -92,69 +121,44 @@ For a custom matrix, `--cases-json` accepts a list such as:
 ]
 ```
 
-Precision/component choices and modes appear in `worker --help`. The lower-level
-worker requires an explicit GPU mask; the campaign owns admission, telemetry,
-process ownership checks, frozen source/checkpoint evidence and profiler
-launches. For long collections, run the campaign in a persistent terminal session
-and retain its output directory. Resume with the same plan, hash and output:
-only completed records whose evidence still matches are skipped, and failed
-attempts remain available. The public tool does not automatically retry a
-failed campaign or modify other users' processes or profiler lock files.
+长采集放入持久终端会话。相同 plan/hash/output 可恢复：只有完成且证据仍匹配的记录被跳过，失败 attempt 保留，失败 campaign 不自动重试。其他用户进程与 profiler lock 不归该工具管理。
 
-### Read the results
+### 分开解释 timing 与 profiler
 
-| Measurement | What it establishes | Limitation |
-| --- | --- | --- |
-| Unprofiled response time | Request release to this worker observing its own CUDA completion, including cooperative waiting | Includes CPU submission/wakeup; it is not kernel busy time |
-| CUDA event span | Elapsed time on a stream | Excludes permit waiting before the start event and includes submission gaps |
-| Nsight Systems | Actual kernel overlap, launch attribution and sampled SM/Tensor/DRAM activity | Concurrent counters describe the whole GPU, not separate model shares |
-| Nsight Compute app-range | DRAM reads/writes per captured model call or pair | Replay changes timing; its GB/s is not normal-service bandwidth |
-| NVML telemetry | Device/process occupancy, clocks, temperature and power context | `utilization.memory` is a busy-time fraction, not GB/s |
+| 证据                     | 解释                                                                                          |
+| ------------------------ | --------------------------------------------------------------------------------------------- |
+| 无 profiler 的 response  | 含 CPU submission/wakeup 和 cooperative waiting 的实际请求响应                                |
+| Nsight Systems           | kernel overlap、launch attribution、采样 SM/Tensor/DRAM activity；并发 counters 是全 GPU 总量 |
+| Nsight Compute app-range | 每个 captured model call/pair 的 DRAM read/write；replay-window GB/s 与正常服务带宽分开       |
+| NVML                     | process/设备占用、实际 clocks、温度和功率；`utilization.memory` 是 busy-time 比例             |
 
-Nsight Systems and Compute run separately. The NCU application-range path uses
-the worker's `cudaProfilerStart/Stop` markers and does not pass the unsupported
-`--profile-from-start` option. Kernel replay would change concurrency. Clock and
-cache controls are explicitly disabled for NCU; all replay throughput remains
-labelled as replay-window throughput. The optional private temporary directory
-is used only with a system-wide check for other NCU processes, following
-[NVIDIA's lock-file guidance](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#faq).
+NSYS 与 NCU 独立采集。NCU application-range 使用 worker 的 `cudaProfilerStart/Stop`，不传不支持的 `--profile-from-start`；clock/cache control 显式关闭，以免 kernel replay 改变并发解释。可选 private temporary directory 只有在系统范围确认无其他 NCU process 时使用，遵循 [NVIDIA lock-file 说明](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#faq)。
 
 ```bash
-# Parse an existing capture without loading CUDA or requiring matplotlib.
 .venv/bin/python scripts/profile_libero_contention.py analyze \
   --measurement artifacts/contention/case/worker/measurement.json \
   --nsys artifacts/contention/case/trace.sqlite \
   --out artifacts/contention/case/report --no-plots
-
-# Aggregate valid completed attempts; failed and pending attempts stay excluded.
 .venv/bin/python scripts/profile_libero_contention.py report \
   --root artifacts/contention/run --out artifacts/contention/report --no-plots
 ```
 
-For figures, install matplotlib, omit `--no-plots`, and use an installed Source
-Han/Noto CJK font or `--font /path/to/font.ttf`. Plots and JSON retain source
-provenance and units. Different hardware, model/fixture, implementation or timing
-cohorts are kept separate. Raw traces, generated reports and local plans belong
-under ignored artifact directories, not in Git.
+分析不加载 CUDA。report 聚合有效 completed attempts，排除 failed/pending，按硬件、模型/fixture、实现和计时 cohort 分组。绘图需 Matplotlib，移除 `--no-plots`；中文字体使用已安装 Source Han/Noto CJK 或 `--font /path/to/font.ttf`。图表和 JSON 保留单位及来源。
 
-### Official Spatial Flow4 scheduling diagnostic
+## Official Spatial Flow4 scheduling diagnostic
 
-本节用于官方 **非 streaming Spatial、H40、Flow4（NFE=4）** 权重的调度诊断。
-`flow` 读取真实图像/状态/文本 fixture；每个请求对重置输入，S1/DiT 消费已完成的旧特征，
-S2/VLM 计算下一个 fixture，S1 使用下一个 fixture 的状态。它不运行 LIBERO 闭环；
-调度时间、数值漂移和量化覆盖率均不能证明任务成功率或策略质量。原有 `worker`、`campaign`
-保留上文的 streaming πR² 协议。
+此入口使用官方非 streaming Spatial、H40、Flow4（NFE=4）权重，比较完整优化路径的 S1 响应、S2 响应和请求对 makespan。`flow` 读取真实图像/状态/文本 fixture，每个请求对重置输入：S1 消费已完成的旧特征和下一个 fixture 的状态，S2 计算下一个 fixture 的视觉特征。相同输入安排适用于各调度模式。
 
-**1. 准备环境和路径。** 按[固定上游来源](upstream.md)、[CUDA 模型环境](environment.md)
-准备完整任务 checkpoint、对应 LeRobot Spatial 数据集与 processor/config 缓存。这里不下载或训练模型。
-外部 CUTLASS 选择与编译缓存见[环境配置](environment.md#optional-gr00t-fusion-and-integer-inference)。
+### 1. 准备输入与路径
+
+按[固定上游来源](upstream.md)、[CUDA 模型环境](environment.md)
+准备完整任务 checkpoint、对应 LeRobot Spatial 数据集与 processor/config 缓存。完整任务权重可直接用于本诊断。
+CUTLASS 选择与编译缓存见[环境配置](environment.md#optional-gr00t-fusion-and-integer-inference)。
 当前 W8 full split-K profile 使用 Ada SM89 候选和严格 Torch guard（包括 `2.7.1+cu126`、
 Torch revision/header 检查）；W4 使用现有 grouping/norm producers。两者保留 category 2、
-site/group tactics，W8 另含 shape tactics。请核对环境文档，不能据此承诺 Jetson 支持。
+site/group tactics，W8 另含 shape tactics。其他平台按[迁移指南](platform-handoff.md)重新选择后端与校准。
 
-每次调用都会加载**两份独立完整策略**，未执行组件的权重也常驻；整数配置保留 BF16 权重，
-并准备 W8/W4 两种格式。下面两个独立进程合计加载四份完整策略。显存记录是诊断进程占用，
-不能解释为纯 INT8/INT4 部署的压缩比例。模型计算只在 CUDA 环境运行。
+每次命令启动加载两份独立完整 CUDA 策略，未执行组件的权重也常驻；整数配置保留 BF16 权重，并准备 W8/W4 格式。双独立进程共加载四份策略，因此显存字段表示该诊断配置的进程占用。
 
 以下代码块在同一个 Bash 会话中执行；先替换路径和 GPU 编号：
 
@@ -185,7 +189,9 @@ COMMON=(scripts/profile_libero_contention.py flow
 `--output` 必须是**尚不存在的新目录**：只创建外层 `BATCH`，不要提前 `mkdir` 下文的输出子目录。
 重跑、更换精度或 group 时使用新输出；保留失败目录、JSON、日志和 PID，不覆盖旧证据。
 
-**2. 检查设备并记录上下文。** `flow` 是低层入口，**不负责 GPU admission、预留或外来进程监控**；
+### 2. 检查设备并记录上下文
+
+`flow` 是低层入口，**不负责 GPU admission、预留或外来进程监控**；
 上文 `campaign` 的保护不适用于这里。Ada 计时准入要求所选卡无 compute PID、GPU 利用率 0%、
 `memory.used <= 200 MiB`，并有足够空闲显存容纳两份完整策略；调用者检查这些条件并确认 UUID 映射，
 运行期间持续检查占用并记录频率。发现外来负载时保留证据，将受影响时段标为不可比较。
@@ -211,7 +217,9 @@ printf '%s\n' "$TELEMETRY_PID" > "$BATCH/telemetry.pid"
 必须与 `selected-gpus.txt` 核对：先去掉可选的 `GPU-` 前缀，再比较完整 UUID 主体（Torch 记录可能不含此前缀）。
 单个 UUID mask 中的 `cuda:0` 就是该 UUID 对应设备。
 
-**3. 同 GPU：先跑完整匹配矩阵。** 下例含每 case 30 次 clean 请求、2 轮预热及独立短 profile。
+### 3. 同 GPU 的匹配调度矩阵
+
+下例含每 case 30 次 clean 请求、2 轮预热及独立短 profile。
 所有 fixture 会在实际执行线程/stream（含高优先级 DiT stream）上预热并 capture，另逐 case 预热；
 这些调用、特征准备、RNG reset、快照和数值检查均不计入请求计时。
 
@@ -236,14 +244,14 @@ printf '%s\n' "$RUN_RC" > "$OUT.exit-code"
 默认 `optimized` 是 7 cases，`cooperative` 是 15 cases（并发模式各有 0/5 ms 两个 offset，
 alone/serial 各一次）。`--modes` 可选子集；完整对比需保留相同精度、placement、group 的 alone/serial。
 
-| `--modes` | 测量内容 |
-| --- | --- |
-| `vlm_only` / `dit_only` | S2 / S1 独跑 |
-| `serial` | S1 先完成，再启动 S2 |
-| `concurrent_equal` / `concurrent_dit_priority` | 等优先级 / DiT 高优先级并发 |
-| `vlm_only_fenced` / `serial_fenced` | 带已完成层边界 fence 的独跑/串行控制 |
-| `concurrent_equal_fenced` / `concurrent_dit_priority_fenced` | 保留 fence 成本的并发控制 |
-| `cooperative_dit_priority` | 在已完成的 VLM 层边界让出，执行 DiT 后恢复 |
+| `--modes`                                                    | 测量内容                                   |
+| ------------------------------------------------------------ | ------------------------------------------ |
+| `vlm_only` / `dit_only`                                      | S2 / S1 独跑                               |
+| `serial`                                                     | S1 先完成，再启动 S2                       |
+| `concurrent_equal` / `concurrent_dit_priority`               | 等优先级 / DiT 高优先级并发                |
+| `vlm_only_fenced` / `serial_fenced`                          | 带已完成层边界 fence 的独跑/串行控制       |
+| `concurrent_equal_fenced` / `concurrent_dit_priority_fenced` | 保留 fence 成本的并发控制                  |
+| `cooperative_dit_priority`                                   | 在已完成的 VLM 层边界让出，执行 DiT 后恢复 |
 
 `optimized` 开启 whole VLM graph；两组均使用 whole action graph、K/V reuse、静态准备与编译 guard。
 将 `GROUP=cooperative` 并换新输出后重跑同一命令，整个组统一关闭 whole VLM graph、保留相同空操作层 hook；
@@ -251,7 +259,9 @@ alone/serial 各一次）。`--modes` 可选子集；完整对比需保留相同
 `--vlm-chunk-blocks 1`（默认）或 `2` 设置边界粒度。不要把跨 group 的差值直接称为调度收益。
 更换 `PRECISION` 后顺序重跑；同卡不同条件不要同时启动。CUDA priority 是提示，不是硬抢占保证。
 
-**4. 同进程双 GPU。** 上一轮退出、两卡预检通过后运行。完整 UUID 按 `GPU_S1_UUID,GPU_S2_UUID`
+### 4. 同进程双 GPU
+
+上一轮退出、两卡预检通过后运行。完整 UUID 按 `GPU_S1_UUID,GPU_S2_UUID`
 顺序列入 visible mask 后，分别映射为进程内 `cuda:0,cuda:1`；保留该 placement 自己的 alone/serial 基线与两卡频率记录：
 
 ```bash
@@ -266,7 +276,10 @@ CUDA_VISIBLE_DEVICES="$GPU_S1_UUID,$GPU_S2_UUID" "${CPU_PREFIX[@]}" \
 旧特征在计时前复制到 S1 GPU 的独立存储；S2 ready 仅表示 VLM GPU 上完成，**新特征传输被排除**。
 因此它不是同一帧的 VLM→DiT 端到端延迟。不同物理卡/频率下的独跑时间不能直接作为隔离收益分母。
 
-**5. 两个独立进程、每进程一张 GPU。** 此例连续回放各 600 次，关闭 profiler；每个进程内部两份
+<details>
+<summary>可选：独立进程连续回放与错开放行</summary>
+
+此例连续回放各 600 次，关闭 profiler；每个进程内部两份
 策略都位于本进程的 `cuda:0`。先等双方预热并确认 CUDA idle，再发布 release 文件；start gate
 仅协调开始时刻，不预留 GPU。先放行 VLM，读取首条完成样本，再以其实际 `s2_release_ns + 3 s`
 为目标放行 DiT。每次重跑都创建新外层目录、两个新 gate 路径，禁止复用文件或 symlink。
@@ -354,17 +367,21 @@ solo head 要求请求完成早于对方首条 release 减 50 ms。solo tail 则
 剔除跨边界请求；裁剪后空窗口没有 co-running 样本。此窗口只表示两个回放循环都活跃，不证明 kernel 重叠。
 这是**连续回放**，不是锁步 0/5 ms 请求对、进程间特征 IPC 或机器人 AoI 测试。
 
-**6. 读结果和检查边界。** 先确认正常退出、`status.json` 为 `complete` 且无 `failure.json`；
+</details>
+
+### 5. 读取结果
+
+先确认正常退出、`status.json` 为 `complete` 且无 `failure.json`；
 异常后 status 可能保留旧状态，缺少最终结果不能视为完成。保留以下本地产物：
 
-| 文件/字段 | 用途 |
-| --- | --- |
-| `status.json`、`failure.json`、外层 `.log`/`.pid` | 当前阶段、失败原因及进程归属 |
-| `start-ready.json` / `start-gate.json`（指定 gate 时） | 完成预热后的 ready 与实际放行记录 |
-| `measurement.json`、`samples.jsonl` | schema `libero-flow4-contention` v1；汇总与逐请求记录 |
-| `fixtures.json`、`features.json`、导出的 observation | 输入身份、旧特征 generation/hash/准备时间 |
-| `executed-coverage.json`、`graph_audits` | 量化执行覆盖、capture/replay 与 action K/V 审计 |
-| `provenance`、`hardware`、`runtime`、`memory` | 源码/checkpoint 配置 hash、UUID、软件/绑核、常驻和峰值显存 |
+| 文件/字段                                              | 用途                                                       |
+| ------------------------------------------------------ | ---------------------------------------------------------- |
+| `status.json`、`failure.json`、外层 `.log`/`.pid`      | 当前阶段、失败原因及进程归属                               |
+| `start-ready.json` / `start-gate.json`（指定 gate 时） | 完成预热后的 ready 与实际放行记录                          |
+| `measurement.json`、`samples.jsonl`                    | schema `libero-flow4-contention` v1；汇总与逐请求记录      |
+| `fixtures.json`、`features.json`、导出的 observation   | 输入身份、旧特征 generation/hash/准备时间                  |
+| `executed-coverage.json`、`graph_audits`               | 量化执行覆盖、capture/replay 与 action K/V 审计            |
+| `provenance`、`hardware`、`runtime`、`memory`          | 源码/checkpoint 配置 hash、UUID、软件/绑核、常驻和峰值显存 |
 
 覆盖计数是预热期间的 adapter visits，不是 timed kernel 数；static feature 路径不调用的已知
 `backbone.model.lm_head` 单列为 inactive，不能当成漏量化，也不能略过其他 missing projection。
@@ -393,23 +410,26 @@ response 是 release 到本 worker 观察到 CUDA output ready，含协作等待
 含 host dispatch/串行交接。`gpu_span_ms` 是 CUDA event 跨度，含队列/提交空隙，**不等于 kernel busy time**。
 host submission 区间可能与 GPU 执行重叠，不能直接把它们相加。用 `s1_release_ns-s2_release_ns`
 核对并发 case 的实际 offset 与 `offset_ms` 目标；`old_feature_ready_ns` 是准备完成时间，不能当图像采集 AoI。
-旧 streaming `analyze`/`report` 不消费 Flow4 schema。
+本节使用 `libero-flow4-contention` schema；campaign 的 `analyze`/`report` 使用另一份 streaming schema。
 
 `--profile-iterations 1` 在全部 clean cases 之后另跑每 case 的短 Torch profiler window，
-保存在 `profiles` 与 `trace-*.chrome.json`，不混入 clean samples；这是已验证的导出流程。
+保存在 `profiles` 与 `trace-*.chrome.json`，不混入 clean samples。
 高级开关 `--cuda-profiler-range` 仅在 `--profile-iterations > 0` 时可用，标记单独的 profile window。
 外部 Nsight 可按 `--capture-range=cudaProfilerApi --capture-range-end=repeat` 捕获各 case 的范围，
-但此分支仍启用 Torch profiler，二者组合尚未经过集成验证。尝试时使用新输出，将整个 Nsight 调用
-保留为 profiler 证据，不将其计时混入独立无 profiler 运行。NVTX 标注实际 S1/S2 request/fixture；
+该分支仍启用 Torch profiler；与外部 Nsight 联用需要独立集成验证。使用新输出保留整个调用的 profiler 证据，clean timing 则单独采集。NVTX 标注实际 S1/S2 request/fixture；
 应检查真实 CUDA activity 与 stream ID 才能判断 kernel 重叠。
 
 ## Auxiliary SO100 replay
 
-The original `coexecution.run` replay workload uses the SO100 GR00T example, H16, BF16 and preprocessed observations on GPU. It does not load the main LIBERO task checkpoint by default and is not a drop-in LIBERO benchmark. Its purpose is to validate execution mechanisms before applying them to the real closed-loop task.
+SO100 H16 BF16 录制观测用于检查 S1/S2 执行机制。`coexecution.run` 默认读取 `outputs/pir2-so100-smoke/checkpoint-10`，以及已准备在 GPU 的 SO100 观测；Spatial 任务实验使用前述入口。
 
-Measure S1 alone, S2 alone, the serial pair and the concurrent pair. Use the measured serial pair as the speedup denominator, not a sum of isolated medians. Preserve input, cache version, RNG and rolling-buffer state across paired comparisons. Report model loading, preprocessing, CPU action decoding and robot/simulator I/O exclusions explicitly.
+```bash
+PIR2_GPU=0 bash scripts/run_single_gpu_baseline.sh measure
+PIR2_GPU=0 bash scripts/run_single_gpu_baseline.sh runtime
+PIR2_GPU=0 bash scripts/run_single_gpu_baseline.sh protocols
+```
 
-CUDA event spans are not proof of kernel overlap. Export Nsight data to SQLite and use `coexecution.analyze_trace` to intersect actual kernel intervals; `coexecution.operator_analysis` joins kernel launches with the innermost NVTX range on the correct CPU thread. Profiled latency and profiler-free latency are separate measurements.
+launcher 先检查占用；同卡逐条运行，用 `PIR2_OUTPUT` 指定新目录。trace mode 使用 PATH 上的 Nsight Systems 或 `PIR2_NSYS`。paired 对照恢复 input、cache version、RNG 与 rolling buffer，速度分母用实测 serial pair；model loading、预处理、CPU 解码及机器人 I/O 位于本 workload 计时外。
 
 ```bash
 nsys export --type=sqlite --output=artifacts/coexecution/run/nsys.sqlite \
@@ -418,6 +438,6 @@ nsys export --type=sqlite --output=artifacts/coexecution/run/nsys.sqlite \
   artifacts/coexecution/run/nsys.sqlite --output artifacts/coexecution/run/overlap.json
 ```
 
-The periodic runner retains the configured release period, bounded in-flight work and actual feature versions. Deadline denominators include dropped requests. Cache age is calculated at consumption, and release/completion/drop conservation is checked. Fixed-pair profiling and free-running periodic replay answer different questions; neither substitutes for the LIBERO wall-clock control protocol.
+`analyze_trace` 对实际 kernel intervals 求交；`operator_analysis` 把 launch 归到正确 CPU thread 的最内层 NVTX range。profile latency 与 profiler-free latency 分开，`--plot` 可选 Matplotlib 输出。
 
-Analysis produces local machine-readable records. Plotting, if requested through the optional `--plot` flag, additionally requires matplotlib. One-off rendering scripts with historical hardware/trial constants, generated figures, optimization ledgers and snapshots remain local. Do not interpret trace coverage as demonstrated quantization quality or task accuracy.
+periodic replay 保留 release period、有界 in-flight 和实际 feature versions；deadline 分母包含 dropped requests，消费时计算 cache age，并检查 release/completion/drop 守恒。固定请求对解释资源争用，periodic replay 解释排队；真实任务表现仍由 LIBERO wall-clock 协议测量。

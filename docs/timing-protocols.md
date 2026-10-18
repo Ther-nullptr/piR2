@@ -1,196 +1,78 @@
-# Two timing protocols
+# 时序协议：推理结果何时成为动作
 
-Both protocols use real VLM image features, the same checkpoint/data identities and paired initial conditions. Their deployment coupling selects the image/state age and inference/execution relationship; the table describes the original cached-worker deployment baseline. Scores from different protocols or coupling modes must not be pooled.
+本项目用两类对照连接模型速度与控制质量：**algorithm 固定图像/动作延迟，deployment 测量实际墙钟调度。** 两者都使用真实 VLM 图像特征，并记录 checkpoint、初始条件和动作来源。评测结果按协议、coupling 和 clock 分组。
 
-| Protocol | Observation/action timing | Purpose |
-|---|---|---|
-| Algorithm | Image age fixed at 3 ticks (150ms); action release fixed at 1 tick (50ms); current state | Compare behavior at identical simulated delays |
-| Deployment (cached asynchronous baseline) | Absolute wall-clock 20Hz control; asynchronous real VLM and action workers | Measure behavior with actual processing/transport delays |
+## 先选择推理与执行关系
 
-In the algorithm protocol, computation waits do not advance physics. Each method executes the committed prefix, then uses the next legal segment. The initial missing image history is explicitly padded. A GPU contract check adds 100ms wait per call and compares actions and final images; this is a timing check, not a success-rate evaluation.
+| 模式                                | 模型工作                                                 | 动作执行                               | 主要问题                      |
+| ----------------------------------- | -------------------------------------------------------- | -------------------------------------- | ----------------------------- |
+| `algorithm`                         | 固定历史图像、当前状态；默认图像延迟 3 步、动作延迟 1 步 | 计算等待期间物理时间暂停               | 相同延迟下的策略能力          |
+| deployment / `asynchronous + paced` | 独立 S2 VLM 与 S1 动作 worker，消费最新可用缓存          | 绝对墙钟 20 Hz，合法动作缓冲           | 实际延时、缓存年龄与 deadline |
+| deployment / `asynchronous + ready` | 同样的真实 VLM 缓存控制器，Flow                          | 原子物理步结束后立即接纳合法结果并继续 | 去掉墙钟 pacing 后的动作时效  |
+| deployment / `synchronous`          | 当前观测的完整 VLM + Flow4                               | 推理结束后执行 K 步，再开始下一轮      | 推理与执行串行的基线          |
+| deployment / `one_step_async`       | 完整 VLM + Flow4，提前一个物理步推理                     | K=1、D=1，结果未就绪则等待             | 单步推理/执行重叠             |
+| deployment / `chunked_async`        | 完整 VLM + Flow4，在段边界前 D 步启动                    | 每段执行 K 步，要求 1 ≤ D ≤ K          | 动作前缀与异步深度的权衡      |
 
-Deployment keeps control independent from unfinished RPCs. An observation computed early is withheld until its physical tick. Committed commands cannot be overwritten, expired slots are discarded, and buffer exhaustion uses zero Cartesian deltas with the previous gripper command. Flow publishes the unexpired native clean plan; πR² publishes only its newly clean segment. πR² normally uses one DiT evaluation per request; full-buffer recovery is explicitly counted as four bootstrap evaluations plus one normal update.
+当前 evaluator 固定 LIBERO 每步推进 **0.05 秒仿真时间**，并要求 `--control-hz 20`。这不保证每个 `env.step` 恰好耗费 50 ms 墙钟时间：
 
-Warm-up and full request calibration occur outside scored control. Control frequency, policy query frequency and plan publication frequency are separate metrics. Record action/VLM latency, actual cache age, state/image timestamp difference, control lateness, expired/fallback slots and recovery counts. Quantiles are calculated from raw requests, not averaged episode quantiles.
+- `paced` 缓存异步有全局 20 Hz 墙钟 deadline。
+- `synchronous + paced` 只在执行段内按 20 Hz 运行，推理段另占时间。
+- `ready` 不额外等待 50 ms，实际频率由计算、环境步进和等待决定。
+- 同步及 ready 模式的全局固定频率有效性为 `null / not applicable`。
 
-Deployment optionally accepts `--vision-max-hz 15` to limit scored S2 admissions. The default zero is unlimited. The first admission is immediate; each later admission is at least `1 / vision_max_hz` after the previous actual admission, with no catch-up after a late wake or slow request. Camera offers continue at physical 20Hz. The newest pending frame is selected only at admission, so newer frames can replace it throughout a wakeable rate wait. Completed features publish without an admission-rate hold; the independent service floors below still apply. Bootstrap and solo warmup/calibration remain outside this limit. Experiment plans may set `vision_max_hz` globally or per condition; a condition value, including zero, overrides the plan, and only deployment evaluator commands receive it.
+`--execution-prefix-steps` 是 `--synchronous-chunk-steps` 的别名，默认 K=8；plan 使用对应下划线字段，同层冲突报错。K 的上限是 checkpoint 的**原生解码长度**，由 processor modality 的 action `delta_indices` 决定，不能用训练 H40 替代。plan 在 GPU 准入前检查全部条件：优先 root metadata，缺失时回退 `processor/`；服务加载后再次核对 identity。
 
-`vision_admission_wait` traces the eligible time and replaceable mailbox; `vision_admitted` records `admitted_s` under the mailbox lock, separately from actual RPC `started_s`. Request rows retain both timestamps, `vision_max_hz` and elapsed `admission_wait_seconds` (from first rate wait through admission, including scheduling). `vlm_work` reports offered/admitted/completed/replaced/dropped counts, admission starts and waits, and `actual_admission_hz` as `(admissions - 1) / (last - first)` when defined. An interrupted final wait has no admission row; its wait and stop events remain in the trace. `vision_stop_requested` records when stop was observed under the same lock and retains the controller's separate cutoff. No new admission follows observed stop; an already admitted RPC may begin or finish afterward, and its timestamps and post-control counts are retained.
+## 固定延迟算法对照
 
-For a hardware scan, the evaluator accepts `--task-ids 0 3 --episodes-per-task 1 --max-steps 300 --no-video`. The default still selects all ten Spatial tasks. A selected subset is labelled `selected_task_subset`, and its expected episode count uses only those tasks. Episodes retain ordinary first-success/environment-termination semantics: `physical_control_seconds` and the deployment `controlled_start_s`/`controlled_end_s` report actual exposure; a 300-tick cap does not promise 15 seconds after an early success. Subset success is not a full-suite result.
+默认图像年龄为 3 ticks（150 ms），动作放行为 1 tick（50 ms），状态取当前物理步。计算期间不推进物理；每种方法保留已承诺前缀并使用下一合法段，缺失的起始图像历史显式补齐。
 
-Deployment calibration stores all 12 action samples in `calibration.json`, marking the first two as excluded; `action_rpc_seconds` and `action_server_seconds` contain the ten included samples. The action budget remains `min(5, ceil((p95 RPC + 0.005) / 0.05))`, with an explicit over-budget flag. `slow-warmup.json` similarly keeps every visual RPC/server sample and marks the first two excluded. `--slow-warmup-calls` defaults to 12. These are solo warm calibration measurements; concurrent-control latency comes from the episode trace.
+`--artificial-compute-wait` 用于检查该时间边界。GPU contract 给每次请求增加 100 ms 等待后比较动作与最终图像，以验证计算等待没有改变物理协议。任务成功率仍由正式闭环评测给出。
 
-Feature transport defaults to `--feature-transport numpy_fp32`, the upstream NumPy dictionary. Opt in to `--feature-transport numpy_bf16` on **both services and the deployment evaluator** to send existing BF16 features as explicitly tagged raw uint16 words in a versioned envelope. This changes their representation, with no new quantization: BF16 bits, other floating dtypes, bool/int masks, scalar shapes and metadata are preserved. Imported tensors own their storage and finish transfer on the endpoint's CUDA stream before planning. Unknown schemas, dtype tags and malformed shapes are rejected before cache installation. Service identities declare the encoding/source; VLM metadata and action cache audits report `feature_wire` with actual field dtypes and `payload_nbytes` (array storage bytes, excluding serialization headers).
+## 缓存异步部署
 
-The evaluator additionally accepts `--feature-rpc combined` to install a newly selected feature inside the same `plan` request. The default `separate` sends `install` then `plan`. Both modes select at the existing control boundary and deduplicate the same feature sequence; combined mode advances the client's installed sequence only after a successful reply. Bootstrap, calibration and scored workers use the declared mode, while action service floors still begin at submission and include installation. Experiment plans accept `feature_transport` and `feature_rpc` globally or per condition, independently of weight-precision flags. Nondefault evaluator feature controls require deployment; resume configuration and calibration bind these settings. The physical 20Hz loop and the optional 15Hz S2 admission cap are unchanged.
+S2 持续处理真实图像并发布特征，S1 使用当前状态、选定特征和不可改写的动作前缀。控制线程独立于未完成 RPC；提前计算出的观测到物理 tick 才释放。结果只写入合法未来槽位：已执行槽位过期、已承诺槽位受保护，缓冲耗尽时使用零笛卡尔增量与上一夹爪命令。
 
-Timing version 2 adds explicit server boundaries to both reference and candidate requests. `plan_rpc_started_s` remains the actual client network-call start; in combined mode it precedes installation. `server_install_started_s` and `server_install_completed_s` describe the most recent imported cache, while `feature_installed_in_request` distinguishes a combined install from reuse. `server_plan_started_s` is recorded after optional installation and stream readiness, before server planning; it is a host boundary, not an exact neural-kernel timestamp. `server_seconds` measures planning from that boundary; `server_request_seconds` also includes combined installation. Whole-call `raw_service_seconds` includes queueing, network, installation and planning. None of these wall-time differences is a CPU-work measurement.
+Flow 发布未过期的原生干净计划；πR² 发布本次新变干净的段。πR² 常规请求使用一次 DiT evaluation；整缓冲恢复单独计为 4 次 bootstrap 加 1 次正常更新。控制频率、请求频率和有效发布频率分别统计。
 
-Queue reports and feature-usage audits prefer `server_plan_started_s` for `use_s` and cache age, record `use_boundary`, and retain legacy `plan_rpc_started_s` semantics when the new timestamp is absent. Existing `cache_age_at_request_ms` remains age at RPC entry; `cache_age_at_server_plan_ms` is the comparable post-install boundary. These loopback timestamps share the host monotonic clock. Feature publication, selection and physical execution keep their existing timestamps and source lineage.
+### 校准与 episode 准备
 
-Run `PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_feature_transport_gpu.py` in the pinned CUDA environment for all 65,536 BF16 bit patterns, other dtype/shape preservation, fresh storage and stream-readiness gates. These codec checks perform no neural inference and do not establish LIBERO task success.
+solo 预热和校准在 scored control 外完成：
 
-Same-process Flow workers are an explicit `--server-layout paired` option. Start
-one service with `--device cuda:0 --vlm-device cuda:0 --port 5570 --vlm-port 5572`
-and select `--server-layout paired` on the deployment evaluator. The service loads
-two independent official policies, each with its own CUDA stream and endpoint.
-The default layout remains `split`. Experiment plans accept `server_layout`
-globally or per condition; paired plans start and own one process, wait for both
-endpoints, and require the same declared physical GPU.
+| 记录                 | 规则                                                                        |
+| -------------------- | --------------------------------------------------------------------------- |
+| `calibration.json`   | 保存全部 12 个动作样本，前 2 个标记 excluded；RPC/server 数组使用其余 10 个 |
+| 初始动作预算 d       | `min(5, ceil((P95 RPC + 0.005) / 0.05))`，越过训练预算另记标志              |
+| `slow-warmup.json`   | 保存全部视觉样本及 excluded 标记；`--slow-warmup-calls` 默认 12             |
+| `vision_preparation` | 每 episode 用当前任务做一次真实 S2 准备调用，再进行新鲜 S1 bootstrap        |
 
-With paired Flow workers on one physical device, `--feature-transport cuda_local`
-replaces tensor serialization with versioned, owner-qualified feature handles.
-Each admitted frame still runs the real VLM. Publication follows the completed
-producer event; the consumer waits on that event and records its stream before
-installing independent references in its policy cache. A bounded pool (default
-16 leases, service option `--feature-max-leases`) retains owned tensor snapshots.
-It rejects capacity exhaustion rather than evicting an in-flight reader. Handles
-bind the exact metadata, dtype, shape, device, process instance and client session;
-stale or modified handles fail without substituting older neural outputs.
+episode 准备调用不返回特征载荷，其输出不进入 scored mailbox/S1 cache；记录实际来源、wall 时间、forward 和 graph 增量。这样任务切换也能在控制开始前准备相应路径。正式准入的每帧仍运行真实 VLM。并发控制期间的 latency 使用 episode trace，区别于 solo 校准值。
 
-The client holds a lease while the feature is latest, selected, pending, or kept
-as the action worker's fallback. Last-reference releases are batched on the next
-vision RPC. Shutdown first joins action consumers, then closes the owned feature
-session over a fresh RPC connection, including features whose replies were lost.
-Reset invalidates the producer session while existing reader references remain
-safe. `feature_wire.payload_nbytes` is zero tensor bytes for this transport;
-`resident_nbytes` reports retained tensor storage. Handle serialization still has
-metadata overhead. Pool counts appear in VLM responses and runtime identities.
+### Responsive πR² scheduling (opt in)
 
-Paired optimization installs adapters independently for each policy. Ordinary
-CUDA submissions can overlap; first VLM/DiT graph captures take a process-wide
-exclusive guard after quiescing prior GPU work. Simultaneous capture upgrades
-drop their shared submission slots before waiting. Startup, reset, inherited
-policy endpoints and teardown also participate. Paired whole-action graph mode
-is rejected; per-DiT and whole-VLM graph options are supported. S2 reset does not
-reseed S1's RNG. Graph capture/replay/failure deltas remain separate from physical
-forward hooks, and `scored_cold_capture_requests` exposes captures during scored
-control. Cold warmup costs stay outside steady measurement.
+`--deployment-scheduling-policy conservative` 为默认：d 校准后单调不减，结果在 tick 边界处理。`responsive` 支持 paced、cached asynchronous 的 deployment πR²，且不与 fixed-delay override 组合。plan 支持全局或逐 condition 设置，配置和 resume identity 记录选择。
 
-Condition-wide solo calibration prepares only its initial task metadata. Each
-episode therefore also runs one real S2 preparation call for its current task,
-before the fresh S1 bootstrap capture and scored control. This applies equally
-to split and paired layouts and every feature transport. The call requests no
-feature payload; its outputs never enter the scored mailbox or S1 cache. Every
-subsequent admitted frame still runs the real VLM. Per-episode
-`vision_preparation` records its actual source and wall times, physical VLM count
-and graph deltas separately. It does not change the calibrated delay, the
-nondecreasing delay rule, camera admission or scored completion timestamps.
+responsive 在保留初始 solo 校准的基础上，使用每 episode 最近 8 个有效完成的 S1 请求时长：
 
-Compare resident transport against **paired `numpy_bf16`** as well as split
-`numpy_bf16`, with identical precision/runtime flags, 20Hz control and S2 admission
-settings. This separates transport cost from process/context layout effects.
-Run `PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_resident_features_gpu.py`
-for stream readiness, owned storage, allocator lifetime and two independent tiny
-pinned CUDA policies with simultaneous cold captures, fresh images and RNG
-checks. Official-checkpoint equality, measured server latency and full Spatial
-quality remain separate gates; W4 systems measurements do not establish quality.
+1. 样本为 `completed_s - submitted_s`，包含执行器排队、安装缓存与 RPC。P95 按 `(n - 1) × 0.95` 线性插值。
+2. 目标为 `ceil((P95 + 0.005) / physical_period)`，限制在 1..5。
+3. 窗口满且连续 3 次目标低于当前 d 时，每次降低 1 tick 并重置计数；无效/非有限/负样本排除并重置降低计数。
+4. deadline miss 立即提高到当前 d+1、最新请求时长预算、从原定物理边界到完成的预算三者最大值，再限制到 5。第三项包含启动迟延；超过 5 的需求仍显式记录。
 
-Measured queue traces retain the existing `control_tick`, `request_completed`, `unused_result_at_episode_end` and `vision_request` row kinds. New lifecycle rows add `schema_version: 1`, a unique insertion-order `seq`, and `t_s` in the same host monotonic-clock domain as worker RPC and controller timestamps. Threads collect detached metadata in memory; JSON/file I/O occurs after timed control and worker drain. Row order is insertion order, so timeline viewers use each event's timestamp instead of assuming timestamps increase with `seq`.
+Future 回调只发 Event。控制器在当前原子 `env.step` 后的 pacing 空闲期处理结果，以**下一未执行物理步**为发布边界，等待截止于下一物理 deadline。传感器仍按 tick 释放，新 S1 请求仍须到达前一后端 anchor `r + old_d`。在飞请求、结果原有效区间和已承诺前缀保持其语义；减小 d 影响后续请求，不改变普通 πR² 的 DiT NFE。
 
-| Event / field | Meaning |
-|---|---|
-| `control_start`, `control_end` | Bounds of the scored wall-clock interval; drain work can complete after its end |
-| `camera_offered`, `camera_replaced`, `camera_dropped` | Actual latest-frame mailbox transitions, keyed by `source_tick`/`capture_s`; replacement identifies `replacement_source_tick` |
-| `vision_started`, `feature_published` | In-flight frame ownership and feature availability; publication records `feature_sequence`, actual publish `t_s`, and separate `rpc_completed_s` |
-| `camera_queue` | Waiting/in-flight ticks and capture times, plus the asynchronous worker's published feature sequence/source/capture time |
-| `action_submitted`, `action_started`, `action_completed` | Request lifecycle keyed by `request_tick`; every stage records state and selected/consumed feature dependencies; completion uses the server's actual cache audit |
-| `action_adopted` | Compatibility result-processing marker, including installed, expired and protected slot counts; zero installed is not adoption |
-| `control_tick.executed_slot` | Producer metadata for the command just applied |
-| `control_tick.action_buffer` | Detached remaining-slot ownership after execution, with `committed_until` and `slots` |
+`delay_policy_decision` 保存窗口、候选/选定预算、降低计数、原因和越界标志。`request_completed` 保存 `rpc_completed_s`、`controller_ready_observed_s`、`controller_processed_s` 及发布计数、缓冲快照。更早处理可能只减少入队等待，首次执行 tick 仍受合法槽位约束。终止后排空的结果标记 unused。
 
-Each slot reports `tick`, `status` (`future`, `committed` or `fallback`), `committed`, `fallback`, `producer_kind` and `producer_request_tick`. Bootstrap and fallback slots have no model request producer; a fallback's `reserved_at_tick` records when the hold command was committed. Sequence 0 in `control_start` and action dependencies denotes the bootstrap feature; the asynchronous camera worker begins at sequence 1. Request metadata includes `state_tick`, `state_capture_s`, `feature_sequence`, `feature_source_tick`, `feature_capture_s`, `delay_ticks` and `deadline_s`. Traces contain metadata and executed actions, never images or embeddings.
+### S2 准入频率
 
-Strict timing validity requires mean frequency within 2% of 20Hz, maximum control lateness at most 5ms and adjacent interval error at most 5ms. All episodes remain in the success-rate denominator, including timing-invalid episodes. Deployment timing runs without concurrent training; the adopted-client supervisor temporarily suspends training and waits for its GPU to become quiet before deployment, then resumes it.
+`--vision-max-hz` 默认 0（不限），例如 15 表示 scored S2 准入间隔至少 1/15 秒。首帧立即准入，此后基于实际前次准入计算，不补发迟到的请求。paced 摄像头仍按物理 20 Hz 提供图像；等待期间 latest-frame mailbox 可被更新图像替换，真正准入时才取最新帧。已完成特征立即进入发布路径；独立服务时长下限仍适用。
 
-The local LIBERO wrapper clears accumulated object-property samplers before hard model reload. This fixes non-reproducible fixture placement without changing task success predicates. Actual fixture-model, settled simulator-state and initial RGB hashes are compared across methods, rather than assuming seed/init-state equality suffices.
+`vision_admission_wait` 记录可准入时间和等待，`vision_admitted.admitted_s` 在 mailbox 锁内记录，与实际 RPC 的 `started_s` 分开。`vlm_work` 汇总 offered/admitted/completed/replaced/dropped，实际准入频率在有定义时为 `(admissions-1)/(last-first)`。stop 在同一锁内观测，随后不再准入；已经准入的 RPC 可以稍后开始或完成，控制后的工作保留。准备、bootstrap 和 solo 校准在此限频之外。
 
-Artifacts are generated below `artifacts/libero-protocols/<label>/`: per-condition config, episodes, traces and summary; stage comparison, initial-condition audit and report. They remain local. The publication checkout extracts two unchanged observation/video helpers from the obsolete evaluator into `libero_observations.py`; implementation hashes therefore differ from earlier live-workspace runs. Do not relabel those older results as a rerun of this publication checkout.
-
-## Responsive πR² scheduling (opt in)
-
-`--deployment-scheduling-policy conservative` remains the default. It keeps
-calibrated, nondecreasing d and tick-boundary result ingestion.
-`--deployment-scheduling-policy responsive` is available only for deployment
-πR² with cached asynchronous workers, paced physics and no fixed-delay override.
-Experiment plans accept `deployment_scheduling_policy` globally or per condition;
-a condition overrides the plan. Configuration, resume identity, episode metadata
-and `service_controls` retain the choice. Flow, ready, synchronous and complete
-policy lookahead modes keep their existing schedules.
-
-Responsive keeps the existing solo initial calibration. Each episode starts a
-fresh window of the last eight valid completed end-to-end S1 request durations
-(`completed_s - submitted_s`, including executor queue, cache install and RPC).
-P95 uses linear interpolation at `(n - 1) * 0.95`. The target is
-`ceil((P95_seconds + 0.005) / physical_period_seconds)`, clamped to 1..5 ticks.
-Only a full window can support a decrease; three consecutive observations with
-a target below current d decrease d by exactly one tick, then reset that streak.
-Invalid/nonfinite/negative samples are excluded and reset the lowering streak.
-A deadline miss raises immediately to the maximum of current d + 1, the latest
-request duration budget, and the completion budget measured from the request's
-scheduled physical boundary, all clamped to five. The last term includes launch
-lateness. Requirements beyond five remain explicit over-training-budget flags.
-
-A completed Future signals an Event only. The controller can ingest the result
-during idle pacing after the current atomic `env.step`; publication uses the
-next unexecuted physical tick. Waiting never extends beyond the next physical
-deadline. Sensors are still released at physical ticks, and new S1 requests are
-submitted only at ticks at or after the previous backend anchor `r + old_d`.
-No in-flight work is cancelled, no output valid interval is retimed, and no
-committed prefix is overwritten. A reduced d changes only later requests and
-their newly reserved prefix; ordinary πR² DiT NFE remains unchanged. Terminal
-results are drained as unused without publication after termination detection.
-
-`delay_policy_decision` records each sample window, candidate/chosen budgets,
-lowering streak, reason and over-budget flag. `request_completed` records
-`rpc_completed_s`, `controller_ready_observed_s`, `controller_processed_s`,
-publication counts and the actual post-publication buffer snapshot. Legacy
-`action_adopted` remains a compatibility read marker, including zero-installed
-results. Recorded-completion-to-processing and recorded-completion-to-first-execution are separate:
-earlier insertion may leave the first execution tick unchanged. Host-only
-contracts verify scheduling and accounting; success and real-time quality need
-matched conservative/responsive LIBERO closed-loop runs on the same checkpoint,
-fixtures, hardware clocks and precision settings.
-
-## Controlled completion-release experiments
-
-### Ready-driven GR00T execution
-
-`--execution-clock ready` is an opt-in deployment Flow mode. The default
-`paced` mode retains its 20 Hz wall target and timing tests. Experiment plans
-accept `execution_clock` globally or per condition. Ready rejects πR² and
-`--deployment-fixed-delay` rather than silently changing their timing semantics.
-
-Ready keeps the existing real VLM worker and GR00T clean action chunks. At each
-boundary after an atomic `env.step`, the controller publishes any completed
-result into legal, uncommitted future slots, takes a fresh state observation,
-and executes the next command immediately. There is no additional 50 ms wall
-wait or final period padding. An in-flight environment step cannot be replaced;
-one logical action step is committed for each request. Results arriving after
-their original target steps retain expired/protected counts, and missing legal
-actions remain explicit zero-delta/gripper-hold fallback commands.
-
-Each `env.step` still advances **0.05 simulated seconds**. `actual_control_hz`
-measures wall execution rate; `physics_step_seconds`, `nominal_physics_hz`,
-`simulated_elapsed_seconds`, `controlled_wall_seconds` and `real_time_factor`
-keep physics units distinct. Request and effective adoption rates are separate.
-`action_ready_to_adopt_seconds` and `action_ready_to_first_apply_seconds` use
-the producing request's recorded `completed_s`, never temporal matching.
-As documented below, that completion precedes Future bookkeeping; the measured
-gap includes that bookkeeping and waiting for the next legal actuator boundary.
-
-Ready has no wall-grid deadline, target frequency, lateness or fixed-rate
-validity; those values are **null / not applicable**, not zero, pass or failure.
-Solo RPC calibration is retained as evidence, while effective alignment stays
-one step with `action_delay_policy=one_step_committed`; it is not derived by
-dividing wall latency by the nominal physics period. The frontend labels this
-“就绪即接纳（StreamingVLA式调度，GR00T）”. It is a scheduling comparison using
-GR00T weights, not StreamingVLA AFM/AEO, paper weights or intermediate noisy actions.
+<a id="controlled-completion-release-experiments"></a>
 
 ### Client-visible release floors
 
-Deployment can run the real model first and then delay worker release using `--action-min-service-ms` and `--vision-min-service-ms` (both default to zero). `--deployment-fixed-delay` optionally fixes both bootstrap and runtime d in 1..5; omitted preserves adaptive scheduling. These controls are rejected for the algorithm protocol and are part of resume identity.
+`--action-min-service-ms`、`--vision-min-service-ms` 默认 0；设置后先运行真实模型，再把结果释放延迟到最小时长。`--deployment-fixed-delay` 可把 bootstrap 和运行期 d 固定在 1..5；这些控制只用于缓存异步 deployment，并进入 resume identity。
 
 ```bash
 python scripts/evaluate_libero_protocol.py \
@@ -200,98 +82,73 @@ python scripts/evaluate_libero_protocol.py \
   --deployment-fixed-delay 2
 ```
 
-The action floor starts at submission and includes worker queueing, feature installation and the real plan RPC. The vision floor starts at its worker RPC timestamp. Calibration uses the same floors; fixed d changes bootstrap and runtime scheduling while retaining deadline misses and per-slot rejection accounting. An over-target raw request is released without additional waiting, with `floor_miss` and raw/total overrun recorded. No extra model forward is introduced.
+动作 floor 从提交开始，含排队、特征安装和真实 plan RPC；视觉 floor 从 worker RPC 时间戳开始。校准使用同样的 floor。原始请求已超目标时直接释放，记录 `floor_miss` 及 raw/total overrun，模型 forward 数保持不变。
 
-`raw_completed_s` and `raw_service_seconds` precede the hold. `released_s`/`completed_s` are timestamps recorded just after the hold, **before** metadata recording, Future completion or the VLM publication lock. They are not exact consumer-visible availability timestamps. Use `feature_published` for cache visibility. `action_adopted` records controller processing; its `installed_slots` proves enqueueing, and exact `control_tick.executed_slot` producer evidence proves execution. New traces additionally record `controller_ready_observed_s` and `controller_processed_s`; `rpc_completed_s` preserves the client recorded completion/release boundary (`client_timing.completed_s`). The actual S1 Future completion instant remains unmeasured; observing readiness does not timestamp when the Future first became done. `added_wait_seconds` includes bookkeeping and scheduling as well as sleeping.
+`raw_completed_s`、`raw_service_seconds` 位于 hold 前；`released_s/completed_s` 位于 hold 后、元数据记录和 Future 完成之前。它们不是精确的消费者可见时刻，`added_wait_seconds` 也包含 bookkeeping 和线程调度。sleep 释放执行资源，与实际降频中的 GPU 争用不同；实验分别报告 raw/release 时长、真实时钟、overrun 与控制质量。
 
-This intervention controls a minimum recorded release duration, not raw GPU computation, GPU frequency, or a hardware/quantization speedup. Sleeping releases CPU/GPU execution resources, so its contention pattern differs from slowing down an executing GPU kernel. Report raw and recorded-release durations, floor overruns, actual clocks, control validity, source lineage and AoI coverage separately. Failed or timing-invalid attempts remain evidence and do not silently increase paired-repeat counts.
+### Ready-driven GR00T execution
 
-### Synchronous inference and action execution / 同步推理与动作执行
+`--execution-clock ready` 支持 deployment Flow 缓存异步控制。每个原子 `env.step` 后接纳合法结果、取得当前状态并立即执行下一动作，无额外 wall pacing 或末尾 padding。每个请求保留一个逻辑承诺步；过期、受保护和缺失槽位按同样规则计数。
 
-`--execution-coupling synchronous` 与 `--execution-clock paced|ready` 独立。
-默认仍为 `asynchronous`。同步模式使用一个普通 Flow action server：每周期
-采集当前真实观测，依次完成真实 VLM 和 Flow4，然后执行至多
-`--synchronous-chunk-steps 8` 个干净动作。推理期间不调用 `env.step`，执行段不
-启动神经推理；首次成功或环境终止立即停止后续动作。每步仍推进 0.05 秒物理时间。
+该模式的 `action_delay_policy=one_step_committed`，solo RPC 校准作为独立记录保留；预算不由墙钟延时除以物理周期推导。`actual_control_hz`、`simulated_elapsed_seconds`、`controlled_wall_seconds` 和 `real_time_factor` 分别记录，deadline/lateness/固定频率有效性为 null。
 
-`paced` 只在执行段内按 20 Hz 节拍运行，包含最终动作的完整 dwell；下一轮推理
-从该执行段结束后开始。`ready` 不增加等待。两者的全局控制频率都会反映真实推理、
-环境和记录成本；同步模式不声明全局 20 Hz deadline，有效性字段为 null。
-`actual_control_hz = control_steps / controlled_wall_seconds` 包含首轮推理等待。
-原生解码长度保持模型配置，必须覆盖请求的执行段长度；未执行的计划后缀显式记录，
-不挪用为下一周期的动作。
+前端标签“就绪即接纳（StreamingVLA式调度，GR00T）”指 GR00T 干净动作块上的调度对照；使用的权重、动作生成和算法身份仍为 GR00T，未接入 StreamingVLA 的 AFM/AEO。ready 不支持 πR² 或 fixed-delay。
 
-启动单个模型服务（CUDA 环境、checkpoint 与优化参数按已有环境文档配置），然后
-使用仿真环境运行现有 evaluator；无需第二个 VLM 服务：
+## 特征传输与 worker 布局
+
+这些选项服务于缓存异步控制，独立于权重量化精度。选用相同 precision/runtime flags 比较传输，先固定布局，再比较 paired 与 split。
+
+| 配置                                     | 数据路径与契约                                                                     |
+| ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| `--feature-transport numpy_fp32`（默认） | 上游 NumPy 字典传输                                                                |
+| `numpy_bf16`                             | 已有 BF16 按带版本标签的 uint16 原始位传输；保留其他 dtype、mask、标量形状和元数据 |
+| `cuda_local`                             | 同 GPU、paired Flow 两份 policy 间传递带所有权的驻留特征 handle                    |
+| `--feature-rpc separate`（默认）         | 新特征先 install 再 plan                                                           |
+| `--feature-rpc combined`                 | 新特征安装合入同一次 plan 请求；成功回复后才推进客户端 installed sequence          |
+| `--server-layout split`（默认）          | 独立服务进程                                                                       |
+| `--server-layout paired`                 | 一个进程，两份独立 policy、CUDA stream 和 endpoint                                 |
+
+传输编码必须同时设置在服务与 evaluator。NumPy 导入获得独立存储，CUDA stream 就绪后才规划；未知 schema、dtype 或错误 shape 在安装前拒绝。`feature_wire.payload_nbytes` 是数组存储字节，不含序列化头。BF16 codec 只改变传输表示，不新增数值量化。combined/separate 均在既有控制边界选择特征并按 sequence 去重。
+
+paired 服务使用 `--device cuda:0 --vlm-device cuda:0 --port 5570 --vlm-port 5572`。plan 管理一个进程并等待两 endpoint，要求同一物理 GPU。每份 policy 串行提交；常规 GPU 工作可以重叠，冷 VLM/DiT 图捕获通过进程级 exclusive guard 和 quiescence 协调。startup、reset、继承 endpoint 和 teardown 参与协调；S2 reset 不重置 S1 RNG。支持 per-DiT/whole-VLM graph，拒绝 paired whole-action graph。
+
+`cuda_local` 在真实 VLM producer event 完成后发布，consumer 等待 event、登记消费 stream 后安装独立引用。默认 16 个 lease（`--feature-max-leases`）保存 owned snapshot；容量耗尽报错，保持在飞读者有效。handle 绑定 metadata、dtype、shape、device、进程和 client session；过期或改写 handle 拒绝使用。
+
+客户端在 latest、selected、pending 或 fallback 引用期间持有 lease，最后引用释放在下次视觉 RPC 批处理。停止时先 join action consumer，再用新 RPC 关闭 session，清理包括丢失回复在内的特征。producer reset 失效 session，已有读者引用仍安全。`payload_nbytes=0` 表示没有张量序列化，`resident_nbytes` 给出驻留存储；handle 元数据仍有传输开销。
+
+CUDA 契约检查（在准备好的模型环境显式运行）：
+
+```bash
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_feature_transport_gpu.py
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_resident_features_gpu.py
+```
+
+前者覆盖全部 65,536 种 BF16 位型、其他 dtype/shape 和独立存储；后者检查 stream 就绪、allocator 生命周期、两份独立 tiny CUDA policy 的并发冷捕获、新图像与 RNG。官方 checkpoint 数值和 Spatial 闭环质量另由对应模型实验报告。
+
+## Synchronous inference and action execution / 同步推理与动作执行
+
+`--execution-coupling synchronous` 用一个普通 Flow action endpoint，每轮获取当前图像与状态，完成真实 VLM + Flow4，再执行至多 K 个干净动作。推理时暂停物理，执行段不启动神经推理；首次成功或环境终止立即停止。原生解码后缀按未执行数量记录，下轮重新取观测。
+
+`paced` 在执行段维持 20 Hz，包含最后动作的完整 dwell，然后开始下一轮推理；`ready` 不增加等待。`actual_control_hz = control_steps / controlled_wall_seconds` 包含首轮推理等待，两种 clock 均没有全局 20 Hz 有效性声明。
+
+启动 action 服务后，使用仿真环境执行：
 
 ```bash
 python scripts/evaluate_libero_protocol.py \
   --protocol deployment --variant flow --port 5570 \
   --execution-coupling synchronous --execution-clock paced \
-  --synchronous-chunk-steps 8 --task-ids 0 3 --episodes-per-task 1 \
+  --execution-prefix-steps 8 --task-ids 0 3 --episodes-per-task 1 \
   --max-steps 300 --record-replay --replay-max-frames 301 \
   --output .local/synchronous-examples/deployment
 ```
 
-现有 `coexecution.libero.experiments` plan 支持全局或逐 condition 的
-`execution_coupling`、`execution_clock`、`synchronous_chunk_steps`，同步 condition
-只启动 action worker。同步模式拒绝 πR²、algorithm protocol、paired/resident
-feature exchange、服务时长下限、视觉限频和 fixed-delay 控制。每任务先做本 endpoint
-完整 warmup，再重置一次 episode RNG；正式周期不调用会重新设 seed 的 bootstrap。
-同步 warmup 的 socket 超时默认 900 秒，可用
-`--synchronous-warmup-timeout-seconds` 或 plan 中同名下划线字段调整；只覆盖冷启动
-JIT/预热调用，结束或异常时恢复原客户端及当前 socket 的超时。reset 与正式推理仍用
-原来的 120 秒设置，预热耗时不计入 scored control。
-可选 `gpu_uuids` 必须提供 action/vlm/simulation 的完整 GPU UUID，准入先核对实际
-`nvidia-smi` index/UUID，保留 `gpu-admission.json` 与 hardware 中的 verified mapping。
+完整策略模式（synchronous / one_step_async / chunked_async）使用单个普通 Flow endpoint，保持默认特征接口；paired/resident、缓存服务 floor、视觉限频、fixed-delay 和人工计算等待不适用。每任务在同 endpoint 做完整 warmup，再重置一次 episode RNG，正式周期不调用重置 seed 的 bootstrap。冷 JIT warmup 超时默认 900 秒，可用 `--synchronous-warmup-timeout-seconds` 调整；随后恢复原客户端/socket 的 120 秒设置。plan 支持对应下划线字段。
 
-每轮 `cycle_phase` 保存真实 inference/execution 起止、物理步范围与暂停状态，
-`synchronous_cycle` 保存原生解码动作、源图像 hash、VLM/DiT 分段时间、forward/graph
-计数和丢弃后缀。兼容现有 feature→request→executed-slot 的来源审计；同步的 S1/S2
-区间标为 `server_action_stage` / `server_vlm_stage`，不是两条独立 RPC，也不是 GPU
-kernel 时间。`inference_wall_seconds` 是单次 VLM+Flow4 RPC 的完整客户端 wall；
-`action_stage_seconds` 和 `vlm_stage_seconds` 是服务端 stream 完成边界。
-完整同步调用使用 `synchronous_rpc_started_s` / `synchronous_rpc_completed_s`，
-不与单独 action RPC 的提交边界混用。导入器兼容第一批记录中的旧字段名称，但保留
-原文件并在规范化输出中明确完整同步 RPC 的范围；显示的各阶段事件必须逐一匹配
-同周期 audit、source IDs 和执行动作。
+`cycle_phase` 保存真实 inference/execution 起止、物理步范围和暂停状态；`synchronous_cycle` 保存图像 hash、原生计划、VLM/DiT 段时间、forward/graph 计数和丢弃后缀。`inference_wall_seconds` 是包含输入准备的完整客户端调用，`synchronous_rpc_started_s/completed_s` 表示该完整调用边界。服务端 `vlm_stage_seconds/action_stage_seconds` 到达对应 stream 完成边界；前端标为 `server_vlm_stage/server_action_stage`，与独立 RPC 或 GPU kernel 区间分开。
 
-```bash
-python -m coexecution.replay build \
-  --deployment .local/synchronous-examples/deployment \
-  --default-execution-coupling synchronous --default-execution-clock paced \
-  --output .local/synchronous-replay
-python simulator/serve.py --replay .local/synchronous-replay/catalog.json
-```
+## One-step asynchronous policy/execution / 单步异步策略与动作执行
 
-回放按 execution coupling 和 clock 筛选匹配运行，显示 `Synchronous`、真实 Phase
-轨道以及 `Inference / simulation paused` / `Executing` 状态。不同精度共用 wall
-游标，各自 physics clock 仅在实际 `env.step` 完成后前进。视频只使用记录的 wall→frame
-映射，推理期间保持已有帧，不伪造运动；VLM→DiT→已执行动作仍可追溯。
-相机拷贝与 trace 收集属于 instrumented debug 成本，视频编码在控制结束后执行。
-少量任务样例不代表完整 Spatial 套件成功率。
-
-
-### One-step asynchronous policy/execution / 单步异步策略与动作执行
-
-`--execution-coupling one_step_async --execution-clock ready
---execution-prefix-steps 1` 是独立协议。它保留一个普通 Flow action server，每次请求
-在同一服务内完整运行真实 VLM 和 Flow4。原有 `asynchronous` 仍指独立 VLM/DiT
-缓存控制器，`synchronous` 仍按推理、执行顺序运行；三者不能混称。
-
-先用观测0完成一次计入 scored control 的 bootstrap 请求，得到动作0。执行动作 k
-之前，主线程复制当前观测 k，将它交给专属模型线程计算动作 k+1；主线程同时执行
-当前结果的**第一个动作**。该原子步结束后，若下一结果未完成，控制器明确等待，
-不补执行旧计划后缀，也不使用 fallback。bootstrap 的源/目标为0/0，随后为0/1、
-1/2等：图像和状态一起滞后一个**物理步**，没有未来状态预测或补偿算法。
-原生解码长度保持 checkpoint 配置，未采纳的动作后缀计入丢弃数量。
-
-每个 `env.step` 仍推进0.05秒仿真时间，但 `ready` 不为它额外等待50ms。
-因此重叠预算来自实际的 `env.step` wall 区间，不等同于50ms；后端渲染和模型同卡
-争用也包含在实测值中。`observation_lag_ticks` 与 capture-to-apply wall AoI 分别
-报告，一个旧物理步不等于额外50ms wall AoI。此实现受
-[The Speedup Paradox §3.1](https://arxiv.org/pdf/2606.28529v3) 启发，但使用真实并发
-RPC/仿真执行；论文中的历史观测抽象和理想周期公式不能替代此处的测量。
+`one_step_async + ready` 固定 K=1、D=1。一次计入 scored control 的 bootstrap 用观测 0 生成动作 0；执行动作 k 前，主线程复制当前观测 k 交给专属模型线程，计算下一目标步 k+1 的完整 VLM + Flow4，同时执行当前计划第一个动作。原子步结束后若下一结果未完成，明确等待，不执行旧后缀或 fallback。
 
 ```bash
 python scripts/evaluate_libero_protocol.py \
@@ -302,59 +159,15 @@ python scripts/evaluate_libero_protocol.py \
   --output .local/one-step-async/deployment
 ```
 
-`--execution-prefix-steps` 是 `--synchronous-chunk-steps` 的兼容别名。experiment plan
-支持同名下划线字段，逐 condition 覆盖全局；同层别名冲突会报错。该模式只支持
-`ready`、prefix1、deployment Flow 和单个普通 action endpoint；paced、πR²、paired/
-resident 特征传输、服务等待下限、视觉限频与 fixed-delay 均明确拒绝。
+bootstrap 的 source/target 为 0/0，随后为 0/1、1/2；图像和状态共同滞后一个物理步，未引入未来状态预测。该调度受 [The Speedup Paradox §3.1](https://arxiv.org/pdf/2606.28529v3) 启发。重叠预算来自实际 `env.step` wall 区间，并包含渲染/模型同卡争用；物理一步 0.05 秒不能直接充当 wall overlap。
 
-专属后台线程创建、使用并销毁自己的 PolicyClient/ZeroMQ context；主线程独占
-MuJoCo 观测和步进，提交的是独立只读数组。每任务同 endpoint 完整 warmup 后只
-重置一次 RNG；warmup socket 超时默认900秒，正式请求恢复120秒的 send/receive
-各自上限。等待 Future 的上限覆盖两次 socket 上限和30秒余量，关闭线程也有上限。
-超时、模型或仿真异常保留不完整 trace 并令实验失败，不会被当作成功 episode。
+后台线程独占自己的 PolicyClient/ZeroMQ context，主线程独占 MuJoCo，跨线程输入为独立只读数组。正式请求 send/receive 分别保留 120 秒上限，Future 等待覆盖两者加 30 秒余量，关闭也有上限。超时或模型/仿真异常保留不完整 trace 并令实验失败。
 
-`request_id`（兼容 `request_tick`）标识唯一策略请求，`target_tick` 是它可能执行的
-目标步；`source_tick` 独立标识源观测步。bootstrap request0与预取 request1 都可源于
-观测0，VLM feature_sequence 使用唯一 request_id，不能用 source_tick 合并它们。
-`policy_request_submitted`、`policy_rpc_started/completed` 分别记录排队提交和模型线程
-实际 RPC 边界；VLM/DiT 的 server stage 时间另存，均不是 kernel-only 时间。
-`cycle_phase` 包含 inference、execution、wait、drain；异步 inference 不标为全程
-暂停仿真。`one_step_async_request` 保存原生计划和采纳状态，
-`one_step_async_execution` 与 `control_tick` 才证明实际动作执行。
+`request_id`（兼容 `request_tick`）唯一标识请求，`target_tick` 与 `source_tick` 分别标识目标和源观测。bootstrap request0 与预取 request1 都可使用观测0，feature_sequence 按 request_id 区分。`policy_request_submitted` 与 `policy_rpc_started/completed` 分开记录提交和实际 RPC；`one_step_async_request` 保存计划与接纳状态，`one_step_async_execution/control_tick` 证明执行。
 
-首次成功、环境终止或 max_steps 后不再执行动作。已在飞行的最终推测请求必须排空，
-记录为 unused；已知最后一步达到 max_steps 时不额外预取。`control_end` 截止控制
-窗口，`async_work_end` 截止全部已提交策略工作，末尾 drain 分开报告。`policy_calls`、
-forward_counts 和完整 RPC 分布包含最终未用请求；`adopted_policy_calls`、实际执行
-步数、丢弃后缀另列。queue report 的 `requests` 保留控制窗口的阶段暴露和 censoring，
-`work_requests` 保留整个 bootstrap/推测/排空过程，不把 drain 隐去。
-`measured_inference_execution_overlap_seconds` 是实际 RPC 与实际执行区间的交集；
-服务端 VLM/DiT 交集另列，不能从“提交在步进之前”推断一定存在 GPU 重叠。
+## Chunked asynchronous lookahead / 动作块长度与异步深度
 
-
-回放导入与 `feature_usage.audit_raw` 共用 `coexecution.async_evidence` 的全工作审计。
-每个规范化 `work_requests` 项都要独立匹配原始 submission、图像 hash、RPC 和服务端
-阶段、唯一 request/target/source、adopted 或 unused 处置及实际动作；最终不用的计算
-同样验证。缺失、重复、错误时序或计数不一致会拒绝结果。控制窗口 `requests` 不变，
-供前端使用的 `replay_requests` 保留完整 VLM/DiT 阶段，`work_end_s` 保留排空尾部。
-前端把 Policy RPC 与 Execute/Wait/Drain 分成可同时可见的轨道；执行动作关联其精确的
-DiT→VLM 来源，并同时显示物理步滞后和 wall AoI。末尾机器人保持真实末帧，模型轨道
-继续展示未执行的最终结果。当前为调试记录，非无插桩性能测试或完整套件成功率。
-
-比较完整策略延时时，异步 `inference_request_seconds` 从主线程提交至响应；其
-`inference_wall_seconds` 仅为 worker 输入准备之后的 RPC。同步的完整调用起点在
-输入准备之前。前端分别标注这些边界，不能直接把异步 RPC 与同步完整调用做加速比。
-
-### Chunked asynchronous lookahead / 动作块长度与异步深度
-
-`chunked_async` 将执行前缀长度 K 与提前推理步数 D 分开：
-`--execution-prefix-steps K --async-overlap-steps D`，要求
-`1 <= D <= K <= checkpoint 原生解码长度`。它复用单步协议的专属 RPC worker，
-保持真实 VLM＋Flow4，每段依次执行原生动作 offset0…K−1。下一段目标 T 为
-K、2K 等；在物理步 T−D 之前捕获当前图像和状态并提交请求，执行完当前段承诺
-的所有动作后才采用下一结果。结果提前就绪也不会提前换段；未就绪时明确等待。
-D=0 使用现有 `synchronous`，而非退化的异步模式。旧 `one_step_async` 保留其
-v1 接口和记录，等价于 K=1、D=1；旧 `asynchronous` 缓存控制器不变。
+`chunked_async` 独立设置前缀 K 和提前量 D。在目标段 T=K、2K… 的边界前，于物理步 T−D 取得观测并发起下一次完整 VLM + Flow4；当前段按原生 offset 0…K−1 执行完后再换段。结果提前就绪仍保留当前承诺段，未就绪则等待。
 
 ```bash
 python scripts/evaluate_libero_protocol.py \
@@ -366,35 +179,59 @@ python scripts/evaluate_libero_protocol.py \
   --output .local/chunked-async/deployment
 ```
 
-experiment plan 支持 `async_overlap_steps`，condition 中的值覆盖全局。
-启动实验前，runner 读取每个 checkpoint 的 `processor_config.json` 中
-`processor_kwargs.modality_configs.libero_sim.action.delta_indices`，按其实际长度
-检查所有 condition 的有效 K；它不会把模型的 H40 当作原生解码长度，也不会加载模型。
-root metadata 优先，缺失时才按上游 loader 回退到 `processor/` 子目录；错误或缺失的
-metadata 在 GPU admission 和子进程启动之前报错。服务加载后的 identity 检查仍保留。
-对照矩阵可采用 K1/D0,1；K2/D0,1,2；K4/D0,1,2,4；K8/D0,1,4,8。
-D0 condition 设置 `execution_coupling=synchronous`；D>0 设置 `chunked_async`。
-该版本仅支持 deployment Flow、ready、一个普通 action endpoint。输入快照独立
-只读，MuJoCo 仅由主线程操作；普通段内步骤复用上一 env.step 的观测，只有 bootstrap
-和指定的预取边界才强制刷新摄像头。没有未来状态预测或异步补偿算法。
+要求 `1 <= D <= K <= native decoded horizon`，只支持 deployment Flow、ready 和单 action endpoint。D=0 使用 synchronous；旧 one_step_async 保留 K1/D1 的 v1 接口。可比较 K1/D0,1；K2/D0,1,2；K4/D0,1,2,4；K8/D0,1,4,8。普通段内步骤复用前一 env.step 观测，bootstrap 和指定预取边界强制刷新摄像头。
 
-bootstrap 的 offset j 来自物理观测0，滞后 j 步；后续每段 offset j 滞后 D+j
-物理步。wall AoI 由真实 capture-to-apply 测量，与仿真0.05秒/步分别报告。
-成功或终止发生在任何 offset 都立即停止。max_steps 截断最后一段的接纳长度，
-例如 K8、上限300时 target296 只接纳4步。接纳但因提前成功未执行的步骤、未接纳
-的原生后缀，以及最终推测请求完全未采用的动作分别计数，不把“接纳”写成“执行”。
+bootstrap 的 offset j 滞后 j 物理步，后续段 offset j 滞后 D+j；wall AoI 使用真实 capture-to-apply。成功或终止可发生在任意 offset；max_steps 截断接纳长度，例如 K8、上限300时 target296 接纳4步。接纳但未执行、原生未接纳后缀和最终完全 unused 请求分别计数。
 
-v2 `chunked_async_request` 在段完成后保存最终计数，`t_s=finalized_s`；实际接纳
-时间使用 `adopted_s`，响应接收使用 `received_s`。`request_id=request_tick=target_tick`
-按 K 递增，不能假设连续；每个 `chunked_async_execution` 与 execution phase 使用
-唯一 `execution_id=tick`，并记录 `executed_offset`。多个物理步关联同一个请求。
-尾部 unused 请求的 target 可能大于实际控制结束步；drain 的 physics tick 始终使用
-实际 `control_steps`。`chunked_async_boundary` 记录结果是否在边界就绪，完整工作
-审计验证对应 wait，以及所有原生 offset、执行动作、源观测和终止后未用计算。
+v2 `chunked_async_request` 在段结束后写最终计数（`t_s=finalized_s`），接纳/接收时刻为 `adopted_s/received_s`。`request_id=request_tick=target_tick` 按 K 递增；`execution_id=tick` 唯一标识动作并保留 `executed_offset`。`chunked_async_boundary` 记录边界是否就绪及等待。尾部 unused target 可以大于终止步；drain 的 physics tick 使用实际 `control_steps`。
 
-主要比较成功/失败、实际 `actual_control_hz`、完整控制窗口除以动作步数的
-`amortized_wall_seconds_per_action`、段边界等待与 gap 的 P95、AoI 和实测重叠。
-`boundary_gap_seconds` 是上一段最后一步 env.step 完成到下一段第一步开始的间隔；
-`adjacent_action_gap_seconds` 是相邻动作开始时刻的间隔。K 较大时段内短间隔会压低
-后一指标的 P50，不能仅凭它声称整体吞吐提升。两种间隔均保留 count 和 sum，原始
-逐动作/逐阶段记录用于汇总分位数，不能把每 episode 的分位数再平均。
+## 时间、来源与汇总合同
+
+### 完成、发布、执行是三个边界
+
+| 证据                                        | 能说明什么                                                      |
+| ------------------------------------------- | --------------------------------------------------------------- |
+| `rpc_completed_s` / `completed_s`           | 客户端记录的完成/释放时刻，早于后续 Future bookkeeping          |
+| `controller_ready_observed_s`               | 控制器实际观察到 readiness；Future 首次变 done 的精确时刻未测量 |
+| `controller_processed_s` / `action_adopted` | 控制器处理结果；兼容 `action_adopted` 可能 installed_slots=0    |
+| `installed_slots` 与 publication 后 buffer  | 写入合法未来动作槽位                                            |
+| `feature_published`                         | 视觉特征对消费者可见                                            |
+| `control_tick.executed_slot`                | 已执行动作与其精确 producer                                     |
+
+因此 `action_ready_to_adopt_seconds` 和 `action_ready_to_first_apply_seconds` 分别度量处理与首次执行等待，并按 producer request 关联。slot 保存 tick、future/committed/fallback、producer_kind/request_tick；bootstrap/fallback 没有普通模型请求 producer，fallback 的 `reserved_at_tick` 给出承诺时间。bootstrap feature sequence 为0，异步视觉 worker 从1开始。
+
+### RPC 与缓存年龄
+
+timing version 2 在可用时优先使用 `server_plan_started_s` 作为 cache use 边界：
+
+| 字段                                                      | 范围                                                              |
+| --------------------------------------------------------- | ----------------------------------------------------------------- |
+| `plan_rpc_started_s`                                      | 实际客户端网络调用起点，combined 时位于安装之前                   |
+| `server_install_started_s/completed_s`                    | 最近一次缓存导入；`feature_installed_in_request` 区分新安装和复用 |
+| `server_plan_started_s`                                   | 可选安装与 stream 就绪之后、服务规划之前的 host 边界              |
+| `server_seconds`                                          | 从规划边界开始的服务时间                                          |
+| `server_request_seconds`                                  | 还包含 combined 安装                                              |
+| `raw_service_seconds`                                     | 队列、网络、安装和规划的完整服务 wall                             |
+| `cache_age_at_request_ms` / `cache_age_at_server_plan_ms` | 分别在 RPC 入口/安装后规划边界计算的年龄                          |
+
+这些 loopback 时间戳使用同一 host monotonic clock。旧记录缺少新字段时保留 `plan_rpc_started_s` 与显式 `use_boundary`。wall 边界差额不等于 CPU 活动或 kernel 时间。
+
+同步完整调用包含 worker 输入准备；整策略异步的 `inference_request_seconds` 从主线程提交到响应，`inference_wall_seconds` 从 worker 准备输入后开始 RPC。比较整体延时需使用匹配边界。真实重叠由 RPC/执行区间的交集计算，服务端 VLM/DiT 交集另列；提交顺序本身不证明 GPU 重叠。
+
+### 终止后的工作与回放
+
+整策略异步首次成功、环境终止或 max_steps 后停止执行；已提交请求排空并标 unused，已知最后一步不再额外预取。`control_end` 截止控制，`async_work_end` 截止全部工作。policy_calls、forward_counts 和完整 RPC 分布包含末尾未用请求，adopted_policy_calls、执行步数与后缀丢弃分别列出。
+
+queue report 的 `requests` 表示控制窗口与 censoring，`work_requests` 表示全部 bootstrap/预取/drain；`coexecution.async_evidence` 核对每个请求的提交、图像 hash、阶段、source/target、接纳或 unused 处置与真实动作。`replay_requests` 保留完整阶段，`work_end_s` 保留尾部。视频在推理暂停或末尾排空时保持已有真实帧，模型轨道继续显示实际工作。
+
+trace 的 `seq` 是唯一插入序号，`t_s` 属于共享 monotonic clock；跨线程插入顺序不保证时间递增。线程收集独立元数据，JSON 写盘在控制和 worker drain 之后。常见生命周期包括 control_start/end、camera_offered/replaced/dropped、vision_started、feature_published、action_submitted/started/completed 和缓冲快照。queue trace 保存来源元数据与已执行动作；启用机器人录制时，图像保存在独立媒体资产中，embedding 不持久化。详细 schema 和视频映射见[回放接口](../coexecution/replay/README.md)。
+
+### 配对与统计
+
+- paced 缓存异步的严格时序有效性要求平均频率距 20 Hz 不超过2%，最大迟延与相邻间隔误差各不超过5 ms。时序无效 episode 仍计入成功率分母。
+- 默认全部 Spatial 10任务；`--task-ids 0 3` 等子集标记 selected_task_subset，单独报告。首次成功即结束，300步上限不保证每 episode 暴露15秒。
+- 初始条件配对核对 fixture 模型、settled state 和初始 RGB 哈希。LIBERO wrapper 在 hard reload 前清理累积的 object-property sampler，保持成功谓词。
+- K/D 对照报告成功率、actual_control_hz、总控制 wall/动作步数、段边界等待和 gap P95、AoI 与实测重叠。`boundary_gap_seconds` 是前段末步完成到后段首步开始；`adjacent_action_gap_seconds` 是相邻动作起点间隔，较大 K 的段内短间隔会影响其分布。
+- 分位数从原始请求/动作汇总，保留 count 和 sum；不平均 episode 分位数。记录相机拷贝和 trace 的插桩成本，视频编码在控制结束后执行。
+
+运行资源与 plan 见 [LIBERO 指南](libero.md)。各条件的配置、episode、trace、summary 和初始条件审计保留在本地输出目录，并绑定实际源码、权重和硬件身份；训练与计时部署使用独立时段或空闲设备。
