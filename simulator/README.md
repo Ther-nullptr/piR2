@@ -174,6 +174,11 @@ intervals and the existing S2/S1 source aliases; it does not guess component
 durations from a complete request's wall time. The server imports only standard-library evidence
 helpers, never Torch, NumPy archives, a simulator or a model.
 
+The two evidence tabs are the single view switch. Initial loading and catalog
+refresh share experiment filtering and run-option rendering; the card grid follows
+the number of visible precisions. Recorded source dependencies are interpreted by
+`measured-model.js` and `replay-timeline.js`.
+
 - **Independent model**: select a measurement boundary, real input and seed.
   `policy` includes raw-input preparation and action decoding;
   `preparation_transfer` only prepares/transfers inputs and shows no neural

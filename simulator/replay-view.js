@@ -104,10 +104,14 @@
         : "执行段无额外等待 · 推理期间暂停仿真";
     return cadenceLabels[mode] ?? mode;
   }
+  const catalogRuns = () =>
+    state.descriptors.length ? state.descriptors : state.runs;
+  const episodeKey = (episode) =>
+    [episode.task_id, episode.episode_id, episode.seed].join("/");
   function configureCouplings(preferred = state.executionCoupling) {
     const couplings = [
       ...new Set(
-        (state.descriptors.length ? state.descriptors : state.runs)
+        catalogRuns()
           .filter((run) => run.kind === "deployment")
           .map(R.deploymentCoupling),
       ),
@@ -122,7 +126,7 @@
   function configureCadences(preferred = state.executionClock) {
     const cadences = [
       ...new Set(
-        (state.descriptors.length ? state.descriptors : state.runs)
+        catalogRuns()
           .filter(
             (run) =>
               run.kind === "deployment" &&
@@ -145,7 +149,7 @@
     const choices = [
       ...new Set(
         R.replayDescriptors(
-          state.descriptors.length ? state.descriptors : state.runs,
+          catalogRuns(),
           "deployment",
           state.executionClock,
           state.executionCoupling,
@@ -170,7 +174,7 @@
   }
   function configureSchedules(preferred = state.schedule) {
     const choices = R.scheduleChoices(
-      state.descriptors.length ? state.descriptors : state.runs,
+      catalogRuns(),
       state.executionClock,
       state.executionCoupling,
     );
@@ -400,21 +404,16 @@
     for (const element of document.querySelectorAll(".run-select")) {
       const run = state.rows[Number(element.dataset.index)]?.run;
       if (!run) continue;
-      const descriptors = R.replayDescriptors(
-        state.descriptors,
-        state.kind,
-        state.executionClock,
-        state.executionCoupling,
-        state.schedule,
-        state.controllerPolicy,
-      ).filter((descriptor) => descriptor.precision === run.precision);
+      const descriptors = selectedDescriptors().filter(
+        (descriptor) => descriptor.precision === run.precision,
+      );
       if (!descriptors.some((descriptor) => descriptor.id === run.id))
         descriptors.unshift(run.descriptor ?? run);
       options(
         element,
         descriptors.map((descriptor) => [
           descriptor.id,
-          descriptor.mode ?? descriptor.label ?? descriptor.id,
+          descriptor.label ?? descriptor.mode ?? descriptor.id,
         ]),
         run.id,
       );
@@ -459,36 +458,15 @@
           (d) => !state.runs.some((r) => r.precision === d.precision),
         );
         if (changedSchedule || addedPrecision) {
-          state.clock = 0;
-          state.sample = null;
-          await loadRuns();
-          return;
-        }
-        if (
-          !state.runs.length &&
-          R.replayDescriptors(
-            state.descriptors,
-            state.kind,
-            state.executionClock,
-            state.executionCoupling,
-            state.schedule,
-            state.controllerPolicy,
-          ).length
-        ) {
-          await loadRuns();
+          await reloadCohort();
           return;
         }
         updateRunOptions();
         const precisions = [
           ...new Set(
-            R.replayDescriptors(
-              [...state.descriptors, ...state.runs],
-              state.kind,
-              state.executionClock,
-              state.executionCoupling,
-              state.schedule,
-              state.controllerPolicy,
-            ).map((run) => run.precision),
+            selectedDescriptors([...state.descriptors, ...state.runs]).map(
+              (run) => run.precision,
+            ),
           ),
         ];
         options(
@@ -546,6 +524,16 @@
         String(kind === state.kind),
       );
   }
+  function reloadCohort() {
+    state.clock = 0;
+    state.sample = null;
+    return loadRuns();
+  }
+  function setView(kind) {
+    state.kind = kind;
+    $("speed").value = kind === "model" ? "0.01" : "1";
+    return reloadCohort();
+  }
   async function loadRuns() {
     stop();
     closeStreams();
@@ -583,14 +571,7 @@
       else url.searchParams.set(key, value);
     }
     history.replaceState(null, "", url);
-    const descriptors = R.replayDescriptors(
-        state.descriptors,
-        kind,
-        state.executionClock,
-        state.executionCoupling,
-        state.schedule,
-        state.controllerPolicy,
-      ),
+    const descriptors = selectedDescriptors(),
       precisions = [...new Set(descriptors.map((d) => d.precision))].sort(
         (a, b) =>
           ["bf16", "w8a8", "w4a4"].indexOf(a) -
@@ -741,9 +722,7 @@
       const unique = new Map();
       for (const run of runs)
         for (const episode of run.episodes ?? []) {
-          const key = [episode.task_id, episode.episode_id, episode.seed].join(
-            "/",
-          );
+          const key = episodeKey(episode);
           if (!unique.has(key)) unique.set(key, episode);
         }
       samples = [...unique.entries()];
@@ -753,20 +732,13 @@
           key,
           `Task ${e.task_id} · episode ${e.episode_id} · seed ${e.seed}`,
         ]),
-        previous?.task_id != null
-          ? [previous.task_id, previous.episode_id, previous.seed].join("/")
-          : null,
+        previous?.task_id != null ? episodeKey(previous) : null,
       );
       if (preserve && state.followLatest) {
         const latest = runs
           .find((run) => run.id === state.latestStreamRun)
           ?.episodes?.at(-1);
-        if (latest)
-          $("sample").value = [
-            latest.task_id,
-            latest.episode_id,
-            latest.seed,
-          ].join("/");
+        if (latest) $("sample").value = episodeKey(latest);
       }
       state.sample = unique.get($("sample").value) ?? null;
     }
@@ -844,8 +816,7 @@
         run,
         episode:
           (run.episodes ?? []).find(
-            (e) =>
-              [e.task_id, e.episode_id, e.seed].join("/") === $("sample").value,
+            (e) => episodeKey(e) === $("sample").value,
           ) ?? null,
       }));
       state.end = Math.max(
@@ -985,33 +956,19 @@
     );
   }
   function renderCards() {
-    $("precision-cards").style.gridTemplateColumns =
-      state.rows.length === 1 ? "minmax(0,1fr)" : "";
+    $("precision-cards").style.setProperty(
+      "--precision-count",
+      state.rows.length || 1,
+    );
     $("precision-cards").innerHTML =
       state.rows
         .map(
           ({ run }, i) =>
-            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2>${state.kind === "deployment" ? `<span class="coupling-badge">${R.policyVariant(run) === "pir2" ? "πR² · cached VLM / rolling DiT" : R.deploymentCoupling(run) === "synchronous" ? "Synchronous" : R.deploymentCoupling(run) === "one_step_async" ? "One-step async" : R.deploymentCoupling(run) === "chunked_async" ? "Chunked async" : "Asynchronous"}</span>` : ""}<select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置">${state.descriptors
-              .filter(
-                (d) =>
-                  d.kind === state.kind &&
-                  d.precision === run.precision &&
-                  (state.kind !== "deployment" ||
-                    (R.deploymentCadence(d) === state.executionClock &&
-                      R.deploymentCoupling(d) === state.executionCoupling &&
-                      R.sameSchedule(R.deploymentSchedule(d), state.schedule) &&
-                      R.controllerPolicy(d) === state.controllerPolicy)),
-              )
-              .map(
-                (d) =>
-                  `<option value="${esc(d.id)}" ${d.id === run.id ? "selected" : ""}>${esc(d.label ?? d.mode ?? d.id)}</option>`,
-              )
-              .join(
-                "",
-              )}</select></div><div class="media-stage"><span class="media-message">等待实际观测</span><div class="frame-meta"></div></div><div class="card-status"></div><div class="metrics"></div><p class="card-details"></p><button class="card-action" data-index="${i}">检查当前动作来源</button><a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
+            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2>${state.kind === "deployment" ? `<span class="coupling-badge">${R.policyVariant(run) === "pir2" ? "πR² · cached VLM / rolling DiT" : R.deploymentCoupling(run) === "synchronous" ? "Synchronous" : R.deploymentCoupling(run) === "one_step_async" ? "One-step async" : R.deploymentCoupling(run) === "chunked_async" ? "Chunked async" : "Asynchronous"}</span>` : ""}<select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置"></select></div><div class="media-stage"><span class="media-message">等待实际观测</span><div class="frame-meta"></div></div><div class="card-status"></div><div class="metrics"></div><p class="card-details"></p><button class="card-action" data-index="${i}">检查当前动作来源</button><a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
         )
         .join("") ||
       '<p class="loading">此证据类型没有记录。已配置的其他视图仍可使用。</p>';
+    updateRunOptions();
     for (const el of document.querySelectorAll(".run-select"))
       el.addEventListener("change", () => {
         const row = state.rows[Number(el.dataset.index)];
@@ -2071,17 +2028,7 @@
     });
     $("kernel-details").addEventListener("toggle", renderKernelTimeline);
     for (const kind of ["model", "deployment"])
-      $("mode-" + kind).addEventListener("click", () => {
-        $("evidence-mode").value = kind;
-        $("evidence-mode").dispatchEvent(new Event("change"));
-      });
-    $("evidence-mode").addEventListener("change", () => {
-      state.kind = $("evidence-mode").value;
-      state.clock = 0;
-      state.sample = null;
-      $("speed").value = state.kind === "model" ? "0.01" : "1";
-      loadRuns();
-    });
+      $("mode-" + kind).addEventListener("click", () => setView(kind));
     $("scope").addEventListener("change", () => {
       state.scope = $("scope").value;
       configureSamples();
@@ -2090,27 +2037,21 @@
       state.executionClock = $("execution-clock").value;
       configureControllers();
       configureSchedules();
-      state.clock = 0;
-      state.sample = null;
-      loadRuns();
+      reloadCohort();
     });
     $("execution-coupling").addEventListener("change", () => {
       state.executionCoupling = $("execution-coupling").value;
       configureCadences();
       configureControllers();
       configureSchedules();
-      state.clock = 0;
-      state.sample = null;
-      loadRuns();
+      reloadCohort();
     });
     $("controller-policy").addEventListener("change", () => {
       state.controllerPolicy =
         $("controller-policy").value === "unknown"
           ? null
           : $("controller-policy").value;
-      state.clock = 0;
-      state.sample = null;
-      loadRuns();
+      reloadCohort();
     });
     for (const id of ["execution-prefix-steps", "async-overlap-steps"])
       $(id).addEventListener("change", () => {
@@ -2118,9 +2059,7 @@
           k: Number($("execution-prefix-steps").value),
           d: Number($("async-overlap-steps").value),
         });
-        state.clock = 0;
-        state.sample = null;
-        loadRuns();
+        reloadCohort();
       });
     $("record-type").addEventListener("change", () => {
       state.type = $("record-type").value;
@@ -2133,14 +2072,7 @@
     });
     $("precision").addEventListener("change", () => {
       state.precision = $("precision").value;
-      const descriptors = R.replayDescriptors(
-        state.descriptors,
-        state.kind,
-        state.executionClock,
-        state.executionCoupling,
-        state.schedule,
-        state.controllerPolicy,
-      );
+      const descriptors = selectedDescriptors();
       const missing = descriptors.some(
         (descriptor) =>
           (state.precision === "all" ||
@@ -2297,7 +2229,6 @@
               )
             ? "deployment"
             : "model";
-      $("evidence-mode").value = state.kind;
       $("speed").value = state.kind === "model" ? "0.01" : "1";
       showCatalogMetadata();
       await loadRuns();

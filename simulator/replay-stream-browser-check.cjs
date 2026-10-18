@@ -657,7 +657,7 @@ async function main() {
             .count(),
           0,
         );
-        await page.selectOption("#evidence-mode", "deployment");
+        await page.locator("#mode-deployment").click();
         await page.waitForFunction(
           () =>
             document.querySelector("#data-status").dataset.state === "ready",
@@ -673,8 +673,8 @@ async function main() {
         assert.equal(await page.locator(".precision-card").count(), 0);
         assert.equal(await page.locator("#sample option").count(), 0);
         assert.equal(
-          await page.locator("#evidence-mode").inputValue(),
-          "deployment",
+          await page.locator("#mode-deployment").getAttribute("aria-pressed"),
+          "true",
         );
         assert.equal(await sourceCount(page), 2);
       },
@@ -685,7 +685,7 @@ async function main() {
       async ({ page, pendingSnapshots, snapshotHeld }) => {
         await snapshotHeld;
         assert.equal(await sourceCount(page), 0);
-        await page.selectOption("#evidence-mode", "deployment");
+        await page.locator("#mode-deployment").click();
         assert.equal(
           pendingSnapshots.length,
           1,
@@ -702,8 +702,8 @@ async function main() {
         assert.equal(await sourceCount(page), 0);
         assert.equal(await page.locator(".precision-card").count(), 0);
         assert.equal(
-          await page.locator("#evidence-mode").inputValue(),
-          "deployment",
+          await page.locator("#mode-deployment").getAttribute("aria-pressed"),
+          "true",
         );
       },
       { holdSnapshot: "contract-a" },
@@ -841,6 +841,9 @@ async function main() {
         await page.selectOption("#sample", "contract-b-request-2");
         await seek(page, 250);
         const before = await selection(page);
+        const beforeLabel = await page
+          .locator(".run-select option:checked")
+          .textContent();
         data.runs.push({
           ...data.runs[0],
           id: "contract-c",
@@ -857,6 +860,11 @@ async function main() {
           timeout: 6500,
         });
         assert.deepEqual(await selection(page), before);
+        assert.equal(
+          await page.locator(".run-select option:checked").textContent(),
+          beforeLabel,
+          "catalog discovery must retain the human run label",
+        );
         assert.equal(
           await sourceCount(page),
           2,
@@ -893,6 +901,27 @@ async function main() {
       async ({ page }) => {
         const bf16 = await waitForSource(page, "legacy-bf16");
         const w8 = await waitForSource(page, "legacy-w8a8");
+        const grid = await page
+          .locator("#precision-cards")
+          .evaluate((element) => {
+            const cards = [...element.querySelectorAll(".precision-card")];
+            const style = getComputedStyle(element);
+            return {
+              count: cards.length,
+              available:
+                element.clientWidth -
+                parseFloat(style.paddingLeft) -
+                parseFloat(style.paddingRight),
+              used:
+                cards.at(-1).getBoundingClientRect().right -
+                cards[0].getBoundingClientRect().left,
+            };
+          });
+        assert.equal(grid.count, 2);
+        assert.ok(
+          Math.abs(grid.used - grid.available) < 2,
+          "two precision cards must fill the desktop grid without a reserved third column",
+        );
         const status = (precision) =>
           page.locator(
             `.precision-card[data-precision="${precision}"] .card-status`,
@@ -1008,7 +1037,10 @@ async function main() {
           page.locator(
             `.precision-card[data-precision="${precision}"] .card-status`,
           );
-        assert.doesNotMatch(await status("bf16").innerText(), /policy variant/);
+        assert.doesNotMatch(
+          await status("bf16").innerText(),
+          /model or controller policy/,
+        );
         assert.equal(
           await page.locator("#execution-prefix-label").isVisible(),
           false,
@@ -1027,7 +1059,10 @@ async function main() {
             },
           }),
         );
-        assert.match(await status("bf16").innerText(), /policy variant/);
+        assert.match(
+          await status("bf16").innerText(),
+          /model or controller policy/,
+        );
         await emit(
           page,
           w8,
@@ -1035,7 +1070,10 @@ async function main() {
             projection: { op: "replace", run: policyRun("policy-w8a8", null) },
           }),
         );
-        assert.match(await status("w8a8").innerText(), /policy variant/);
+        assert.match(
+          await status("w8a8").innerText(),
+          /model or controller policy/,
+        );
         await emit(
           page,
           bf16,
@@ -1043,8 +1081,14 @@ async function main() {
             projection: { op: "replace", run: policyRun("policy-bf16") },
           }),
         );
-        assert.doesNotMatch(await status("bf16").innerText(), /policy variant/);
-        assert.match(await status("w8a8").innerText(), /policy variant/);
+        assert.doesNotMatch(
+          await status("bf16").innerText(),
+          /model or controller policy/,
+        );
+        assert.match(
+          await status("w8a8").innerText(),
+          /model or controller policy/,
+        );
       },
       {
         catalog: {

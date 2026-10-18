@@ -58,8 +58,8 @@ if (!catalog && !external)
     );
     assert.equal(await page.locator(".precision-card").count(), 3);
     assert.equal(
-      await page.locator("#evidence-mode").inputValue(),
-      "deployment",
+      await page.locator("#mode-deployment").getAttribute("aria-pressed"),
+      "true",
       "real robot view should be the visible default",
     );
     const configuredCatalog = await page.evaluate(async () =>
@@ -112,7 +112,7 @@ if (!catalog && !external)
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
-    await page.selectOption("#evidence-mode", "model");
+    await page.locator("#mode-model").click();
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
@@ -159,7 +159,7 @@ if (!catalog && !external)
       await page.locator("#precision-cards").innerText(),
       /did not retain outputs|尚未产生/,
     );
-    await page.selectOption("#evidence-mode", "deployment");
+    await page.locator("#mode-deployment").click();
     await page.waitForSelector(".precision-card video");
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
@@ -268,7 +268,6 @@ if (!catalog && !external)
       await page.locator("#precision-cards").innerText(),
       /当前动作的状态年龄/,
     );
-    assert.equal(await page.locator(".lineage-row").count(), 0);
     assert.equal(await page.locator(".task-lane").count(), 6);
     assert.ok(
       await page.locator('.task-lane[data-stage="action"] .task-block').count(),
@@ -387,15 +386,15 @@ if (!catalog && !external)
       await new Promise((r) => setTimeout(r, 200));
       await route.continue();
     });
-    await page.selectOption("#evidence-mode", "model");
-    await page.selectOption("#evidence-mode", "deployment");
+    await page.locator("#mode-model").click();
+    await page.locator("#mode-deployment").click();
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
     await page.waitForTimeout(300);
     assert.equal(await page.locator(".precision-card video").count(), 3);
     await page.unroute("**/api/replay/run/model-*");
-    await page.selectOption("#evidence-mode", "model");
+    await page.locator("#mode-model").click();
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
@@ -403,7 +402,7 @@ if (!catalog && !external)
       await new Promise((r) => setTimeout(r, 450));
       await route.continue();
     });
-    await page.selectOption("#evidence-mode", "deployment");
+    await page.locator("#mode-deployment").click();
     assert.equal(await page.locator("#precision").isDisabled(), true);
     await page.locator("#precision").evaluate((e) => {
       e.value = "w8a8";
@@ -442,8 +441,8 @@ if (!catalog && !external)
       ];
       await route.fulfill({ json: run });
     });
-    await page.selectOption("#evidence-mode", "model");
-    await page.selectOption("#evidence-mode", "deployment");
+    await page.locator("#mode-model").click();
+    await page.locator("#mode-deployment").click();
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
@@ -462,7 +461,7 @@ if (!catalog && !external)
     await page.route("**/api/replay/run/model-*", (route) =>
       route.fulfill({ status: 404, body: "missing" }),
     );
-    await page.selectOption("#evidence-mode", "model");
+    await page.locator("#mode-model").click();
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
@@ -505,8 +504,8 @@ if (!catalog && !external)
       }));
       await route.fulfill({ json: run });
     });
-    await page.selectOption("#evidence-mode", "deployment");
-    await page.selectOption("#evidence-mode", "model");
+    await page.locator("#mode-deployment").click();
+    await page.locator("#mode-model").click();
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
@@ -540,8 +539,8 @@ if (!catalog && !external)
     assert.equal(await page.locator(".task-block").count(), 0);
     assert.match(await page.locator("#evidence-note").innerText(), /边界未知/);
     withoutPairing = true;
-    await page.selectOption("#evidence-mode", "deployment");
-    await page.selectOption("#evidence-mode", "model");
+    await page.locator("#mode-deployment").click();
+    await page.locator("#mode-model").click();
     await page.waitForFunction(
       () => document.querySelector("#data-status").dataset.state === "ready",
     );
