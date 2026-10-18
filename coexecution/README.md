@@ -1,420 +1,45 @@
-# Single-GPU S1/S2 execution tools
+# GR00T 推理、量化与算子参考
 
-The S1/S2 replay tools below are auxiliary GR00T inference and profiling tools. Their workload loads the SO100 replay checkpoint `outputs/pir2-so100-smoke/checkpoint-10` and real prerecorded SO100 observations. The separate opt-in GR00T fusion/integer adapters described below target standard LIBERO Flow and serial πR² inference. Neither replay profiling nor adapter tests replace closed-loop evaluation.
+`coexecution` 把 GR00T 的真实 VLM（S2）、DiT 动作头（S1）、执行调度和测量边界拆成可组合模块。共享运行时优化用于减少输入准备与提交开销，量化和融合用于减少模型计算与中间读写；两类优化通过同一策略接口进入 LIBERO 闭环。
 
-The two workers run a real VLM (S2) and a rolling DiT action head (S1) on one physical GPU. Feature handoff uses completion events and reader leases. Optional fusion, static input handling and CUDA Graph variants are explicit A/B choices. Numerical checks restore a paired starting buffer and compare with the eager path; periodic replay also records deadlines and feature ages.
+本页回答“实现在哪里、开关如何组合、算子合同是什么”。实验步骤见[测量与争用实验](../docs/coexecution.md)，任务运行见 [LIBERO](../docs/libero.md)，调度与特征传输见[时序协议](../docs/timing-protocols.md)，环境与编译见[环境配置](../docs/environment.md)。主线使用官方 Spatial 任务权重及其 πR² 适配检查点。
 
-## Commands
+## 模块地图
 
-Prepare the pinned GR00T source and GPU environment as described in [environment setup](../docs/environment.md). Run the separate SO100 demonstration training entrypoint only if you need this replay checkpoint. Select an idle GPU; the launcher performs a preflight occupancy check:
+| 路径                                                              | 职责                                              |
+| ----------------------------------------------------------------- | ------------------------------------------------- |
+| `optimization/config.py`、`tactics.py`、`operators.py`            | 不加载 GPU 的配置、tactic、算子清单与 profile     |
+| `optimization/capabilities.py`、`session.py`                      | 后端准入、可恢复安装、运行身份与证据              |
+| `optimization/groot/projections.py`、`integer.py`、`floating.py`  | 共用模型节点发现与投影替换                        |
+| `optimization/groot/*_connections.py`                             | GR00T norm、residual 等 producer 到打包算子的连接 |
+| `optimization/execution/graph.py`、`cache.py`                     | 纯 DiT Graph、调用内缓存与串行所有权              |
+| `optimization/execution/preparation.py`、`tokenization.py`        | 输入路由与精确文本缓存                            |
+| `optimization/execution/guards.py`、`patching.py`、`groot/vlm.py` | 冻结执行校验、实例级适配与完整 VLM Graph          |
+| `optimization/backends/integer/linear.py`                         | 整数激活打包、GEMM 与 dispatch                    |
+| `optimization/backends/thor/linear.py`、`packing.py`              | Thor 浮点格式与执行                               |
+| `libero/inference.py`、`measurement.py`、`service.py`             | 常驻输入模型接口、独立测量与策略服务              |
+| `profiling/`、`replay/`                                           | VLM/DiT 争用实验、模型及机器人回放证据            |
 
-```bash
-PIR2_GPU=0 bash scripts/run_single_gpu_baseline.sh measure
-PIR2_GPU=0 bash scripts/run_single_gpu_baseline.sh runtime
-PIR2_GPU=0 bash scripts/run_single_gpu_baseline.sh protocols
-```
+实际 CUDA/Triton 实现在 `kernels/`；模型连接留在 `optimization/groot/`。后端不依赖 LIBERO 调度器或 RPC。整数与浮点后端共享模型发现及 Graph 生命周期，各自拥有 packed format。配置导入不加载 Torch/GPU，安装时只加载选中的实现。旧 `coexecution.groot_optimization`、`quantization`、`floating_quantization` 导入路径保留兼容转发；新增实现使用上述目录。
 
-Run one command at a time. Use `PIR2_OUTPUT` for a new result directory. Trace modes require Nsight Systems on PATH or an explicit `PIR2_NSYS` executable. The `test_*_gpu.py` modules require CUDA and are opt-in; CI only runs timeline/launch-attribution accounting tests.
+<a id="common-policy-runtime--公共推理路径"></a>
 
-See [measurement definitions](../docs/coexecution.md). Raw JSON, plots, SQLite exports, logs and Nsight traces stay local. These tools do not by themselves demonstrate LIBERO accuracy, physical control stability, quantization quality or performance on another GPU.
+## 共用策略接口
 
-## Experimental GR00T fusion and integer inference
-
-### Module ownership / 模块职责
-
-GR00T optimization implementations live under `coexecution/optimization`:
-
-| Path | Responsibility / 职责 |
-| --- | --- |
-| `config.py`, `tactics.py`, `operators.py` | GPU-free configuration, tactic parsing and operator inventory/profiles; 配置与算子选择 |
-| `capabilities.py` | Selected-backend preflight and runtime identity; 后端能力与来源 |
-| `session.py` | Reversible installation, restoration and evidence; 安装生命周期 |
-| `groot/projections.py` | Shared model inventory; 共用模型节点发现 |
-| `groot/integer.py`, `groot/floating.py` | Model projection replacement; 模型适配 |
-| `groot/*_connections.py` | GR00T norm/residual producer boundaries; 模型连接 |
-| `execution/graph.py` | Shared pure-DiT graph capture; 共用 Graph |
-| `execution/cache.py` | Invocation-local cache ownership and serial guards; 调用边界 |
-| `execution/preparation.py`, `execution/tokenization.py` | Scoped input routing and exact-text token preparation; 输入准备 |
-| `execution/guards.py`, `execution/patching.py` | Host metadata guards and instance-local callable adaptation; 状态校验 |
-| `groot/vlm.py` | Static VLM metadata and optional complete VLM capture; 完整 VLM 执行 |
-| `backends/integer/linear.py` | Integer packing, GEMM and dispatch; 整数算子 |
-| `backends/thor/linear.py`, `backends/thor/packing.py` | Thor floating formats and execution; 浮点算子 |
-
-Configuration and default scope imports do not load Torch or GPU kernels. A
-session imports only its selected implementation. Backends do not import LIBERO
-schedulers or RPC services; integer and floating implementations share model
-inventory and Graph handling, not packed formats. Actual CUDA sources and the
-selected shared Triton primitives now live under `coexecution/kernels`: `common`,
-`ampere_ada` and `blackwell`. The official `vendor/cutlass` submodule is the default
-header dependency; a compatible `CUTLASS_ROOT` can select existing headers.
-Model-specific connections remain in `optimization/groot`; Python entrypoints do not resolve an
-external robotics source tree or prebuilt shared-library path.
-
-原有 `coexecution.groot_optimization`、`quantization`、`floating_quantization`
-等导入路径作为兼容转发保留；新增实现使用上述目录。已有默认精度、packing、scale、
-tactic 和融合公式保留；新增 profile 与模式参数用于显式选择。不同硬件共用模型与
-调度语义，不复制整套推理服务。
-
-Optimization contracts are in `tests/contracts`, explicit CUDA tests in
-`tests/gpu`, and reusable fixtures in `tests/helpers`. GPU tests require
-`PIR2_GPU_TESTS=1`; public CI checks configuration, scheduling and accounting only.
-The separate SO100/queue tools retain their existing modules and tests.
-
-### Common policy runtime / 公共推理路径
-
-Common runtime options apply to the same BF16 or quantized CUDA policy:
-`--input-preparation` routes only consumed tensor fields to each model component;
-`--tokenizer-cache` caches exact expanded text after fresh image processing;
-`--static-vlm` prepares fixed text/grid/mask metadata without device-side scalar
-reads; `--vlm-cuda-graph` captures the complete VLM and requires `--static-vlm`.
-`--image-array-preparation` replaces the pinned GR00T processor's PIL conversion
-with owned contiguous uint8 RGB arrays. Its original conversation, chat template,
-crop/resize, state and Qwen collation still run; every image buffer is fresh.
-Scope entry checks pinned GR00T/Transformers source and live method code and
-admits the stock Qwen2VL fast or slow pixel processor. Replacement processors or
-methods require closing the scope; unsupported implementations fail admission.
-Heights of 1 or 3 pixels are rejected because ndarray channel inference would be
-ambiguous; normal task images retain their original preprocessing.
-`--compiled-host-guards` compiles the exact Python guard source with Cython and
-binds its predicate methods to each guard instance. Discovery and all frozen
-execution checks retain the Python reference behavior, including tracked weight
-mutations, methods, hooks, closures, defaults, configuration and topology.
-Images, robot state and VLM features are recomputed for every observation.
-These options default off. Graph and metadata caches are bounded, and new input
-signatures require warmup. Runtime changes through `optimized.set_runtime(...)`
-retain the selected precision controller and the separate DiT graph cache.
-
-Compiled guards require CPython, a working host C compiler and the optional
-`Cython==3.1.2` and `setuptools` packages in the model environment. Install them
-with `python -m pip install Cython==3.1.2 setuptools==84.0.0` when using that flag.
-Startup builds a native extension from the unchanged guard source; generated
-source, binaries and build logs stay in `~/.cache/pir2/host-guards`, or the directory
-specified by `PIR2_HOST_GUARD_CACHE`. The cache is locked across processes and
-keyed by exact source, CPython ABI, platform, compiler identity and build settings.
-Evidence records those inputs and the compiled binary hash. Missing dependencies
-or build failures fail explicitly. Normal imports, CLI help and the default
-Python backend never invoke a compiler.
-
-Use `python -m coexecution.libero.measurement --help` for paired measurements of
-raw-observation policy wall time, prepared-input complete-model time, CUDA event
-spans and separately collected GPU activity. These timing scopes overlap and
-must not be added or subtracted as a CPU/GPU decomposition. The module validates
-same-precision actions and checks that timed graph calls replay without capture.
-It requires CUDA, the official Spatial task checkpoint and its dataset; profiler
-output and numerical archives stay local.
-The cumulative modes are `baseline`, `prepared`, `tokenized`, `static`, `graph`,
-`images` and `compiled`; the last two add image arrays and compiled guards to the
-preceding mode. Keep `--action-cuda-graph` and precision settings fixed for each
-paired run. Use the same runtime flags for BF16, W8A8 and W4A4 comparisons.
-The default mode list remains `baseline` through `graph`; explicitly select
-`--modes graph images compiled` to measure the new host optimizations.
-Same-precision action checks use `baseline` when requested, otherwise the first
-requested mode (`graph` in this example); results record that reference explicitly.
-
-For independent quantization debugging, select `--measurement-boundary model-only`.
-This prepares and owns the selected real observation input trees once per
-precision/runtime block (bounded by `--max-prepared-observations`, default 16),
-collects raw-policy action/RNG references, then warms and replays those resident
-inputs. Each recorded call recomputes the complete VLM and all four Flow steps;
-no neural output is cached. Observation selection, image conversion, collation,
-input copies, RPC, simulation, action decoding, numerical checks and file writes
-are outside the model timer. Raw/prepared comparisons remain available with the
-default `--measurement-boundary comparison`; their separate wall probes are not
-an additive decomposition. Model-only groups runtime modes into blocks rather
-than interleaving preparation and raw calls with recorded model calls.
-
-`coexecution.libero.inference.PreparedInferenceEngine` exposes `vlm`, `action`
-and `full` on caller-owned resident inputs. Preparation and decoding are separate
-adapters, and decoder state is opaque to the engine. The engine returns the
-upstream output directly and retains no outputs: snapshot retained results
-outside timing according to the component's lifetime contract. Callers establish
-CUDA, inference mode, stream readiness and serial ownership; CUDA completion is
-measured at the runner boundary. Imports and CLI help do not load a model.
-Preparation copies mutable inputs before upstream preparation registers static
-metadata. Registered metadata identities stay intact and retain their mutation
-guards; keep the corresponding optimization scope and bindings alive throughout
-the prepared replay. No input copy or metadata registration occurs in the engine.
-
-Clean latency runs do not allocate timing events or profiler scopes. Explicit
-`--cuda-events` adds CUDA span and host-return detail; `--profile-rounds N` runs
-a separate instrumented pass with actual request/VLM/action annotations. In
-model-only profiles, the fixed input cohort is prepared before profiling starts.
-Samples retain precision, observation identity, request identity and seed; trace
-requests retain the corresponding annotation and input identity. Instrumented
-GPU work, CUDA span and complete host wall latency remain different metrics.
-The runner checks exact same-precision decoded actions and CPU/CUDA RNG against
-raw policy calls before accepting model-only results. These are execution gates,
-not LIBERO success or quantization-quality claims.
-
-Run `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_prepared_inference_gpu.py`
-in the pinned CUDA environment for actual fresh-input ownership, original model
-output/RNG equality and output-lifetime gates, including static VLM and VLM graph
-composition with input separation. Host CI uses interface objects,
-never CPU neural inference.
-
-Run `PIR2_NATIVE_TESTS=1 python -m pytest tests/native/test_compiled_host_guards.py`
-for native predicate/mutation gates, and
-`PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_image_preparation_gpu.py` in the
-pinned environment for actual image/collator equality and ownership checks.
-The latter performs deployment preprocessing only; complete policy action/RNG
-gates still require CUDA.
-
-`--action-cuda-graph` additionally captures S1 visual/state conditioning and the
-unchanged four-step Flow action head. It supports BF16, W8A8 and W4A4, requires
-non-streaming H40, and preserves the policy's decoded horizon and output API.
-The adapter calls the pinned upstream algorithm with one fresh explicit noise
-tensor per request, including the first capture. Features, state, embodiment ID
-and masks are copied freshly; validated integer image delay is part of the
-bounded eight-entry graph signature along with shape, dtype, stride and stream.
-Inpaint, rolling/streaming requests and unknown options or hooks are rejected.
-Scheduler state, cache timestamps, noise generation and policy decoding remain
-outside the graph. Returned tensors have independent storage.
-
-When both graph flags are selected, the action graph supersedes the inner
-`--dit-cuda-graph`; evidence reports this explicitly. Runtime mode changes close
-and recapture action graphs after installing new serial boundaries. Warm each
-signature before measuring. Capture failures propagate and the adapter stays
-installed until explicit scope close, with no automatic eager fallback. Close
-before replacing weights, methods or attention settings; tracked mutations are
-rejected, while untracked `.data`/foreign writes are outside the frozen scope
-contract. CUDA callers must establish input/weight readiness on their stream.
-
-Service audits preserve `python_forward_counts` as physical hook observations.
-For the larger graph, `forward_counts.dit` is the logical NFE proved by four DiT
-calls in every captured Flow body and explicit replay counts; `dit_count_source`
-and `action_graph` identify that source. Warmup/capture hooks and logical request
-work are separate. The measurement and profiler modules require one whole-action
-replay and four logical evaluations per timed call. Select the same graph flag
-for BF16 and quantized comparisons; these execution checks establish neither
-quantization quality nor closed-loop success.
-
-`--action-kv-reuse` additionally reuses each cross-attention layer's K/V outputs
-within that unchanged Flow4 body. It requires `--action-cuda-graph`, non-streaming
-H40/NFE4, the pinned interleaved AlternateVLDiT, frozen eval execution and an
-admitted SDPA processor. BF16, W8A8 and W4A4 support both standard
-`AttnProcessor2_0` and `PreparedAttention`; operator fusion is independent. Q,
-self-attention, masks, state/noise and the four denoising evaluations stay fresh.
-Installed integer grouping, tactics and producer packs remain in effect.
-
-The scope starts empty for every warmup/captured body. Each layer's first K/V
-computation is captured, so every replay recomputes it from the newly copied
-observation. The remaining three evaluations use those outputs. All Python
-K/V references are released on body exit, including exceptions, independently
-of per-DiT projection-cache resets. There is no reuse across observations or
-reliance on feature pointers as freshness evidence. Closing restores projection
-forwards; changing the flag through `set_runtime(action_kv_reuse=...)` closes and
-recaptures action graphs while keeping precision and weights resident.
-
-For paired timing, explicitly select `--modes compiled kv_reuse` with
-`--action-cuda-graph` and the same precision/fusion/tactic flags for both modes.
-Only K/V reuse differs between those two modes. The measurement command owns
-the switch, so it rejects a global `--action-kv-reuse`; the standalone runtime
-and service commands accept that flag. Existing default measurement modes are
-unchanged. For example:
-
-```bash
-python -m coexecution.libero.measurement \
-  --checkpoint /path/to/libero_spatial --dataset /path/to/groot-libero-spatial \
-  --output .local/kv-paired --precisions bf16 w8a8 w4a4 \
-  --modes compiled kv_reuse --action-cuda-graph --operator-fusion \
-  --observations 3 --rounds 20 --warmup 2
-```
-
-The comparison boundary randomizes mode order per round using identical inputs
-and seeds. `--measurement-boundary model-only` retains its resident mode blocks;
-record or reverse block order separately when evaluating timing drift. Warm
-every shape/stream signature before timing. `action_graph.kv_reuse` records
-per-layer captured-body proofs and expected/executed/avoided projection counts
-from explicit replay counts. These count K/V projection evaluations, not GEMM
-or kernel launches: an installed K/V group can execute one GEMM for two
-projections. Python projection counters describe successful warmup/capture
-bodies only; replay bypasses those counters and hooks. Timing audits require
-the proof and exact work deltas. No speedup or task-quality claim follows from
-these execution counts alone.
-
-Run `PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_action_graph_gpu.py` in the
-pinned CUDA environment for full-action/RNG, freshness, stride/stream, output
-lifetime, failure, frozen-execution and restoration gates.
-
-The opt-in numerical suite is
-`PIR2_GPU_TESTS=1 python -m pytest tests/gpu/test_policy_vlm_gpu.py` in the pinned
-CUDA environment. This checks execution behavior, not closed-loop task success.
-For full Spatial evaluation, see the declared-condition runner in
-[LIBERO](../docs/libero.md). Separate action and VLM processes can share an
-explicitly declared GPU. The opt-in `--server-layout paired` service uses two
-independent policy instances/streams and coordinates cold VLM/DiT capture across
-all endpoint CUDA submissions. See [transport and placement](../docs/timing-protocols.md)
-for bounded resident feature leases and the paired NumPy control.
-
-这些适配器来自独立的 GR00T-N1.7-LIBERO 算子实验，默认关闭。它们提供 BF16 融合、W8A8/W4A4、调制到量化的融合以及可选的纯 DiT CUDA Graph；整数后端源码来自固定版本的 Speedup Paradox，现由本仓集中管理。当前范围是每个策略单提交者、冻结权重、B1 的标准 Flow 或流式 πR² 推理。条件投影分组在流式模式下仍被拒绝。配对服务使用独立策略实例与流，首次 VLM/DiT capture 通过进程共享协调器排他执行；配对 whole-action graph 仍被拒绝。随机权重动作头测试不代表已训练检查点或量化闭环质量通过。
-
-The modules provide instance-local, reversible adaptations. Weight packing happens during installation; activation scales, quantization and packing run online. Integer GEMM uses INT32 accumulation and a fused scale/bias/BF16 output epilogue. Compatible QKV/KV and gate/up projections share preparation. The native dispatch can combine activation preparation with GELU or SiLU-times-up; AdaLN modulation can produce the packed input directly. Fused SDPA remains floating point. No checkpoint, convolution layout, sampling schedule, observation or VLM-cache policy is changed by enabling quantization.
-
-Verify the repository-owned `robotics-kernels` manifest and prepare the GPU environment using [environment setup](../docs/environment.md). Use the existing `serve_libero_protocol.py` entrypoint with explicit options, for example:
+服务开关默认为 BF16、优化关闭。先准备 [CUDA 环境](../docs/environment.md)和完整任务检查点，再显式选择精度与算子：
 
 ```bash
 export PYTHONPATH="$PWD:$PWD/upstream/learning/Isaac-GR00T${PYTHONPATH:+:$PYTHONPATH}"
 python scripts/serve_libero_protocol.py \
-  --checkpoint models/GR00T-N1.7-LIBERO/libero_10 \
+  --checkpoint models/GR00T-N1.7-LIBERO/libero_spatial \
   --variant flow --role action --output .local/integer-server \
   --operator-fusion --inference-precision w8a8 \
   --quantization-scope all --quantization-category-id 2
 ```
 
-This is a server invocation, not a completed closed-loop protocol. The existing protocol orchestrator retains its BF16 default; select matching precision/configuration on any separately started VLM server as well. `--dit-cuda-graph` requires serial submissions to each Flow or πR² policy. It captures only the pure DiT forward; rolling buffers, noise and action decoding stay outside that graph. First calls and new tensor signatures capture graphs and must be excluded from steady timing. In paired service mode, a process-wide submission coordinator gives cold VLM/DiT graph calls exclusive CUDA access without changing the pinned graph implementation. Steady handlers can overlap. Close the optimization scope before changing weights or using the same policy concurrently.
+该命令启动 action 服务。运行完整协议时，为独立 VLM 服务选择对应配置，或使用声明条件的实验 runner。每份策略由一个提交者串行调用；`--server-layout paired` 使用两份独立策略与流，并协调所有端点的冷 VLM/DiT capture，稳定执行可重叠。配对服务支持纯 DiT Graph，拒绝 whole-action Graph；特征租约与 placement 见[时序协议](../docs/timing-protocols.md)。
 
-- `--operator-fusion`: enable BF16 fusion. The default mode `all` retains RoPE/RMSNorm, AdaLN modulation and shared DiT condition/mask preparation. Unsupported attention configurations are rejected at installation.
-- `--operator-fusion-mode {vision_rope,text_rope,rope,rmsnorm,rope_rms,all}`: select the BF16 component set while fusion is enabled. `rope` selects both RoPE paths; only `all` installs DiT pointwise preparation. A selective mode requires `--operator-fusion`; condition grouping and norm/residual producer flags require `all`. The option defaults to `all` and does not enable fusion by itself.
-- `--operator-profile FILE`: explicitly override operator implementations for one architecture and precision. Omitted families retain their existing choices; no candidate profile is selected automatically. It requires fusion or a low-bit precision and validates before model patches. See the inventory and profile contract below.
-- `--vision-channels-last`: independently opt into channels-last-3D inputs and weights for the vision patch Conv3D. This can avoid the `SlowDilated3d` fallback; it preserves tensor values but can change BF16 rounding. The original weight storage, layout and hooks are restored on exit. Compare fusion and integer modes with the same explicit layout setting and measure its action differences separately.
-- `--norm-modulation-quant`: experimental fusion of non-affine DiT LayerNorm, AdaLN modulation, dynamic scale and low-bit packing. Requires `w8a8`, `w4a4`, `fp8` or `fp4` precision and `--operator-fusion`; shared and per-token conditions are supported. Integer modes use the pinned reference Triton kernel; floating modes use the separate local producers described in [Thor FP8 and FP4](#experimental-thor-fp8-and-fp4). FP32 reduction order differs from native LayerNorm, so this is not a bitwise-preserving option.
-- `--residual-norm-quant`: additionally fuse the attention-output residual addition, FFN input LayerNorm and low-bit packing. Requires `--norm-modulation-quant` and a quantized FFN input projection. GR00T has no gate/modulation at this boundary: integer modes use unit gate and zero scale/shift with the reference residual kernel, while floating modes use a separate residual producer. Both preserve the residual equation; the FFN output residual remains separate. Only non-affine LayerNorm and blocks without positional embeddings are supported. Both options default off and restore original forwards on exit; checkpoint quality and GPU savings require target-device validation.
-- `--inference-precision {bf16,w8a8,w4a4,fp8,fp4}`: BF16 is the default; low-bit modes are experimental and can change actions. The floating modes require the separate Thor environment below.
-- `--quantization-scope transformer`: quantize selected vision/text/DiT transformer projections. `all` additionally selects other BF16 Linear modules, including conditioning and vocabulary projections; it does not skip logits or cache condition calculations.
-- `--quantization-component {all,vlm,dit}`: intersect the selected scope and optional coverage with S2 backbone or S1 action-head projections. S1 includes `action_head.vl_self_attention`. The default is `all`; this selects quantization coverage, not the scope of general BF16 fusion. Category, condition-group and DiT norm-producer options cannot be combined with `vlm` alone. The same selection applies to integer and Thor floating precision.
-- `--quantization-category-id N`: with `scope=all`, quantize the fixed embodiment's category projections. Each call checks B1 and the actual ID; omitting the option leaves these projections in BF16. ID 2 is the LIBERO_PANDA mapping in the pinned model, not a universal embodiment ID.
-- `--group-conditioning`: with integer precision, fusion and `scope=all`, concatenate the DiT blocks' condition projections and final output-modulation projection using the reference `IntegerProjectionGroup`. They consume the same activated condition in this fused forward, so one preparation and GEMM serves all projections. Shared `[B,D]` and per-token `[B,T,D]` conditions retain their values; this is within one forward, with no reuse across denoising steps. Concatenated weights are packed at installation and require additional packed-weight storage. The option defaults off, requires complete coverage of the group to take effect, and records actual groups in the identity metadata. It does not establish streaming checkpoint or closed-loop quality. Measure both its complete group and full inference; the speedup of these small projections is not the speedup of every model GEMM.
-- `--quantization-coverage FILE`: optionally select ordinary Linear sites using a JSON `linears` mapping keyed by module name. Input `shape` fields are needed only for legacy shape-based tactic lookup. Without this file, the selected model inventory is used; category projections are selected separately by `--quantization-category-id`.
-- `--quantization-tactics FILE`: optional `{"8": {"module.name": 0}, "4": {...}}` mapping. `--quantization-group-tactics FILE` accepts rows with `bits`, `members` and `tactic`; legacy shape rows additionally require explicit coverage. Tactics are integers 0–7. Unmatched entries use reference tactic 0, not a measured optimum. No past experiment directory is searched automatically.
-- `--quantization-shape-tactics FILE`: optional rows such as `[{"bits": 8, "shape": [41, 6144, 1536, true], "tactic": 2}]`, with shape `[M, K, N, has_bias]`. An exact match overrides the module/group tactic for that call; other shapes retain their configured tactic. `M` is the flattened input row count, `K`/`N` are the integer projection's logical widths (a grouped projection uses its combined padded output width). This selects existing reference kernels for native, prepared-input and grouped paths without changing quantization or weights. Load the table before CUDA Graph capture; close and recreate the optimization scope to change it. Calibrate on the target device and checkpoint, then validate full streaming replay; an example row is not a recommended preset.
-
-### Owned operators and explicit profiles
-
-The source layout separates a shared model contract from platform-specific
-implementations:
-
-| Location | Implementation or dependency |
-| --- | --- |
-| `kernels/common/csrc/` | Native vision RoPE and AdaLN BF16 fusion |
-| `kernels/common/fused.py`, `graph.py` | Shared Triton primitives and graph lifecycle |
-| `kernels/ampere_ada/csrc/integer_gemm.cu` | Canonical INT4/INT8 CUTLASS GEMM |
-| `kernels/ampere_ada/csrc/integer_dispatch.cu` | Native activation preparation plus integer dispatch |
-| `kernels/ampere_ada/` | Integer formats, modulation producers and optional Ada candidates |
-| `kernels/blackwell/csrc/` | FP8/FP4 CUDA GEMM and packing, with focused lazy loaders |
-| `kernels/vendor/cutlass/` | Default official CUTLASS submodule; compatible `CUTLASS_ROOT` also supported |
-
-For the default dependency, initialize CUTLASS from the repository root, then
-inspect GPU-free source and build metadata:
-
-```bash
-git submodule update --init --recursive coexecution/kernels/vendor/cutlass
-python tools/prepare_sources.py --component robotics-kernels
-python -m coexecution.kernels.build --help
-python -m coexecution.kernels.build --backend integer --describe
-```
-
-The build command accepts `--backend` with `integer`, `integer_dispatch`,
-`bf16_fusion`, `fp8`, or `fp4`, plus `--describe` and `--verbose`. Omit `--describe`
-to explicitly build/load that backend with the installed CUDA toolkit. Torch's
-extension cache stores generated binaries outside the tracked source tree;
-`TORCH_EXTENSIONS_DIR` can point to a personal `.local/` directory. Runtime
-backends also load lazily when explicitly enabled. Build and warm all selected
-kernels before timing or CUDA Graph capture. The source manifest records imported
-and adapted operator hashes and the default CUTLASS submodule revision. Actual
-selected dependency and loaded binary identity are separate runtime evidence.
-The Git link records `982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` for reproducibility;
-it does not require every author to run that exact SHA.
-
-An existing compatible CUTLASS clone or complete headers-only installation can
-be used directly:
-
-```bash
-export CUTLASS_ROOT=/path/to/cutlass
-```
-
-With this variable set, omit the submodule initialization command above.
-The selected root needs the full required `include/` tree, including `cutlass`
-and `cute`, plus `tools/util/include/`. Its APIs and CUDA/C++ toolchain must
-support the selected operators; arbitrary versions are not promised to work.
-Tools record the actual Git revision when present rather than rejecting a
-source solely for differing from the default. The CUDA operator implementations
-remain local piR2 files regardless of the general CUTLASS header location.
-
-New environments can use `git clone --recurse-submodules`. Repeat the submodule
-update command after pulling or switching branches when selecting that branch's
-default. Compatible local submodule revisions are also usable; preserve those
-intentional choices and keep their personal Git-link changes out of unrelated
-commits. `--reference /path/to/existing/cutlass --dissociate` is an optional
-first-clone download optimization, not a prerequisite for reusing an existing
-installation. See [CUTLASS setup](../docs/environment.md#cutlass-submodule).
-Routine default setup does not need `--remote`; changing the project's shared
-default pin remains a separate reviewed change.
-
-The inventory API reports implementation language, source, architecture,
-precision, shape/layout constraints and numerical contract without importing
-Torch, Triton or the model:
-
-```python
-from dataclasses import asdict
-from coexecution.optimization.operators import inventory
-
-for implementation in inventory("integer_gemm"):
-    print(asdict(implementation))
-# inventory() lists every family; it does not benchmark or rank implementations.
-```
-
-The newly consolidated native Ada candidates are explicit opt-ins for SM89:
-INT4 GEMV (`integer_gemm=int4_gemv`), small-M INT4 tiles (`small_m`), integer
-split-K (`split_k`), LayerNorm packing (`layernorm_pack=native`), native RMS
-statistics (`rmsnorm=native`), RMSNorm packing (`rmsnorm_pack=native`), residual
-epilogues (`integer_residual=native`) and grouped output stores
-(`group_writeback=native`). Their per-call guards fall back to the configured
-same-precision reference for unsupported shapes or runtime contracts. Native
-LayerNorm/RMS candidates additionally enforce their pinned PyTorch requirements;
-see [environment boundaries](../docs/environment.md#optional-gr00t-fusion-and-integer-inference).
-The already existing BF16 and activation-pack implementations keep their own
-inventory contracts; platform restrictions are not inferred from language alone.
-
-An operator profile is a partial override. The following is a schema example,
-not a measured preset or a recommendation for every W4A4 shape:
-
-```json
-{
-  "schema_version": 1,
-  "architecture": "sm_89",
-  "precision": "w4a4",
-  "implementations": {
-    "integer_gemm": "small_m",
-    "activation_pack": "native"
-  },
-  "parameters": {
-    "integer_gemm": {"tactic": 0}
-  }
-}
-```
-
-Save a selected profile locally and pass `--operator-profile FILE` to the same
-service command, or set `OptimizationConfig(operator_profile=Path(...))`.
-`small_m` parameters accept tactic 0–5; `split_k` accepts `slices` 2/4/8 and
-`tile` 0–2. These parameters belong to those implementations and are distinct
-from canonical integer GEMM tactics 0–7. Unknown families, implementations,
-parameters, architecture/precision mismatches and incompatible activation flags
-are rejected. Each family must also be applicable to the selected fusion/precision
-configuration. The profile hash and actual installed choices are retained in
-optimization evidence; the profile does not change checkpoint weights, default
-precision or unrelated fusion flags.
-
-DiT LayerNorm, residual, shared-context and final-modulation profile choices
-require full fusion and a DiT-containing component. RMS packing requires text
-RMSNorm fusion. Overlapping producer replacements are rejected: profile
-LayerNorm with `--norm-modulation-quant`, profile residual with
-`--residual-norm-quant`, or profile LayerNorm with final-modulation packing.
-Select one producer implementation for each boundary.
-
-CUDA and Triton alternatives are not globally ranked. The GPU-free
-`read_measurements(path)` and `select_measured(records, baseline="...")` API in
-`coexecution.optimization.operators` consumes retained, normalized measurements
-with an explicit same-precision numerical gate. Comparisons must agree on
-architecture, precision, exact shape, measurement cohort, checkpoint/input
-workload, device/environment identity, measured boundary, timing method and
-statistic. Failed numerical candidates are excluded; mismatched contexts are
-rejected. `deployment=True` additionally requires full-policy wall latency.
-The result applies to that exact context and never changes runtime defaults.
-No new benchmark, cross-platform winner or LIBERO success result is supplied by
-this source organization; historical experiments require matched remeasurement
-after selecting a new combination. Keep records and generated profiles local.
-
-For an already loaded eval-mode BF16 CUDA policy, the same public interface is:
+已有 eval-mode BF16 CUDA 策略可直接使用可恢复作用域：
 
 ```python
 from coexecution.groot_optimization import GrootOptimizations, OptimizationConfig
@@ -426,21 +51,155 @@ with GrootOptimizations(policy, config) as optimized:
         options={"force_nonstreaming": True, "num_inference_timesteps": 4},
     )
     coverage = optimized.evidence()
-# Original module forwards/processors are restored, including on failure.
 ```
 
-For a focused BF16 operator experiment, `NonGemmAdapters` supports `baseline`,
-`vision_rope`, `text_rope`, `rope` (both RoPE paths), `rmsnorm`, `rope_rms`, and
-`all` (RoPE/RMSNorm plus AdaLN modulation). These select existing kernels;
-`baseline` restores the original forwards. The low-level adapter does not install
-DiT condition/mask preparation, Graphs or quantization. Use one adapter per
-private eval-mode model, change modes only after its work has completed, and
-restore it with `close()` in `finally`. The service exposes the same enabled
-component choices through `--operator-fusion-mode`; disable `--operator-fusion`
-for the baseline. Neither interface relaxes the paired-worker guard. Test
-component selection, instance isolation
-and restoration explicitly with `tests/gpu/test_groot_fusion_modes_gpu.py`;
-measure performance on the target GPU with matched inputs and invocation counts.
+作用域退出时恢复原 forwards/processors。更换权重、方法、attention 配置或精度前关闭作用域；支持的运行时开关可经 `optimized.set_runtime(...)` 更新，保留精度控制器，并按需关闭和重新 capture Graph。调用方负责 CUDA stream 上的输入/权重就绪。Python 串行保护不替代跨流同步；root 调用、reset 及异常清理共用投影缓存边界。
+
+## 与精度共用的运行时优化
+
+这些开关保持每次观测的图像、状态和 VLM 计算更新，使 BF16 与量化模式能够使用相同的系统路径。
+
+| 开关                        | 行为与条件                                                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `--input-preparation`       | 向各组件路由实际消费的 tensor 字段                                                                                  |
+| `--tokenizer-cache`         | 图像处理后缓存精确展开文本的 tokenization                                                                           |
+| `--static-vlm`              | 准备固定 text/grid/mask 元数据，避免 device scalar 读取                                                             |
+| `--vlm-cuda-graph`          | 捕获完整 VLM，要求 `--static-vlm`                                                                                   |
+| `--image-array-preparation` | 用新鲜 contiguous uint8 RGB array 代替 PIL 转换；保留 conversation、模板、crop/resize、state 与 Qwen collator       |
+| `--compiled-host-guards`    | 用 Cython 编译同一 Python guard 源码，保留权重、方法、hook、closure、defaults、配置和拓扑校验                       |
+| `--vision-channels-last`    | 显式选择 vision patch Conv3D 的 channels-last-3D 输入与权重布局；可改变 BF16 舍入，退出恢复原 storage、布局和 hooks |
+
+image-array 路径校验固定 GR00T/Transformers 源码和当前方法，接纳标准 Qwen2VL fast/slow pixel processor；替换 processor/method 需要关闭作用域。高度为 1 或 3 的图像因 ndarray channel 推断歧义而被拒绝。每次使用独立图像缓冲。
+
+compiled guards 需要 CPython、host C compiler、`Cython==3.1.2` 和 setuptools；已记录的 setuptools 兼容版本为 84.0.0，构建保存实际版本。缓存默认位于 `~/.cache/pir2/host-guards`，可用 `PIR2_HOST_GUARD_CACHE` 指定；缓存加锁，并按源码、ABI、平台、编译器和编译选项标识。构建失败显式报错；默认 Python 路径及 CLI help 不触发编译。构建身份和 binary hash 写入证据。
+
+### 常驻输入接口
+
+`coexecution.libero.inference.PreparedInferenceEngine` 在调用方持有的 GPU 输入上提供 `vlm`、`action` 和 `full`。输入准备及动作解码是独立 adapter，decoder state 对 engine 不透明。engine 原样返回上游输出、不保留输出，也不执行输入复制或静态元数据注册；需要留存结果时，在计时外按其生命周期做 snapshot。
+
+准备阶段先复制可变输入，再由上游注册静态元数据。已注册对象的 identity 和 mutation guards 保持有效；回放期间保持对应优化作用域与 bindings 存活。调用方建立 inference mode、stream readiness、串行所有权，并在 runner 边界测 CUDA 完成。完整实验与计时范围见[独立模型测量](../docs/coexecution.md#independent-model-measurement)。
+
+### Graph 层级与新鲜度
+
+| 开关                  | 捕获范围                                            | 适用路径                                                                         |
+| --------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `--dit-cuda-graph`    | 纯 DiT forward；rolling buffer、noise、解码在图外   | 每策略串行的 Flow 与 πR²；配对服务协调冷 capture                                 |
+| `--action-cuda-graph` | S1 visual/state conditioning 与完整四步 Flow 动作头 | BF16/W8A8/W4A4，非 streaming H40/NFE4                                            |
+| `--action-kv-reuse`   | 同一 Flow4 body 内复用每层 cross-attention K/V 投影 | 要求 whole-action Graph、固定 interleaved AlternateVLDiT 与受支持 SDPA processor |
+
+whole-action Graph 每个请求生成一次新显式 noise，包括首次 capture；features、state、embodiment ID 和 masks 均新鲜复制。整数 image delay 与 shape/dtype/stride/stream 共同组成最多八项的 Graph signature。inpaint、rolling/streaming、未知 options/hooks 被拒绝。调度器状态、cache 时间戳、noise 生成与动作解码留在图外；输出持有独立 storage。
+
+同时开启两个 action 相关 Graph 开关时，whole-action Graph 替代内层 DiT Graph，并在证据中标明。新 signature 先预热；whole-action capture 失败向调用方传播，不静默切换 eager。冻结校验可检测受追踪的修改；`.data` 或外部直接写入属于调用方必须避免的未追踪修改。
+
+K/V reuse 支持 `AttnProcessor2_0` 和 `PreparedAttention`，与 operator fusion 独立。每层第一次 K/V 计算仍被捕获，随后三次复用，故每次 replay 都从新观测重算 K/V；Q、self-attention、mask、state/noise 与四次 denoising 保持更新。复用状态在 body 退出（含异常）清空，无跨观测复用。整数 grouping/tactics/producer packs 继续生效。
+
+审计区分物理 Python hooks 和逻辑工作量：`python_forward_counts` 是实际 hook 计数；whole-action 的 `forward_counts.dit` 由每个 captured body 的四次调用及 replay 次数证明。`dit_count_source`、`action_graph` 与 `action_graph.kv_reuse` 保留来源和每层投影计数。K/V projection 次数与 GEMM/kernel 次数不同：分组 K/V 可用一次 GEMM 完成两次投影。
+
+## 整数量化与 producer 融合
+
+权重在安装时量化并打包；**online quant** 指每次调用的激活尺度计算、量化和打包。INT8×INT8 或 packed INT4×INT4 GEMM 使用 INT32 accumulation，scale、bias 与 BF16 输出转换进入 epilogue。兼容的 QKV/KV、gate/up 投影共享输入准备；GELU、SiLU-times-up 或 AdaLN producer 可直接生成 packed input，减少中间读写。SDPA 的 QK/softmax/PV 保持浮点路径。
+
+量化覆盖、后端选择和调度独立：启用量化不改变 checkpoint、采样步数、观测或 VLM cache 策略。原 BF16 参数保留以支持恢复，加上 packed weights、workspace 与 Graph pools 后，诊断进程总显存不等于纯低比特模型的最小部署显存。
+
+| 开关                                                                       | 合同                                                                                                                                                                |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--inference-precision {bf16,w8a8,w4a4,fp8,fp4}`                           | BF16 默认；浮点低比特使用下节 Thor 后端                                                                                                                             |
+| `--operator-fusion`                                                        | 启用 BF16 RoPE/RMSNorm、AdaLN 与共享 DiT condition/mask 准备；不支持的 attention 配置安装时拒绝                                                                     |
+| `--operator-fusion-mode {vision_rope,text_rope,rope,rmsnorm,rope_rms,all}` | 默认 `all`；`rope` 包括两种 RoPE，只有 `all` 安装 DiT 点算子准备；选择模式本身不启用 fusion                                                                         |
+| `--quantization-scope {transformer,all}`                                   | `transformer` 选 transformer projections；`all` 加入其余合适 BF16 Linear，包括 condition/vocabulary                                                                 |
+| `--quantization-component {all,vlm,dit}`                                   | 与 scope/coverage 求交；VLM 为 backbone，DiT 为整个 action head（含 `vl_self_attention`）；不控制一般 BF16 fusion 范围                                              |
+| `--quantization-category-id N`                                             | `scope=all` 时量化固定 embodiment 的 category projections；逐次检查 B1 与实际 ID，LIBERO_PANDA 的固定映射为 2                                                       |
+| `--group-conditioning`                                                     | 整数精度 + fusion `all` + scope `all`；拼接各 DiT condition 与最终 modulation 投影，一次准备/GEMM 服务共享或 per-token condition；需完整组覆盖，流式 πR² 拒绝此选项 |
+| `--norm-modulation-quant`                                                  | 非仿射 DiT LayerNorm、AdaLN、动态 scale 与 packing 融合；要求低比特 + fusion `all`，支持共享/per-token condition                                                    |
+| `--residual-norm-quant`                                                    | attention residual + FFN 输入 LayerNorm + packing；要求上一选项和量化 FFN 输入投影；只支持非仿射 LayerNorm、无 positional embeddings 的 blocks                      |
+
+`component=vlm` 不能组合 category、condition grouping 或 DiT norm producers。condition grouping 的 packed 拼接权重增加存储，只复用当前 forward 的相同激活，不跨 denoising 步缓存。residual 边界没有 gate/modulation，整数实现用 unit gate、zero scale/shift 保持原 residual 方程；FFN 输出 residual 仍独立。norm 融合改变 FP32 reduction 顺序，应记录相对同精度未融合路径及 BF16 的动作误差。
+
+### Coverage 与 tactic
+
+| 输入                                | 格式与选择顺序                                                                                                   |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--quantization-coverage FILE`      | `linears` 以 module name 为键；无文件时使用模型 inventory，category 单独选择；旧 shape lookup 才需要输入 `shape` |
+| `--quantization-tactics FILE`       | `{"8": {"module.name": 0}, "4": {...}}`，canonical tactics 为 0–7                                                |
+| `--quantization-group-tactics FILE` | rows 含 `bits`、`members`、`tactic`；旧 shape rows 额外要求 coverage                                             |
+| `--quantization-shape-tactics FILE` | 精确 `[M,K,N,has_bias]` 覆盖 site/group tactic；M 为展开行数，group 的 N 为合并 padded width                     |
+
+未匹配项使用 reference tactic 0。shape 选择作用于 native、prepared 和 grouped 路径，保持量化与权重不变；表必须在 Graph capture 前载入，修改后重建作用域。工具不会从旧实验目录自动寻找“最佳”配置。
+
+shape 文件可为旧 row list，也可绑定实际后端身份：
+
+```json
+{
+  "schema_version": 1,
+  "backend_id": "pir2_integer",
+  "backend_revision": "sha256:<runtime source_sha256>",
+  "device_arch": "sm_89",
+  "quant_format": "w8a8-symmetric-row-v1",
+  "rows": [{ "bits": 8, "shape": [41, 6144, 1536, true], "tactic": 2 }]
+}
+```
+
+这是 schema 示例，revision 应来自实际 backend evidence。W4A4 使用 `w4a4-symmetric-row-v1`。身份缺失、unknown 或不匹配的绑定 profile 被拒绝；旧 list 明确为 unbound，旧 `robotics_integer` 绑定不会自动匹配 `pir2_integer`。Thor 浮点使用独立格式。
+
+[libero_10 Ada 配置](../configs/quantization/groot-libero10-ada/coverage.json)保留为显式的历史校准输入：469 个 executed Linear sites 和 7 个 fixed-category projections，B1/H40 Flow4、SDPA、fusion、DiT Graph、channels-last-3D 条件。它不是 Spatial streaming preset。使用时同时选择 [site tactics](../configs/quantization/groot-libero10-ada/tactics.json)、[group tactics](../configs/quantization/groot-libero10-ada/group-tactics.json)，并显式启用 `--vision-channels-last`；配置不会自动选择该布局。
+
+重新校准时，采集完整真实调用的执行 shape，在实际 packed inputs/weights 上比较 tactics 0–7，保留重复测量与同精度误差，再于新进程验证完整输出和 policy wall time。不同 checkpoint、长度、硬件或 producer 组合需要各自的校准；重复 GEMM 的 cache 行为与完整策略不同。
+
+## Owned operators and explicit profiles
+
+| 源码位置                                      | 实现                                                |
+| --------------------------------------------- | --------------------------------------------------- |
+| `kernels/common/csrc/`                        | native vision RoPE、AdaLN BF16 fusion               |
+| `kernels/common/fused.py`、`graph.py`         | 共享 Triton primitives 与 Graph 生命周期            |
+| `kernels/ampere_ada/csrc/integer_gemm.cu`     | canonical INT4/INT8 CUTLASS GEMM                    |
+| `kernels/ampere_ada/csrc/integer_dispatch.cu` | native 激活准备与 integer dispatch                  |
+| `kernels/ampere_ada/`                         | 整数格式、modulation producers、Ada 候选            |
+| `kernels/blackwell/csrc/`                     | FP8/FP4 CUDA GEMM/packing 与 lazy loaders           |
+| `kernels/vendor/cutlass/`                     | 默认官方 CUTLASS 依赖，可由兼容 `CUTLASS_ROOT` 替代 |
+
+源码归属与版本见[上游记录](../docs/upstream.md)，CUTLASS 初始化、替代安装和 CUDA 编译见[环境配置](../docs/environment.md#cutlass-submodule)。以下入口读取源码/构建元数据，不加载模型：
+
+```bash
+python tools/prepare_sources.py --component robotics-kernels
+python -m coexecution.kernels.build --help
+python -m coexecution.kernels.build --backend integer --describe
+```
+
+build 接受 `integer`、`integer_dispatch`、`bf16_fusion`、`fp8`、`fp4`；移除 `--describe` 才显式构建/加载后端，`--verbose` 显示构建信息。二进制写入 Torch extension cache（可设 `TORCH_EXTENSIONS_DIR`），在计时和 capture 前完成构建/预热。
+
+算子 inventory 提供语言、源码、architecture、precision、shape/layout 和数值合同，不依赖 Torch/Triton：
+
+```python
+from dataclasses import asdict
+from coexecution.optimization.operators import inventory
+
+for implementation in inventory("integer_gemm"):
+    print(asdict(implementation))
+```
+
+SM89 的显式候选包括 `integer_gemm=int4_gemv/small_m/split_k`、`layernorm_pack=native`、`rmsnorm=native`、`rmsnorm_pack=native`、`integer_residual=native`、`group_writeback=native`。每次调用检查 shape/runtime 合同，不适用时回到同精度 reference。native LayerNorm/RMS 还有[固定 Torch 条件](../docs/environment.md#optional-gr00t-fusion-and-integer-inference)。其他 implementation 以 inventory 自身合同为准。
+
+`--operator-profile FILE` 是某 architecture/precision 的部分覆盖，未列 family 保留默认选择；需启用 fusion 或低比特精度。示例：
+
+```json
+{
+  "schema_version": 1,
+  "architecture": "sm_89",
+  "precision": "w4a4",
+  "implementations": { "integer_gemm": "small_m", "activation_pack": "native" },
+  "parameters": { "integer_gemm": { "tactic": 0 } }
+}
+```
+
+`small_m` tactic 为 0–5，`split_k` 的 `slices` 为 2/4/8、`tile` 为 0–2，与 canonical tactic 0–7 分开。示例描述格式，不提供测量推荐。profile 在模型安装前校验未知字段、architecture/precision、flag 与 family 适用性，保留文件 hash 和实际选择。
+
+DiT LayerNorm/residual/shared-context/final-modulation choices 要求 full fusion 和 DiT component；RMS packing 要求 text RMSNorm fusion。每个 producer 边界只选择一个实现：profile LayerNorm 与 `--norm-modulation-quant`、profile residual 与 `--residual-norm-quant`、profile LayerNorm 与 final-modulation packing 不可重叠。
+
+`read_measurements(path)`、`select_measured(records, baseline="...")` 消费保留的标准测量记录：必须匹配 architecture、precision、shape、cohort、checkpoint/input、设备/环境、计时边界、方法与统计量，并通过显式同精度数值门槛。`deployment=True` 额外要求完整 policy wall latency。选择结果只适用于该上下文，不改变运行默认值。
+
+运行证据分别记录 upstream revision、owned-source fingerprint、loaded-library hash、Torch/CUDA/Triton、设备及 quant format。无法确认的预加载或 binary ownership 标为 `unknown`；环境变量路径不等于实际执行证明。缺 API 或加载失败直接报错。canonical integer 保持其算术/API 合同，SM89 为历史验证架构；新增 Ada candidates 限定 SM89，浮点限定 SM110，BF16 不新增架构白名单。
+
+聚焦单个 BF16 fusion 时可使用 `NonGemmAdapters`：
 
 ```python
 from coexecution.groot_fusion import NonGemmAdapters
@@ -448,248 +207,97 @@ from coexecution.groot_fusion import NonGemmAdapters
 adapter = NonGemmAdapters(policy)
 try:
     adapter.set("vision_rope")
-    # Run the existing inference path on this privately owned model.
+    # 在私有 eval 模型上执行推理；等待完成后才能换 mode。
 finally:
     adapter.close()
 ```
 
-An optional RTX 6000 Ada preset for the pinned `GR00T-N1.7-LIBERO/libero_10` model is provided as [coverage](../configs/quantization/groot-libero10-ada/coverage.json), [single-projection tactics](../configs/quantization/groot-libero10-ada/tactics.json) and [group tactics](../configs/quantization/groot-libero10-ada/group-tactics.json). These are executable configuration inputs, not timing reports. Add the following options to the standard Flow invocation above, selecting `w4a4` instead for INT4:
-
-```bash
---inference-precision w8a8 --operator-fusion --dit-cuda-graph \
---quantization-scope all --quantization-category-id 2 --group-conditioning \
---quantization-coverage configs/quantization/groot-libero10-ada/coverage.json \
---quantization-tactics configs/quantization/groot-libero10-ada/tactics.json \
---quantization-group-tactics configs/quantization/groot-libero10-ada/group-tactics.json
-```
-
-The preset covers 469 executed Linear sites and seven fixed-category projections, with separate choices for W8A8 and W4A4. Calibration used B1/H40 standard Flow4, the pinned model/backend, SDPA, shared fusion, DiT Graph and a channels-last-3D Conv3D layout. The preset does not select that layout; it requires the separate `--vision-channels-last` option. Other input lengths, checkpoints or hardware require remeasurement; the configuration is never selected automatically. The backend performs INT8-by-INT8 or packed INT4-by-INT4 Tensor Core GEMM with INT32 accumulation. Floating scales, bias and BF16 output conversion are fused into its epilogue; floating SDPA is outside the integer GEMM claim.
-
-To recalibrate, collect executed input shapes on a representative full call, then compare reference tactics 0–7 on actual packed activations and weights using CUDA Graph event timing. Retain raw repetitions and check every candidate against the same-precision reference before choosing a tactic. Export module-name entries and exact group-member entries in the formats above. Recheck complete policy outputs after loading the files in a fresh process, and measure BF16, previous and candidate configurations in one randomized, matched GPU session. Isolated repeated-GEMM timings have different cache behavior from a full policy; a microbenchmark winner alone is not evidence of a full-policy improvement.
-
-The service records the configuration, replaced sites and tactic-file hashes in its local identity output. Before changing model methods or layouts, an enabled scope checks the selected backend's exact operator APIs, including the FP8 packed-tactic and FP4 weight-packing APIs. Runtime evidence separates original upstream revisions, the owned source-tree fingerprint and loaded-library hashes, and records Torch/CUDA/Triton, device architecture and quantization format. Preloaded or ambiguous binary ownership is explicitly `unknown`; a requested environment-variable path is not proof that its library executed.
-
-The canonical integer backend retains its original arithmetic/API contract, with SM89 separately recorded as historical validated architecture. Additional native Ada candidates are explicitly restricted to SM89. Successfully loading elsewhere does not establish arithmetic or task quality. Thor floating precision retains its existing SM110 restriction; BF16 has no new architecture whitelist. Missing APIs and loader failures propagate rather than silently selecting BF16. A complete comparison must include online activation preparation and checks, use matching fusion/layout/Graph settings for BF16 and low-bit variants, and record checkpoint/input identity. Profiled GPU duration sums, isolated GEMM timing, complete Linear timing and synchronized CPU-observation-to-action latency are different metrics. Installation, compilation, packing, preflight and Graph capture are reported separately.
-
-Shape-tactic files still accept the legacy row list. A versioned integer profile can additionally bind the rows to the actual backend, clean source revision, architecture and quantization format:
-
-```json
-{
-  "schema_version": 1,
-  "backend_id": "pir2_integer",
-  "backend_revision": "sha256:<source_sha256 from runtime backend evidence>",
-  "device_arch": "sm_89",
-  "quant_format": "w8a8-symmetric-row-v1",
-  "rows": [{"bits": 8, "shape": [41, 6144, 1536, true], "tactic": 2}]
-}
-```
-
-This is a schema example, not a recommended tuning result; replace the revision placeholder with the recorded owned-source fingerprint from backend evidence. Old bound `robotics_integer` profiles do not automatically match the new owned namespace/source identity. Profiles with missing, unknown or mismatched runtime identity are rejected before installation; legacy lists remain explicitly unbound. W4A4 uses `w4a4-symmetric-row-v1`. Thor FP8/FP4 use their distinct floating formats and cannot consume integer profiles. Close and rebuild the optimization scope after changing precision, weights or tactics.
-
-优化根调用与 reset 共享串行保护，调用开始、结束和异常时清理投影缓存；Graph 异常恢复 eager 后仍保留该边界。该锁只管理 Python 提交，不是 CUDA 跨流同步，也不开放同进程双优化 worker。组件选择、缓存与后端契约的新增测试使用元数据/fake 对象；旧闭环结果不能作为新组合的质量结论。对应 CUDA 回归需显式执行 `tests/gpu/test_streaming_component_cache_gpu.py`，包含 eager/Graph 的 W8/W4 异常重试与 reset。本次结构和契约整理未重跑这些 GPU 测试。
-
-Lightweight public CI runs only the configuration and restoration contracts. Explicit local GPU checks use no model download:
-
-```bash
-PIR2_GPU_TESTS=1 python -m pytest -q \
-  tests/gpu/test_groot_fusion_gpu.py tests/gpu/test_quantization_gpu.py \
-  tests/gpu/test_groot_vision_layout_gpu.py
-```
-
-Kernel agreement at a fixed precision does not establish quantization quality versus BF16 or robot-task success. Preserve raw evidence outside Git and report unexecuted streaming/closed-loop checks in the PR. Source and license attribution is recorded in [third-party notices](../THIRD_PARTY_NOTICES.md).
-
-### Serial streaming validation
-
-Use a Spatial πR² checkpoint produced by the [training recipe](../docs/libero.md),
-then compare the same checkpoint with BF16, fusion BF16, W8A8 and W4A4. Supply
-`--variant pir2` to the server above, omit `--group-conditioning`, and regenerate
-packed weights from the selected checkpoint. Compare eager execution first, then
-enable `--dit-cuda-graph` explicitly. Keep the same Graph setting across precision
-comparisons; changed input signatures recapture and require separate warmup.
-The Long/Flow tactic preset is not a calibrated Spatial/streaming configuration.
-
-Before model-quality evaluation, the following opt-in check runs the actual
-pinned action-head implementation with a small AlternateVLDiT and synthetic
-inputs. It exercises bootstrap, changing slide sizes and image delays, fresh
-visual features, reset and restoration. Graph checks also change context length and
-mask values, preserve earlier outputs, and verify normal and exceptional cleanup.
-Fusion is compared with unfused execution
-at the same precision; the trace checks INT8/INT4 kernel execution. It bypasses
-the VLM and uses random weights, so it establishes neither task accuracy nor
-production-model speedup:
-
-```bash
-PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_groot_streaming_gpu.py
-```
-
-Explicit checks for the experimental norm/residual options:
-
-```bash
-PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_groot_norm_quant_gpu.py
-```
-
-Shape-tactic dispatch has separate opt-in CUDA checks for both precisions, prepared inputs, grouped projections and changing-shape Graph capture:
-
-```bash
-PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_shape_tactics_gpu.py
-```
-
-These checks separate native-reduction control-flow equivalence from fused
-reduction error, exercise streaming/reset/Graph and restoration, and verify true
-integer and fused kernel execution. They do not establish task success. Compare
-the existing integer path, norm fusion, then residual fusion at the same precision,
-checkpoint, inputs, layout and Graph setting. Report repeated profiled GPU kernel /
-memcpy / memset duration sums separately from CUDA-event elapsed time and host
-latency; inspect action error against both the previous integer path and BF16.
+支持 `baseline`、`vision_rope`、`text_rope`、`rope`、`rmsnorm`、`rope_rms`、`all`；这里的 `all` 为 RoPE/RMSNorm/AdaLN，不安装高层 DiT condition/mask、Graph 或量化。服务通过 `--operator-fusion-mode` 选择对应组件，baseline 则关闭 `--operator-fusion`。
 
 ## Experimental Thor FP8 and FP4
 
-The serial floating adapter requires Thor SM110, eval-mode BF16 CUDA weights,
-and the repository-owned [Blackwell operators](../docs/environment.md#optional-thor-floating-inference).
-It uses the same reversible `GrootOptimizations` interface:
+Thor SM110 浮点后端使用相同的可恢复接口和 eval-mode BF16 CUDA 原始权重。软件/编译准备见 [Thor 环境](../docs/environment.md#optional-thor-floating-inference)，迁移步骤见[平台交接](../docs/platform-handoff.md#precision-support)。
 
 ```python
 config = OptimizationConfig(
     precision="fp8", scope="all", dit_graph=True, fp8_fast_quant=True
 )
 with GrootOptimizations(policy, config) as optimized:
-    # Run the normal streaming bootstrap / vision / plan interface here.
     coverage = optimized.evidence()
 ```
 
-The equivalent server flags are `--inference-precision fp8 --quantization-scope all
---dit-cuda-graph --fp8-fast-quant`. Select `fp4` and omit `--fp8-fast-quant` for FP4.
-All options default off. Close the scope before changing weights or configuration.
+服务对应 `--inference-precision fp8 --quantization-scope all --dit-cuda-graph --fp8-fast-quant`；FP4 选择 `fp4` 并省略 `--fp8-fast-quant`。
 
-- FP8 uses E4M3 weights and activations with one FP32 scale per tensor.
-  `--fp8-fast-quant` selects a two-pass Triton activation packer: partial absmax,
-  followed by scale finalization and conversion. Both passes refresh every call,
-  including Graph replay. The default uses the owned native packer with the pinned reference convention.
-- `--fp-shared-inputs` optionally packs the common activation once per known
-  QKV/KV or gate/up module invocation. Only fully selected groups participate;
-  every member keeps its original quantized weight, scale, GEMM and tactic.
-  Reuse requires the identical, unmodified input tensor in that invocation.
-  Owner exit (including exceptions) clears reuse state, and direct projection
-  calls pack independently. Graph capture records fresh packing for every replay.
-  This option supports serial FP8/FP4 inference and defaults off.
-- `--fp-grouped` merges fully selected QKV/KV and gate/up projections into one
-  GEMM per owner invocation, taking precedence over `--fp-shared-inputs`.
-  FP8 repacks the concatenated weight with one tensor scale, so it can change
-  quantization error compared with independent weights. FP4 retains block-16
-  row scales. Output views are retained except where text Q/K normalization
-  requires contiguous inputs. Owner exit and exceptions clear the group state.
-- `--fp-swiglu` fuses the text MLP's native BF16 SiLU lookup, multiply and input
-  packing. The SiLU output is rounded to BF16 before multiplying, preserving
-  the original PyTorch boundary. This differs from the reference's alternative
-  SwiGLU rounding policies. FP8 uses a producer/partial-amax pass and one global
-  scale/cast pass; FP4 emits packed E2M1 and swizzled block scales directly.
-- With `--operator-fusion`, floating modes also accept `--norm-modulation-quant`
-  and `--residual-norm-quant`. These connect non-affine DiT LayerNorm/AdaLN and
-  attention residual + FFN LayerNorm to floating packed inputs. The residual
-  and materialized intermediate boundaries remain BF16, but Triton LayerNorm's
-  reduction order differs from native Torch. Measure numerical error against
-  both the same-precision unfused path and BF16. These flags default off and do
-  not enable the integer packed-buffer path or alter attention's precision.
-- FP4 uses E2M1 data and UE4M3 scales per 16 elements in the CUTLASS swizzled
-  layout. This is the reference block-scaled FP4 GEMM path, not MXFP8 or an INT4
-  buffer. Both floating GEMMs accumulate in FP32 and output BF16; neither
-  dequantizes its operands to run a BF16 GEMM.
-- FP8 chooses from a small, measured Thor table keyed by exact runtime
-  `(M, K, N, has_bias)`, falling back to explicit prefill tactic 2. FP4 uses
-  bias-aware tactic 0 for M>1 and tactic 3 for M=1. The pinned FP4 backend's
-  nonzero prefill tactics omit the bias epilogue and are deliberately avoided.
-  Ada integer tactic files, category selection and condition grouping are rejected.
+| 机制   | 格式和执行合同                                                                                                                                             |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FP8    | E4M3 权重/激活，每 tensor 一个 FP32 scale；K/N 需被 16 整除                                                                                                |
+| FP4    | E2M1 数据与每 16 元素 UE4M3 scale，CUTLASS swizzled layout；K/N 需被 32 整除                                                                               |
+| GEMM   | FP32 accumulation、BF16 输出；低比特 operands 直接进入 GEMM                                                                                                |
+| 覆盖   | `scope=all` 包括 eligible 普通 Linear；CategorySpecificLinear、excluded/unaligned sites 保持 BF16 并记入 coverage；attention 保持浮点                      |
+| tactic | FP8 查精确 `(M,K,N,has_bias)` Thor 表，fallback 为 prefill tactic 2；FP4 的 M>1 用 bias-aware 0、M=1 用 3，避免缺 bias epilogue 的 nonzero prefill tactics |
 
-`--fp4-swap-ab` (Python: `OptimizationConfig(precision="fp4", fp4_swap_ab=True)`)
-is an additional opt-in SM110 dispatch. It uses the repository-owned FP4 CUDA
-backend described in [environment setup](../docs/environment.md). The unified
-operator profile can select the same implementation with
-`"floating_gemm": "swap_ab"`; `native` retains the original floating dispatch. Only
-`(M,K,N,has_bias)=(41,256,1536,true)` and `(41,1536,1536,true)` use the new API;
-all other signatures, including biasless and M=1 calls, keep the previous path.
-The selected tile is `(128,64,256)` after swapping W and X, with cluster
-`(2,1,1)`/two stages for K=256 and `(4,1,1)`/automatic stages for K=1536.
-Both use the reference dynamic scheduler. Column-major output writes directly
-to the original contiguous `[M,N]` result; there is no output transpose kernel.
-Weights/activations remain E2M1 with block-16 UE4M3 scales, FP32 accumulation
-and BF16 output. Packing, masks and attention are unchanged.
+浮点模式拒绝整数 tactic files、category selection 与 condition grouping。可选融合如下，默认关闭：
 
-The two shapes were selected by repeated CUDA Graph event timing over actual
-module weights, followed by numerical and full-replay checks. Their measured
-operator gains do not establish a complete-policy speedup: paired full-replay
-wall timing did not show a consistent improvement. BF16 rounding boundaries
-may differ on arbitrary inputs, and existing FP4 quantization error remains;
-this option is not LIBERO closed-loop quality acceptance. Disable the flag to
-restore the original FP4 dispatch, or leave the optimization scope to restore
-BF16. Public CI does not execute CUDA; run the explicit tests on Thor:
+| 开关                                               | 行为                                                                                                                     |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `--fp8-fast-quant`                                 | 两遍 Triton 激活打包：partial absmax，再 finalize scale/cast；每次调用及 replay 都刷新，默认是 native packer             |
+| `--fp-shared-inputs`                               | 同一已知 QKV/KV 或 gate/up owner invocation 中，共用未修改的同一 activation packing；独立调用仍独立 pack                 |
+| `--fp-grouped`                                     | 完整选中组拼成一次 GEMM，优先于 shared-inputs；FP8 拼接权重后共用 tensor scale，可改变误差；FP4 保持 block-16 row scales |
+| `--fp-swiglu`                                      | native BF16 SiLU lookup、乘法与 packing 融合，保留 SiLU 输出先 round BF16 的边界；FP8 两遍，FP4 直接输出 E2M1/scales     |
+| `--norm-modulation-quant`、`--residual-norm-quant` | 配合 `--operator-fusion` 使用独立 floating producers；residual/materialized 边界仍为 BF16，LayerNorm reduction 顺序改变  |
+
+shared/grouped 状态在 owner 退出或异常时清空，Graph 记录每次 replay 的 fresh packing；group outputs 通常保留 views，text Q/K normalization 需要时产生 contiguous inputs。原参数、packed weights、scales、workspaces 与 Graph pools共同常驻。
+
+### FP4 Swap-AB
+
+`--fp4-swap-ab` 或 operator profile 的 `"floating_gemm": "swap_ab"` 显式选择 SM110 新 dispatch；`native` 保留原路径。命中条件限定为 biased `(M,K,N)=(41,256,1536)` 和 `(41,1536,1536)`，其他 signature（含 biasless/M=1）沿原路径。
+
+交换 W/X 后 tile 为 `(128,64,256)`；K=256 使用 cluster `(2,1,1)`、两 stages，K=1536 使用 `(4,1,1)`、自动 stages，均为 reference dynamic scheduler。column-major store 直接写原 contiguous `[M,N]` 输出，无额外 transpose kernel。格式、packing、mask 与 attention 保持原合同。
+
+这两个 shape 的选择来自实际权重上的重复 CUDA Graph timing 及数值/完整回放检查；已有配对完整回放未观察到稳定的 policy wall 提升，因此此开关供该 shape 的算子研究。任意输入的 BF16 rounding 可不同，FP4 误差与闭环质量需独立评估。关闭开关恢复原 FP4 dispatch，关闭整个作用域恢复 BF16。
+
+## 验证与证据
+
+验证分为执行合同、真实检查点回放和 LIBERO 闭环三个层次。固定精度的算子一致性解释实现行为；精度间动作误差描述数值变化；任务成功率由[闭环 runner](../docs/libero.md)给出。完整比较固定 checkpoint/input、attention、布局、fusion 与 Graph，并分别报告 bootstrap、vision、plan 和完整调用。steady latency 包含 online activation packing，安装/编译/离线权重打包/capture 单列。
+
+下列测试需在匹配的 CUDA 环境显式运行；公共 CI 使用 `tests/contracts`、元数据和 fake objects 检查接口，不执行 CPU 神经模型：
+
+| 测试文件（`tests/gpu/`）                                                                        | 主要覆盖                                                                        |
+| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `test_prepared_inference_gpu.py`、`test_policy_vlm_gpu.py`                                      | fresh-input ownership、真实输出/RNG、VLM Graph 与生命周期                       |
+| `test_image_preparation_gpu.py`                                                                 | 图像/collator 一致性与 ownership；完整动作/RNG 另由 CUDA policy gates 验证      |
+| `test_action_graph_gpu.py`                                                                      | Flow4/RNG、K/V freshness、stride/stream、异常及恢复                             |
+| `test_groot_fusion_gpu.py`、`test_groot_fusion_modes_gpu.py`、`test_groot_vision_layout_gpu.py` | fusion、组件选择、布局、隔离和恢复                                              |
+| `test_quantization_gpu.py`、`test_shape_tactics_gpu.py`                                         | 整数 kernel、prepared/grouped dispatch、变 shape Graph                          |
+| `test_groot_streaming_gpu.py`、`test_streaming_component_cache_gpu.py`                          | bootstrap、slide/image delay、reset、eager/Graph 异常清理；前者使用小随机动作头 |
+| `test_groot_norm_quant_gpu.py`                                                                  | norm/residual producer、reduction 误差与实际融合 kernel                         |
+| `test_floating_quantization_gpu.py`、`test_floating_fusion_gpu.py`、`test_fp4_swap_ab_gpu.py`   | Thor packing、bias、Graph freshness、fallback、恢复                             |
 
 ```bash
-PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_fp4_swap_ab_gpu.py
+PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_action_graph_gpu.py
+PIR2_NATIVE_TESTS=1 python -m pytest -q tests/native/test_compiled_host_guards.py
 ```
 
-These tests cover dynamic Graph inputs, nonzero bias, unsupported-shape fallback,
-buffer rejection and exception restoration. Recalibrate before expanding the
-signature table or claiming gains on a different checkpoint or workload.
-- `scope=all` covers eligible ordinary Linear projections, including vocabulary
-  and conditioning projections. FP8 requires K/N divisible by 16; FP4 by 32.
-  CategorySpecificLinear and excluded/unaligned sites remain BF16 and are listed
-  in coverage metadata. QK, softmax and PV attention stay floating point.
-- Original parameters remain allocated so exit and failure can restore BF16.
-  Packed weights, scales, activation workspaces and Graph pools add storage;
-  quantization does not imply lower total resident model memory here.
+Spatial streaming 验证使用同一个 πR² checkpoint，服务设 `--variant pir2`，省略 `--group-conditioning`；先比较 eager，再显式加 `--dit-cuda-graph`，每个新 signature 预热。Thor 的已有目标回放条件为 Spatial πR² checkpoint-500、B1/H40、固定 demonstration observations 与 committed prefixes，不能自动外推到其他检查点。
 
-The targeted validation uses checkpoint-500 of Spatial πR² adaptation, B1/H40,
-fixed demonstration observations and committed prefixes. GPU tests check packed
-references, bias, changing Graph inputs, RNG preservation and restoration:
+## 闭环报告与辅助工具
 
-```bash
-PIR2_GPU_TESTS=1 python -m pytest -q tests/gpu/test_floating_quantization_gpu.py tests/gpu/test_floating_fusion_gpu.py
-```
-
-Keep these checks separate from model replay and LIBERO closed-loop evaluation.
-Compare BF16/FP8/FP4 with identical checkpoint, attention, layout, fusion and Graph
-settings. Report bootstrap, vision and plan separately, along with full replay;
-exclude offline weight packing, compilation and capture from steady timings;
-include online activation packing. Action/cache errors
-and finite outputs do not establish task quality. No learned-policy quality
-threshold or FP4 deployment recommendation is supplied by this adapter.
-
-## Measured LIBERO queue reports
-
-`queue_report` is a separate offline consumer of real LIBERO closed-loop trace artifacts. It loads no model and launches no GPU work. Install Matplotlib for static exports, and make Node.js available for the optional illustrative queue-model comparison:
+`queue_report` 读取真实 LIBERO traces，不加载模型：
 
 ```bash
 python -m coexecution.queue_report \
-  --input .local/experiments/queue-scan \
-  --output .local/experiments/queue-report
-python -m pytest -q coexecution/test_queue_report.py
-```
-
-The input contains `layout/condition/{hardware.json,telemetry.jsonl,calibration.json,slow-warmup.json,episodes.jsonl,task*-episode*-trace.jsonl}`; a single condition directory also works. Each completed control window contributes to the report. The output includes a self-contained offline `index.html`, PNG/SVG capacity and hardware curves, representative per-condition trace plots, `summary.json`, `summary.csv`, complete replay data, and an explicitly labelled `simulation-comparison.json`. Smoke, clock-probe and profile conditions are excluded by default; `--include-diagnostics` enables diagnostic previews.
-
-The viewer replays camera waiting/in-flight/latest-feature state, S1 host requests and completed results awaiting adoption, and committed/future/bootstrap/fallback action slots with their producing request. Real capacity is the reciprocal of the mean complete solo RPC duration, never inferred from a requested clock. Hardware summaries report effective per-role clocks from telemetry. Requested settings need not take effect equally on different GPUs.
-
-Latency percentiles use requests admitted and completed within control windows. End-crossing requests remain censored; outputs targeting future control ticks are not expired. Energy integrates board-power samples only within each control window and reports NVML energy-counter differences and sample coverage separately. Board energy includes rendering or other work on those GPUs. Different success-terminated durations remain visible, along with paired initial-state hashes. Host RPC overlap does not establish CUDA kernel overlap, and selected episodes do not establish full-suite success. The embedded simulator is a separate illustrative reference, with explicit sharing assumptions and its original synthetic calibration/drain accounting.
-
-### Feature consumption accounting
-
-```bash
+  --input .local/experiments/queue-scan --output .local/experiments/queue-report
 python -m coexecution.feature_usage \
   --report .local/experiments/queue-report/report-data.json \
-  --output .local/experiments/feature-usage \
-  --raw-root .local/experiments/queue-scan
+  --output .local/experiments/feature-usage --raw-root .local/experiments/queue-scan
 ```
 
-The optional raw-root audit verifies published and consumed source identities against the original traces. Counts always use the actual feature sequence, never the nearest publication to an RPC timestamp: a request can hold an older snapshot while a new version arrives during installation. Outputs contain per-feature DiT reads, distinct directly executed producer requests, execution ticks, zero/one/multiple-read distributions and count-weighted valid-episode summaries. Bootstrap and right-censored final features are separate; unknown sources explicitly mark accounting incomplete. Direct execution does not represent all causal contributions through the neural rolling buffer.
+输入可为单 condition 或 `layout/condition/`，包含 hardware、telemetry、calibration、warmup、episodes 和逐 episode traces。输出有离线 HTML、PNG/SVG、JSON/CSV 与完整 replay。默认排除 smoke/clock-probe/profile，`--include-diagnostics` 纳入诊断预览；`--no-figures` 可免 Matplotlib。可选 Node queue comparison 标为 simulation，字体为本地下载资产并保留许可。
 
-Use `queue_report --no-figures` to export replay without Matplotlib. The optional Source Han webfont remains a separately downloaded local asset; generated reports inline it with its license when present.
+报告的 capacity 来自真实 solo RPC 均值的倒数，时钟来自 telemetry。latency 只统计控制窗口内入场且完成的请求；跨终点请求保留删失标记，未来 tick 的结果不视为 expired。能量只积分控制窗口的 board power，能量计数差值与样本覆盖单列；board energy 包含同卡渲染。成功提前终止的时长、初态 hashes 和未知源保留。
 
-### Model and robot replay evidence
+feature usage 依据实际 consumed sequence，而非最近 publication 时间；输出每 feature 的 DiT reads、直接执行 producer、ticks 和零/一/多次消费分布。bootstrap、最终右删失特征单列，unknown 来源使 accounting 标为 incomplete。直接执行计数不覆盖 rolling buffer 中的全部神经因果贡献。
 
-The [replay package](replay/README.md) builds a framework-free catalog from the
-existing independent model benchmark and actual deployment traces. Optional
-`--replay-assets` exports raw model input images outside timing;
-`--record-replay` records each precision's own bounded robot state and two-camera
-response, with encoding after control. The catalog keeps clean model timing,
-actual instrumented kernel timelines and divergent closed-loop trajectories
-separate. This is debugger evidence, not a replacement for LIBERO quality tests.
+[模型与机器人回放](replay/README.md)统一展示独立模型输入、clean latency、真实 kernel timeline 以及每个精度自己的闭环轨迹。`--replay-assets` 在计时外导出模型输入，`--record-replay` 有界记录机器人状态/双摄像头，控制完成后编码。
+
+SO100 的 H16 BF16 录制观测用于辅助执行机制诊断，入口与分析方式见[辅助 SO100 回放](../docs/coexecution.md#auxiliary-so100-replay)。模型、数据、trace、图表和报告留在忽略目录；源码与许可见[第三方记录](../THIRD_PARTY_NOTICES.md)。

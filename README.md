@@ -1,51 +1,70 @@
-# GR00T-N1.7-LIBERO: πR² and real-time control experiments
+# piR2：从量化推理到实时机器人控制
 
-这是基于 [πR² 官方实现](https://github.com/pi-r2-flow/pi-r2-flow) 的复现与实验扩展仓库，由本仓维护者独立维护，不是论文作者的官方发布，也不是 GitHub fork。
+**piR2 把 VLM/DiT 的量化、融合算子和执行调度接入真实 LIBERO 闭环，用同一条观测—推理—动作链路研究：模型变快之后，机器人能否更及时地使用新信息。**
 
-This independently maintained repository studies **NVIDIA GR00T-N1.7-LIBERO** task checkpoints, πR² adaptation, real VLM closed-loop control and deployment efficiency. It separates upstream source revisions and local fixes from experiment code. Local results are not automatically claims of reproducing the paper.
+项目从 [NVIDIA GR00T-N1.7-LIBERO 任务权重](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO)出发，以 [NVIDIA LIBERO 示例](https://github.com/NVIDIA/Isaac-GR00T/blob/main/examples/LIBERO/README.md)建立常规 Flow 基线，再接入 [πR²](https://github.com/pi-r2-flow/pi-r2-flow) 适配、真实 VLM 闭环和系统优化。当前完整训练与评测流程覆盖 **Spatial 的全部 10 个任务**；Object、Goal、Long 的扩展目标记录在[模型清单](configs/libero/model-family.json)。
 
-主要研究对象为 [官方 GR00T-N1.7-LIBERO 权重](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO)，常规基线以 [NVIDIA LIBERO 示例](https://github.com/NVIDIA/Isaac-GR00T/blob/main/examples/LIBERO/README.md) 为参考。先从已适配任务的权重建立基线，再比较 πR²、时序协议与部署优化；不默认重做通用基座的任务微调。
+<a id="scope--范围"></a>
 
-## Scope / 范围
+## 一条链路，三个实验层次
 
-- [LIBERO-Spatial adaptation](docs/libero.md) of public GR00T task weights and real VLM closed-loop evaluation.
-- Separate [fixed-delay algorithm and wall-clock deployment comparisons](docs/timing-protocols.md).
-- Four-suite research targets are recorded in [the model-family manifest](configs/libero/model-family.json); the current implemented training/evaluation pipeline covers the complete Spatial suite.
-- [Leap reconstruction](simulation/README.md), SO100 profiling and browser teaching tools are auxiliary historical work, reported separately from the GR00T-LIBERO main line.
-- [Single-GPU execution tools](coexecution/README.md) support auxiliary SO100 replay profiling; their mechanisms require separate LIBERO validation before contributing main-line performance claims.
-- [LIBERO VLM/DiT contention profiling](docs/coexecution.md#libero-vlmdit-contention-profiling) compares isolated, concurrent, priority and cooperative execution with BF16/W8A8/W4A4, keeping response time, hardware counters and task quality distinct.
-- [官方 Spatial Flow4 操作指南](docs/coexecution.md#official-spatial-flow4-scheduling-diagnostic)：环境与空卡预检、同卡/双卡调度、双进程延迟放行及结果读取。
-- [Interactive timing tool](simulator/README.md) explains queueing and cache-age assumptions without predicting task success.
-- [Jetson 与流式回放交接](docs/platform-handoff.md) maps AGX Orin/Thor porting gates, reproducible measurements and the replay integration contract.
+| 要回答的问题                   | 项目提供的能力                                                         | 主要证据                                                    |
+| ------------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------------- |
+| 量化与融合节省了多少推理时间？ | 固定真实输入的 BF16/W8A8/W4A4 模型回放、VLM/DiT 分段测量、算子 profile | 完整调用 wall 延时、GPU 活动、量化和打包占比                |
+| VLM 和 DiT 怎样共享计算资源？  | 独立、并发、优先级和协作式调度；分进程或同进程双 worker                | 两个模型各自的响应时间、重叠与排队                          |
+| 推理加速怎样影响机器人动作？   | 固定延迟算法对照、墙钟部署对照、同步/异步执行、πR² 滚动控制            | 任务成功率、deadline、已执行动作 AoI、fallback 与机器人视频 |
 
-Modules are introduced through focused pull requests. Model weights, datasets, environments and generated results are intentionally excluded from Git.
+下面是缓存异步控制的依赖关系。S2 更新视觉特征，S1 结合当前状态生成动作，控制器在合法物理边界执行；回放保留每个动作的实际来源。
 
-## Start / 开始
+```mermaid
+flowchart LR
+    accTitle: 从视觉特征到机器人动作
+    accDescr: LIBERO 图像进入 S2 VLM，特征缓存和当前状态共同驱动 S1 DiT，动作缓冲再推进机器人；各阶段事件汇入回放。
+    camera["LIBERO 图像"] --> vlm["S2 · VLM"]
+    vlm --> cache["带时间戳的特征缓存"]
+    cache --> dit["S1 · DiT"]
+    state["当前机器人状态"] --> dit
+    dit --> buffer["动作缓冲与调度"]
+    buffer --> robot["LIBERO 物理步进"]
+    robot --> camera
+    robot --> state
+    vlm -.-> replay["时间线与视频回放"]
+    dit -.-> replay
+    robot -.-> replay
+```
 
-Read [source provenance](docs/upstream.md), [environment boundaries](docs/environment.md) and [contribution rules](CONTRIBUTING.md). New users can initialize the default official CUTLASS dependency with the clone:
+## 按任务阅读
+
+| 任务                                            | 文档                                                                             |
+| ----------------------------------------------- | -------------------------------------------------------------------------------- |
+| 配置环境、准备任务权重、启动 Spatial 实验       | [环境](docs/environment.md) → [LIBERO 工作流](docs/libero.md)                    |
+| 阅读量化、GEMM、融合与执行适配实现              | [算子与模块参考](coexecution/README.md)                                          |
+| 测量模型延时、拆解开销或比较 VLM/DiT 争用       | [性能实验指南](docs/coexecution.md)                                              |
+| 选择算法/部署协议、动作前缀、异步深度和接纳策略 | [时序协议](docs/timing-protocols.md)                                             |
+| 在前端检查不同精度的模型时间线、动作来源和视频  | [前端使用](simulator/README.md) → [回放数据与接口](coexecution/replay/README.md) |
+| 在 AGX Orin / AGX Thor 上复刻并接入流式播放平台 | [平台交接](docs/platform-handoff.md)                                             |
+| 核对作者代码、第三方算子、固定版本和本地修改    | [源码关系](docs/upstream.md)                                                     |
+
+测量分层对应不同结论：固定输入回放解释模型开销，闭环轨迹解释调度和动作时效，任务评测衡量控制质量。成功率与时序指标按 checkpoint、协议、初始条件和硬件配置配对报告；具体精度和平台的可用接口见[能力表](docs/platform-handoff.md#precision-support)。
+
+<a id="start--开始"></a>
+
+## 开始使用
 
 ```bash
 git clone --recurse-submodules https://github.com/Ther-nullptr/piR2.git
 cd piR2
-```
-
-For an existing piR2 checkout using the default CUTLASS version, run
-`git submodule update --init --recursive coexecution/kernels/vendor/cutlass`
-after pulling or switching branches. The Git link records
-`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa` as the reproducible default. Authors may
-instead set `CUTLASS_ROOT=/path/to/cutlass` to use an existing compatible full
-header tree, or keep a compatible local submodule revision; the exact SHA need
-not match. Actual CUDA operator implementations remain in this repository.
-[Setup instructions](docs/environment.md#cutlass-submodule) describe the required
-header structure, toolchain compatibility and optional Git object-cache reuse.
-Fetch the separately pinned model source when needed:
-
-```bash
 python3 tools/prepare_sources.py --component groot
 ```
 
-Model training and inference require CUDA. Lightweight CI checks repository hygiene and scheduling/accounting logic; it never evaluates a model on CPU, downloads model weights or uses laboratory GPU runners.
+随后按[环境指南](docs/environment.md)配置 CUDA 模型环境和独立的 LIBERO 仿真环境，再按 [LIBERO 工作流](docs/libero.md)准备权重、测量或评测。CUTLASS 可使用仓库记录的默认版本，也可通过 `CUTLASS_ROOT` 选择兼容安装，详见[依赖配置](docs/environment.md#cutlass-submodule)。
 
-## Paper / 论文
+代码、必要配置和稳定使用说明进入版本管理；权重、数据、环境与实验产物留在本地。开发和提交检查见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-Sungjae Park and Shubham Tulsiani, *πR²: Reactive Real-time Flow Policies*, 2026. [Paper](https://arxiv.org/abs/2607.26055) · [Official implementation](https://github.com/pi-r2-flow/pi-r2-flow).
+<a id="paper--论文"></a>
+
+## 算法来源与辅助实验
+
+πR² 算法来自 Sungjae Park 和 Shubham Tulsiani 的 _πR²: Reactive Real-time Flow Policies_（2026）：[论文](https://arxiv.org/abs/2607.26055) · [作者实现](https://github.com/pi-r2-flow/pi-r2-flow)。本仓库独立维护 LIBERO 适配、量化与调度实验、回放工具和可追踪补丁；作者代码与本地实现的边界见[源码关系](docs/upstream.md)。
+
+[Leap 状态策略重建](simulation/README.md)、SO100 真实观测回放与浏览器队列教学工具提供辅助实验路径，各自保留独立的数据、协议和结果口径。
