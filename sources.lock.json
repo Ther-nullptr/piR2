@@ -48,6 +48,12 @@
       "path": "coexecution/kernels/vendor/cutlass",
       "mode": "submodule",
       "patches": []
+    },
+    "libero-dynamic": {
+      "url": "https://github.com/renshaojie233/LIBERO-Dynamic.git",
+      "revision": "1e5845720643da281c47bf4423ae99e115976a13",
+      "path": "third_party/libero_dynamic",
+      "patches": []
     }
   },
   "adapted_sources": {

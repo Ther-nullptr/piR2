@@ -1,0 +1,32 @@
+{
+  "schema": "pir2.libero_dynamic.benchmark.v1",
+  "paper": "https://arxiv.org/abs/2610.24579",
+  "upstream_url": "https://github.com/renshaojie233/LIBERO-Dynamic.git",
+  "upstream_revision": "1e5845720643da281c47bf4423ae99e115976a13",
+  "configs": {
+    "l1": {
+      "path": "libero/libero/dynamic_configs/libero_dynamic_l1.yaml",
+      "sha256": "861c618c2a8a1766f2d01c1952be6db2f8ee5d9c77b9d9a57f42bb33c2b77925"
+    },
+    "l2": {
+      "path": "libero/libero/dynamic_configs/libero_dynamic_l2.yaml",
+      "sha256": "599f2a1d591dcca97177a81f2a943a5df3ec17025900454904cf6712295ad801"
+    },
+    "l3": {
+      "path": "libero/libero/dynamic_configs/libero_dynamic_l3.yaml",
+      "sha256": "d39176b1b073bf3add3873ef981ff64e6cccd5bbf130d99bbcdc5899760b7221"
+    }
+  },
+  "suites": ["libero_spatial", "libero_object", "libero_goal", "libero_10"],
+  "task_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "trajectory_indices": [0, 1, 2, 3, 4],
+  "speed_mps": [0.03, 0.06, 0.09],
+  "seed": 0,
+  "init_state_id": 0,
+  "pre_policy_dynamic_steps": 40,
+  "full_population_conditions": 1800,
+  "evaluation_status": "inventory_only",
+  "motion_contract": "Levels identify the reviewed configuration families. Preserve actual per-target motion types and geometry; do not derive them from level names.",
+  "speed_contract": "Each condition declares an explicit speed override. Raw source motion dictionaries retain their original alpha_mps. Zero is not a stationary condition: upstream treats alpha_mps=0 as its default speed.",
+  "phase_contract": "Advance actual moving-world physics for 40 control steps before the first policy observation. This is neither seed 40 nor a phase-counter jump."
+}
