@@ -1,4 +1,4 @@
-"""Inspect the reviewed LIBERO-Dynamic benchmark without loading a simulator."""
+"""Inspect or evaluate the reviewed physical moving-object benchmark."""
 
 import argparse
 import json
@@ -21,8 +21,20 @@ def main(argv=None):
         choices=SUITES,
         help="Repeat to select suites; default all 40 tasks",
     )
+    evaluate = commands.add_parser(
+        "evaluate", help="Run default GR00T on real moving-object environments"
+    )
+    from .evaluation import add_evaluate_arguments
+
+    add_evaluate_arguments(evaluate)
     args = parser.parse_args(argv)
     try:
+        if args.command == "evaluate":
+            from .evaluation import evaluate_default
+
+            result = evaluate_default(args)
+            print(json.dumps(result))
+            return
         result = build_inventory(args.upstream, suites=args.suite)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x", encoding="utf-8") as output:

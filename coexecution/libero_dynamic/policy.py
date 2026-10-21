@@ -36,9 +36,20 @@ def _client_factory(**options):
     from gr00t.policy.server_client import PolicyClient
 
     class ExplicitCloseClient(PolicyClient):
+        def _init_socket(self):
+            # Close before the upstream replacement drops the last reference.
+            # A socket already closed by GC with infinite linger can keep term
+            # blocked even when destroy(linger=0) closes the remaining sockets.
+            previous = getattr(self, "socket", None)
+            if previous is not None:
+                previous.close(linger=0)
+            super()._init_socket()
+
         def close(self):
             self.socket.close(linger=0)
-            self.context.term()
+            # Upstream recreates REQ sockets on timeouts without closing the old
+            # socket. Destroy all of this client's sockets on their owner thread.
+            self.context.destroy(linger=0)
 
         def __del__(self):
             # Upstream's destructor touches the socket. GC may run on the main
@@ -51,15 +62,16 @@ def _client_factory(**options):
 class GrootChunkPolicy:
     """An ordinary full-policy request, followed by K native decoded commands.
 
-    Construction and reset perform no RPC. The first get_action_chunk creates
-    the client on the inference executor; all later calls and close must run on
+    Construction and reset perform no RPC. Prepare or the first get_action_chunk
+    creates the client on the inference executor; later calls and close run on
     that same thread. Drain requests and submit close to that executor BEFORE
     shutting down the upstream controller, whose close does not close its policy.
 
     Optional raw observation ``__pir2_capture`` metadata contains source_tick,
-    sim_time_s and/or capture_s (monotonic seconds). Without a physical source
-    tick, the RPC source_tick is a request sequence, explicitly labelled in the
-    records; it must not be interpreted as a simulator tick.
+    source_tick_kind, sim_time_s and/or capture_s (monotonic seconds). An explicit
+    action_step counts executed commands, excluding inference holds. Without a
+    source tick, the RPC source_tick is a request sequence, explicitly labelled
+    in the records; it must not be interpreted as a simulator tick.
     """
 
     supports_rtc_conditioning = False
@@ -129,12 +141,44 @@ class GrootChunkPolicy:
             self.identity = deepcopy(identity)
         return self._client
 
+    def _apply_reset(self, client, generation, seed, record):
+        if self._applied_generation != generation:
+            record["reset_started_s"] = time.monotonic()
+            try:
+                client.call_endpoint("reset", {"options": {"seed": seed}})
+            finally:
+                record["reset_completed_s"] = time.monotonic()
+            self._applied_generation = generation
+
+    def prepare(self):
+        """Connect and apply pending reset on the owner, outside timed inference.
+
+        This barrier runs no model and does not append an inference record. Call
+        it again after controller.reset, on the same executor used for inference.
+        """
+        client = self._connection()
+        with self._lock:
+            generation, seed = self._generation, self.seed
+        self._apply_reset(client, generation, seed, {})
+        with self._lock:
+            if generation != self._generation:
+                raise RuntimeError("Policy reset during preparation; retry barrier")
+        return deepcopy(self.identity)
+
     @staticmethod
     def _capture(raw_observation, request_sequence, started):
         metadata = raw_observation.get("__pir2_capture", {})
         if not isinstance(metadata, dict):
             raise TypeError("Observation capture metadata must be a mapping")
         source_tick = metadata.get("source_tick", request_sequence)
+        source_tick_kind = metadata.get(
+            "source_tick_kind",
+            "physical_tick" if "source_tick" in metadata else "request_sequence",
+        )
+        if source_tick_kind not in {"physical_tick", "action_step", "request_sequence"}:
+            raise ValueError("Invalid observation source tick kind")
+        if "source_tick" not in metadata and source_tick_kind != "request_sequence":
+            raise ValueError("Observation source tick kind requires an explicit tick")
         capture_s = metadata.get("capture_s", started)
         sim_time_s = metadata.get("sim_time_s")
         if type(source_tick) is not int or source_tick < 0:
@@ -149,9 +193,7 @@ class GrootChunkPolicy:
             raise ValueError("Simulation time must be finite and nonnegative")
         return {
             "source_tick": source_tick,
-            "source_tick_kind": (
-                "physical_tick" if "source_tick" in metadata else "request_sequence"
-            ),
+            "source_tick_kind": source_tick_kind,
             "capture_s": capture_s,
             "capture_time_kind": (
                 "observation_capture" if "capture_s" in metadata else "policy_entry"
@@ -212,11 +254,7 @@ class GrootChunkPolicy:
             "status": "pending",
         }
         try:
-            if self._applied_generation != generation:
-                record["reset_started_s"] = time.monotonic()
-                client.call_endpoint("reset", {"options": {"seed": seed}})
-                record["reset_completed_s"] = time.monotonic()
-                self._applied_generation = generation
+            self._apply_reset(client, generation, seed, record)
             observation = self._preprocess(raw_observation, language)
             record["rpc_started_s"] = time.monotonic()
             try:

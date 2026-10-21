@@ -24,3 +24,5 @@ future==0.18.2
 matplotlib==3.5.3
 termcolor==2.4.0
 pydantic==2.12.3
+# The upstream RPC package eagerly imports its policy interface; no model loads.
+transformers==4.57.3

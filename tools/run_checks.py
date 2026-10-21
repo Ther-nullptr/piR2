@@ -42,6 +42,7 @@ def main():
         "tests/contracts/test_libero_experiments.py",
         "tests/contracts/test_dynamic_catalog.py",
         "tests/contracts/test_dynamic_policy.py",
+        "tests/contracts/test_dynamic_evaluation.py",
         "tests/contracts/test_responsive_scheduling.py",
         "tests/contracts/test_synchronous_execution.py",
         "tests/contracts/test_one_step_async.py",

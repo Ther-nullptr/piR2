@@ -1,6 +1,6 @@
 # LIBERO-Dynamic：移动目标下的速度与控制质量
 
-本模块接入 [LIBERO-Dynamic](https://arxiv.org/abs/2610.24579) 的移动目标环境，用同一组任务、轨迹和初始条件比较默认 VLA、量化推理与 πR²。核心观测是目标在等待模型期间移动了多少，以及返回动作能否完成抓取和放置。当前里程碑固定源码、完整任务清单和默认 GR00T RPC 适配器；动态闭环、速度—成功率实验与代表性模型视频按后续阶段验收。
+本模块接入 [LIBERO-Dynamic](https://arxiv.org/abs/2610.24579) 的移动目标环境，用同一组任务、轨迹和初始条件比较默认 VLA、量化推理与 πR²。核心观测是目标在等待模型期间移动了多少，以及返回动作能否完成抓取和放置。`inventory` 固定完整条件清单，`evaluate` 将已有 GR00T 服务接入上游物理载体、任务判定和录像循环。速度—成功率实验及 πR² 动态适配分别记录实际验收结果。
 
 ## 基准与模型
 
@@ -25,7 +25,40 @@ python -m coexecution.libero_dynamic inventory \
 
 发布代码中的部分轨迹函数会把 `alpha_mps=0` 回退为0.055m/s，因此不能用改零速度宣称静态对照。静态控制需要明确停用或冻结载体运动，并核对目标实际位移。动态的40步初始相位必须真实推进场景；推理延迟期间也保留目标运动。
 
-后续记录同时保留仿真时间、墙钟时间、校准延迟、实际目标位姿、动作来源、成功率和空队列事件。视频覆盖等待期间的移动过程；默认 VLA、量化与 πR² 的对照使用明确一致的评测条件，不从固定输入误差推断动态任务排名。
+评测记录同时保留仿真时间、墙钟时间、校准延迟、实际目标位姿、动作来源、成功率和空队列事件。视频覆盖等待期间的移动过程；默认 VLA、量化与 πR² 的对照使用明确一致的评测条件，不从固定输入误差推断动态任务排名。
+
+## 运行已有模型的默认动态评测
+
+在模型环境中启动已有套件权重的普通 Flow 服务。以下路径变量应指向本机现有目录，输出目录为本地实验目录。
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  python -m coexecution.libero.service \
+  --checkpoint "$LOCAL_SPATIAL_CHECKPOINT" --variant flow --role action \
+  --port 19170 --device cuda:0 --inference-precision bf16 \
+  --runtime-receipt --output .local/dynamic-model-bf16
+```
+
+在独立仿真环境中选择套件、任务、轨迹和速度，连接上述服务。每个输出目录只能创建一次，重跑须用新目录。
+
+```bash
+python -m coexecution.libero_dynamic evaluate \
+  --upstream third_party/libero_dynamic \
+  --output .local/dynamic-spatial-bf16-v006 \
+  --suite libero_spatial --task-ids 0 3 --levels l1 --traj-indices 0 \
+  --speed-mps 0.06 --model-port 19170 \
+  --expected-checkpoint "$LOCAL_SPATIAL_CHECKPOINT" --precision bf16 \
+  --chunk-steps 8 --max-steps 600 --calibrate \
+  --timing-rule release_continuous_sync
+```
+
+省略任务、轨迹家族和路径参数时，会运行该套件当前速度下的全部150个条件；三档速度分别运行。`libero_object`、`libero_goal`、`libero_10` 必须连接各自的已有套件权重，不能复用 Spatial 权重后称为套件基线。所有神经模型在 CUDA 服务上运行。
+
+校准使用第一个选定场景的真实初始观测，8次预热后保留88次完整请求，取中位数作为该批次固定延迟；完整请求包含输入处理、RPC、模型和动作输出处理。正式开始前重置策略随机状态。每个后续场景仍有预热，物理场景在预热和校准期间保持初始状态，正式推理等待才推进动态时间。实际请求耗时与施加的校准延迟分别保留。`--calibration` 可复用匹配执行身份的实测校准；`--latency-seconds` 是明确标记的延迟控制实验，不能作为模型速度实测。
+
+少于8次预热或88次保留调用的校准标为 `diagnostic`，样本数随结果保存。校准身份核对权重内容、精度、执行前缀、输入形状、GPU和可用的源码/运行时证据；锁频与功耗配置仍需由实验方保存，改变这些条件后重新校准。正式延迟测量使用无其他任务争用的GPU。
+
+`evaluation-summary.json` 给出成功数、时序规则和校准身份；各场景的 `policy_audits` 保存完整模型输出、执行前缀、服务阶段、动作块与物体位姿。上游 step trace 保留逐动作队列和任务状态。`video_samples` 将每帧映射到仿真时间及推理等待/动作阶段。视频为物理场景相机画面，GR00T 实际输入另经官方图像转换；视频60fps与控制20Hz分别记录。
 
 ## 默认 GR00T 策略适配器
 
@@ -36,10 +69,11 @@ from coexecution.libero_dynamic.policy import GrootChunkPolicy
 
 policy = GrootChunkPolicy(port=5570, chunk_steps=8, seed=0)
 # These calls run on the same inference thread:
+identity = policy.prepare()  # Connect and reset outside the measured request.
 actions = policy.get_action_chunk(raw_observation, task_language)
 policy.close()
 ```
 
-运行时 `PYTHONPATH` 需包含本仓库、`scripts/` 和固定 GR00T 源码。连接在第一次推理的线程创建，后续使用和关闭保持在该线程；reset可以由控制线程请求，在下一次推理前执行一次。上游控制器退出前，先排空请求，再通过其executor执行 `policy.close()`，最后关闭executor。`policy.records` 在内存保存完整模型输出、执行前缀和RPC/服务端阶段，不在模型计时路径写盘。
+运行时 `PYTHONPATH` 需包含本仓库、`scripts/` 和固定 GR00T 源码。连接在 `prepare()` 或第一次推理的线程创建，后续使用和关闭保持在该线程；reset可以由控制线程请求，在下一次 `prepare()` 或推理前执行一次。上游控制器退出前，先排空请求，再通过其executor执行 `policy.close()`，最后关闭executor。`policy.records` 在内存保存完整模型输出、执行前缀和RPC/服务端阶段，不在模型计时路径写盘。
 
-观测可携带 `__pir2_capture` 的物理步、仿真时间和实际capture时间；缺少时明确标为请求序号/策略入口时间，不能伪装成物理观测年龄。环境接入必须在上游观测快照阶段保留这些字段。
+观测可携带 `__pir2_capture` 的来源步、步计数类型、仿真时间和实际capture时间。动态评测的 `source_tick_kind=action_step` 统计已执行动作，不包含推理等待子步；完整物理时间单独记录。缺少来源时标为请求序号/策略入口时间，环境接入须在上游观测快照阶段保留这些字段。

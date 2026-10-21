@@ -136,6 +136,58 @@ def test_reset_queues_seed_once_per_generation_and_close_owns_thread():
         policy.get_action_chunk({"frame": 4}, "four")
 
 
+def test_prepare_applies_pending_reset_on_owner_before_timed_inference():
+    policy, clients, preprocessed = create_policy(seed=17)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        identity = pool.submit(policy.prepare).result()
+        assert identity["predicted_horizon"] == 40
+        identity["decoded_horizon"] = 99
+        assert policy.identity["decoded_horizon"] == 16
+        pool.submit(policy.prepare).result()
+        assert [name for name, _ in clients[0].calls] == ["identity", "reset"]
+        assert preprocessed == [] and policy.records == []
+        with pytest.raises(RuntimeError, match="owning thread"):
+            policy.prepare()
+        policy.reset(seed=29)
+        pool.submit(policy.prepare).result()
+        pool.submit(policy.get_action_chunk, {"frame": 1}, "cup").result()
+        assert [data for name, data in clients[0].calls if name == "reset"] == [
+            {"options": {"seed": 17}},
+            {"options": {"seed": 29}},
+        ]
+        assert "reset_started_s" not in policy.records[-1]
+        pool.submit(policy.close).result()
+    with pytest.raises(RuntimeError, match="closed"):
+        policy.prepare()
+
+
+def test_prepare_detects_reset_racing_with_barrier():
+    policy, clients, _ = create_policy()
+    started, finish = threading.Event(), threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(policy.prepare).result()
+        original_call = clients[0].call_endpoint
+
+        def block_reset(endpoint, data=None, requires_input=True):
+            if endpoint == "reset":
+                started.set()
+                assert finish.wait(5)
+            return original_call(endpoint, data, requires_input)
+
+        clients[0].call_endpoint = block_reset
+        policy.reset(seed=29)
+        pending = pool.submit(policy.prepare)
+        assert started.wait(5)
+        policy.reset(seed=31)
+        finish.set()
+        with pytest.raises(RuntimeError, match="reset during preparation"):
+            pending.result()
+        pool.submit(policy.prepare).result()
+        assert clients[0].calls[-1] == ("reset", {"options": {"seed": 31}})
+        assert policy.records == []
+        pool.submit(policy.close).result()
+
+
 def test_observation_metadata_preserves_physical_tick_and_simulation_clock():
     policy, clients, _ = create_policy()
     policy.get_action_chunk(
@@ -150,6 +202,40 @@ def test_observation_metadata_preserves_physical_tick_and_simulation_clock():
     record = policy.records[-1]
     assert record["source_tick_kind"] == "physical_tick"
     assert record["sim_time_s"] == 2.6
+    policy.close()
+
+
+def test_action_step_capture_is_not_mislabeled_as_physical_tick():
+    policy, _clients, _ = create_policy()
+    policy.get_action_chunk(
+        {
+            "frame": 1,
+            "__pir2_capture": {
+                "source_tick": 8,
+                "source_tick_kind": "action_step",
+                "capture_s": 18.0,
+                "sim_time_s": 3.01,
+            },
+        },
+        "cup",
+    )
+    assert policy.records[-1]["source_tick_kind"] == "action_step"
+    assert policy.records[-1]["source_tick"] == 8
+    assert policy.records[-1]["sim_time_s"] == 3.01
+    policy.close()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"source_tick": 8, "source_tick_kind": "unknown_clock"},
+        {"source_tick_kind": "action_step"},
+    ],
+)
+def test_capture_rejects_ambiguous_tick_domain(metadata):
+    policy, _clients, _ = create_policy()
+    with pytest.raises(ValueError, match="source tick kind"):
+        policy.get_action_chunk({"frame": 1, "__pir2_capture": metadata}, "cup")
     policy.close()
 
 
@@ -283,3 +369,40 @@ def test_close_before_any_request_does_not_construct_client():
     assert clients == []
     with pytest.raises(RuntimeError, match="closed"):
         policy.reset()
+
+
+def test_timeout_socket_replacement_closes_old_socket_before_losing_reference(
+    monkeypatch,
+):
+    import sys
+
+    from coexecution.libero_dynamic.policy import _client_factory
+
+    class Socket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self, *, linger):
+            assert linger == 0
+            self.closed = True
+
+    class TimeoutRecreatingClient:
+        def __init__(self, **options):
+            self.context = SimpleNamespace(destroy=lambda **options: None)
+            self._init_socket()
+
+        def _init_socket(self):
+            self.socket = Socket()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "gr00t.policy.server_client",
+        SimpleNamespace(PolicyClient=TimeoutRecreatingClient),
+    )
+    client = _client_factory()
+    old_socket = client.socket
+    client._init_socket()  # Upstream invokes this after a REQ timeout.
+    assert old_socket.closed
+    assert not client.socket.closed
+    client.close()
+    assert client.socket.closed
