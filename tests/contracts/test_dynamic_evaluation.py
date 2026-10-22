@@ -732,14 +732,14 @@ class FakePolicy:
         self.calls.append(("close", threading.get_ident()))
 
 
-def fake_episode_inputs(tmp_path, *, fail=False):
+def fake_episode_inputs(tmp_path, *, fail=False, fixture=False):
     class Base:
         def __init__(self, item, args, worker_slot=0):
             self.item, self.args = item, args
             self.preview_elapsed = 2.0
             self.preview_dt = 0.05
             self.preview_states = []
-            self.use_preview = True
+            self.use_preview = not fixture
 
         def _setup_world(self, env, init):
             return (
@@ -762,6 +762,15 @@ def fake_episode_inputs(tmp_path, *, fail=False):
             )
             return controller
 
+        def _step_env(self, env, action, *, on_substep=None):
+            assert env._consume_inference_latency() == 0
+            env._advance_dynamic_fixture_body({}, 0.05, reason="native_action")
+            for index in range(25):
+                env.sim.step()
+                if on_substep:
+                    on_substep((index + 1) * 0.002)
+            return {}, 0, False, {}
+
         def _apply_sync_latency(self, env, duration, *, on_substep=None):
             for index in range(round(duration / 0.01)):
                 env.sim.data.time += 0.01
@@ -772,7 +781,9 @@ def fake_episode_inputs(tmp_path, *, fail=False):
 
     source = SimpleNamespace(
         runtime=SimpleNamespace(
-            RealtimeEpisode=Base, _target_entries=lambda item, env: []
+            RealtimeEpisode=Base,
+            _target_entries=lambda item, env: [],
+            _object_pose=lambda env, name, entry: {"name": name},
         )
     )
     options = SimpleNamespace(
@@ -794,9 +805,43 @@ def fake_episode_inputs(tmp_path, *, fail=False):
     args = SimpleNamespace(calibrated_latency_seconds=0)
     policy = FakePolicy(tmp_path, fail=fail)
     episode = ev.make_episode_type(source, options, session)(item, args, policy=policy)
-    episode._setup_world(
-        SimpleNamespace(sim=SimpleNamespace(data=SimpleNamespace(time=3.0))), None
-    )
+    env = SimpleNamespace(sim=SimpleNamespace(data=SimpleNamespace(time=3.0)))
+    if fixture:
+        env.dynamic_config = {
+            "motion": {"type": "body_yaw_zigzag_waypoints"},
+            "carrier": {"enabled": False},
+        }
+        env.dynamic_controller = object()
+        env.dynamic_multi_target_states = []
+        env.dynamic_fixture_body_state = {"elapsed": 1.0}
+        env.pending = None
+        env.sim.model = SimpleNamespace(opt=SimpleNamespace(timestep=0.002))
+        env.sim.forward = lambda: None
+        env.sim.step = lambda: setattr(
+            env.sim.data, "time", env.sim.data.time + env.sim.model.opt.timestep
+        )
+        env._get_latency_config = lambda: {
+            "enabled": True,
+            "mode": "continuous_physics",
+            "substep_dt": 0.01,
+        }
+        env.notify_inference_latency = lambda value: setattr(env, "pending", value)
+
+        def consume():
+            value = env.pending or 0
+            env.pending = None
+            return value
+
+        env._consume_inference_latency = consume
+        env._capture_latency_robot_hold_state = lambda config: []
+        env._restore_latency_robot_hold_state = lambda state, **kwargs: None
+
+        def advance(config, seconds, **kwargs):
+            env.dynamic_fixture_body_state["elapsed"] += seconds
+            return {"delta_seconds": seconds}
+
+        env._advance_dynamic_fixture_body = advance
+    episode._setup_world(env, None)
     return episode, policy, session
 
 
@@ -872,3 +917,39 @@ def test_latency_advances_once_and_video_map_includes_joint_held_motion(tmp_path
         ]
     finally:
         controller.close()
+
+
+def test_fixture_episode_hold_and_action_use_real_clocks_and_correct_source_video_offset(
+    tmp_path,
+):
+    episode, _, _ = fake_episode_inputs(tmp_path, fixture=True)
+    assert episode.use_preview is False
+    assert episode.motion_events[0]["motion_phase_s"] == 1.0
+    episode.control_started = True
+    latency = 0.0613
+    hold_frames, action_frames = [], []
+    episode._apply_sync_latency(episode.env, latency, on_substep=hold_frames.append)
+    assert episode.env.pending is None
+    assert episode.rollout_sim_time_s == pytest.approx(latency)
+    # Source non-preview run() subtracts the pending latency from its callback
+    # base; our adapter must restore it now that hold physics already happened.
+    episode._step_env(episode.env, np.zeros(7), on_substep=action_frames.append)
+    assert action_frames[-1] == pytest.approx(latency + 0.05)
+    assert episode.rollout_sim_time_s == pytest.approx(latency + 0.05)
+    assert episode.env.sim.data.time == pytest.approx(3 + latency + 0.05)
+    assert episode.motion_events[-1]["motion_phase_s"] == pytest.approx(
+        1 + latency + 0.05
+    )
+    assert episode.motion_events[-1]["physics_elapsed_s"] == pytest.approx(0.05)
+    assert [sample["phase"] for sample in episode.video_samples] == [
+        "inference_hold",
+        "action",
+    ]
+    assert episode.video_samples[-1]["sample_sim_time_s"] == pytest.approx(0.1013)
+    # A chunk-internal action has no pending hold and must not repeat the offset.
+    action_frames.clear()
+    episode._step_env(episode.env, np.zeros(7), on_substep=action_frames.append)
+    assert action_frames[-1] == pytest.approx(0.05)
+    assert episode.rollout_sim_time_s == pytest.approx(latency + 0.10)
+    assert len(episode.fixture_timing.records) == 1
+    assert episode.latency_backend == "owned_fixture_exact_hold"

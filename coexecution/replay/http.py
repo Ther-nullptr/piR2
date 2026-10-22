@@ -17,7 +17,7 @@ from .stream import (
 )
 
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
-MIMES = {"video/webm", "image/png"}
+MIMES = {"video/webm", "video/mp4", "image/png"}
 
 
 class ReplayFiles:
