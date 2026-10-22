@@ -201,4 +201,4 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_groot_spatial.py \
 
 ## 移动目标扩展
 
-[LIBERO-Dynamic](../coexecution/libero_dynamic/README.md)固定第二套仿真协议的源码与1800个动态条件，重点研究目标运动下的推理速度与任务成功率。静态LIBERO现有入口保持不变；新模块明确记录接入与验证阶段，默认使用现成VLA权重，不采用论文微调流程。
+[LIBERO-Dynamic](../coexecution/libero_dynamic/README.md)固定第二套仿真协议的源码与1800个动态条件，连接已有套件权重的默认 Flow4 与 πR² 接口。`evaluate --native-latency` 将本次完整策略调用耗时用于本次物理等待；`evaluate-pir2 --timing-mode native` 用各自实测耗时驱动 S1/S2 逻辑调度。两者记录真实物体运动、动作来源与视频帧时间。静态质量使用独立的原始 LIBERO 对照，不把动态速度设为零；各协议的时间和预算口径见模块文档。本阶段不采用论文微调流程。

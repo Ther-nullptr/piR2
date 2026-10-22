@@ -207,6 +207,14 @@
   function timelineAxis(start, end) {
     return `<div class="task-axis"><span>物理仿真时间 / s</span><div class="task-scale">${Array.from({ length: 6 }, (_, i) => `<span style="left:${i * 20}%">${(start + ((end - start) * i) / 5).toFixed(3)} s</span>`).join("")}</div></div>`;
   }
+  function averageActionHz(e) {
+    return Number.isInteger(e.steps) &&
+      e.steps >= 0 &&
+      finite(e.duration_s) &&
+      e.duration_s > 0
+      ? e.steps / e.duration_s
+      : null;
+  }
   function startupLabel(e) {
     const ms = (v) => (finite(v) ? (v * 1000).toFixed(1) : "—");
     if (!finite(e.requested_startup_release_seconds))
@@ -258,6 +266,7 @@
     timelineAxis,
     modelContract,
     timingLabel,
+    averageActionHz,
     startupLabel,
     stageNfe,
     observationLabel,
