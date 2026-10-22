@@ -83,3 +83,40 @@ policy.close()
 运行时 `PYTHONPATH` 需包含本仓库、`scripts/` 和固定 GR00T 源码。连接在 `prepare()` 或第一次推理的线程创建，后续使用和关闭保持在该线程；reset可以由控制线程请求，在下一次 `prepare()` 或推理前执行一次。上游控制器退出前，先排空请求，再通过其executor执行 `policy.close()`，最后关闭executor。`policy.records` 在内存保存完整模型输出、执行前缀和RPC/服务端阶段，不在模型计时路径写盘。
 
 观测可携带 `__pir2_capture` 的来源步、步计数类型、仿真时间和实际capture时间。动态评测的 `source_tick_kind=action_step` 统计已执行动作，不包含推理等待子步；完整物理时间单独记录。缺少来源时标为请求序号/策略入口时间，环境接入须在上游观测快照阶段保留这些字段。
+
+## 已有 πR² 权重的动态控制实验
+
+`evaluate-pir2` 使用本项目已有的 πR² checkpoint，连接两个独立 policy 实例的 action/VLM 服务。服务必须声明 `variant=pir2`、原生预测和解码长度40、`numpy_bf16` 特征传输及 combined install/plan；两侧权重哈希和请求精度必须一致。普通 Flow 权重不能直接改名为 πR²。客户端复用 `Backend.bootstrap/vision/plan` 的真实神经推理和滚动缓冲，不重写模型算法。
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  python -m coexecution.libero.service \
+  --checkpoint "$LOCAL_PIR2_SPATIAL_CHECKPOINT" --variant pir2 --role action \
+  --port 19180 --device cuda:0 --vlm-port 19182 --vlm-device cuda:0 \
+  --feature-transport numpy_bf16 --inference-precision bf16 \
+  --runtime-receipt --output .local/dynamic-pir2-model
+
+python -m coexecution.libero_dynamic evaluate-pir2 \
+  --upstream third_party/libero_dynamic \
+  --output .local/dynamic-pir2-spatial-v003 \
+  --suite libero_spatial --task-ids 0 3 --levels l1 --traj-indices 0 \
+  --speed-mps 0.03 --action-port 19180 --vision-port 19182 \
+  --expected-checkpoint "$LOCAL_PIR2_SPATIAL_CHECKPOINT" --precision bf16 \
+  --bootstrap-latency-seconds 0.20 --s1-latency-seconds 0.04 \
+  --s2-latency-seconds 0.15 --recovery-latency-seconds 0.20 \
+  --max-steps 600
+```
+
+上述四个延迟是显式的 **counterfactual 算法控制参数**，示例值不是硬件实测。S1、S2 在逻辑时间上有独立服务通道，真实 CUDA 请求与仿真在宿主控制线程依次执行；模型结果在所声明的逻辑完成时刻才发布。结果标记 `counterfactual_discrete_event`、`independent_stage_service` 和 `serialized_gpu_simulation`，实际 RPC/server wall 时间另存，不能据此宣称同卡并发部署延迟。
+
+初始化沿用同一任务、轨迹、速度、seed0/init0 和40个真实 pre-policy 步。默认每场景预热8轮；responsive 调度逐轮覆盖 d=1..5，`--fixed-delay d` 只预热该 d。每次预热执行真实 bootstrap→S2→S1，世界时间保持不变，记录均标为 warmup。`--warmup-requests 0` 可用于明确不预热的诊断。正式开始时重新 bootstrap/reset seed；启动的真实 VLM1/DiT4 对应 `bootstrap-latency-seconds`，只冻结机器人并推进移动世界，随后强制读取新状态。bootstrap 图像保留原 capture，不能将它改写为启动等待后的新时间。
+
+之后每50ms执行一个真实动作，物体持续运动；S1/S2 等待与这些物理步重叠，不再额外增加 hold。S1 使用已发布的 S2 特征和当前状态，正常1NFE，全 H40 缓冲失效时恢复5NFE；恢复使用独立的 `recovery-latency-seconds`。每次先承诺 `[r,r+d)` 前缀，输出只属于原始 `[r+d,r+2d)`；过期动作原位丢弃，已承诺动作受保护，队列耗尽执行零位移并保持夹爪的 fallback，仍推进真实物理。
+
+S2 只有一个在途请求和一个可覆盖的 waiting frame。恰好在控制边界完成时，先发布缓存，再提供该边界的新图像并开始下次请求；例如150ms S2 在50ms控制周期下取 tick0、3、6。中途完成只能取之前已发布的历史帧，不能看宿主已计算但逻辑上尚未到达的下一帧。结束边界不会再启动新请求，未完成结果保留为 unapplied。
+
+`physical.py` 共享默认 Flow 与 πR² 的物理初始化、动作、等待和录像采样。默认 Flow 仍使用上游 `run()` 的 fixture 回调补偿；πR² 自有循环使用实际物理时间原点，显式禁用该旧补偿。视频默认60fps，包含 startup hold 和动作期间的真实子步画面；双相机与腕部各保存 MP4。`video_samples` 保存每帧物理采样时间、动作步与阶段，控制图像采样仍为20Hz。
+
+输出包括批次 `evaluation.json`、`manifest.jsonl`、`evaluation-summary.json`，以及逐场景 manifest、完整 streaming 请求/动作/缓存血缘、真实 RPC 审计、物体位姿、源物理诊断、视频映射和原始录像。每个成功返回的动作步必须推进50ms，完整物理时长必须等于 startup hold 加实际动作数×50ms。异常保留已完成请求和动作、在途状态、实际部分物理时间与录像，并在同一线程关闭两条 RPC、摄像机和环境。前端导入与真实闭环效果需按对应实验另行验收。
+
+异常回合的 `steps` 按实际完成的50ms物理动作计数，`controller_recorded_steps` 单列核心成功接收的动作记录数，便于识别物理已完成而后处理失败的情况。每个 `video_samples` 条目保留采样时间和双路 `streams` 写入状态；某一路编码失败时，另一侧已写帧的索引和时间映射仍保留。批次中断会先登记该回合的条件身份与失败产物，再传播原中断。
