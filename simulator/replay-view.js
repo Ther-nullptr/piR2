@@ -1,6 +1,15 @@
 /* Browser presentation over explicit evidence; the pure model owns time semantics. */
 "use strict";
 (() => {
+  if (new URLSearchParams(location.search).get("view") === "dynamic") {
+    window.DynamicReplayView.initialize();
+    return;
+  }
+  document.getElementById("mode-dynamic").addEventListener("click", () => {
+    const url = new URL(location.href);
+    url.searchParams.set("view", "dynamic");
+    location.href = url;
+  });
   const R = window.QuantReplay,
     Q = window.MeasuredReplay,
     $ = (id) => document.getElementById(id);
