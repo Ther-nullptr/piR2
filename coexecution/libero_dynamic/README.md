@@ -66,6 +66,16 @@ python -m coexecution.libero_dynamic evaluate \
 
 `evaluation-summary.json` 给出成功数、时序规则和校准身份；各场景的 `policy_audits` 保存完整模型输出、执行前缀、服务阶段、动作块与物体位姿。只读 `observation_registry` 补全源目标、coupled objects、passengers、场景自由物体、fixture 根和关节，位姿记录包含 qvel 与全部已知关节状态；加入观测集合不会增加驱动目标或冻结对象。上游 step trace 保留逐动作队列和任务状态。`video_samples` 将每帧映射到仿真时间及推理等待/动作阶段。视频为物理场景相机画面，GR00T 实际输入另经官方图像转换；视频60fps与控制20Hz分别记录。
 
+## 执行前缀与量化配对
+
+`--chunk-steps 8`、`2`、`1` 选择每轮实际执行的前缀。三者都重新读取观测，执行完整 VLM + Flow4，再从原生16步输出中取前 K 步；改变 K 不会缩短预测长度或减少去噪次数。同步时序为 `观测 → 推理等待τ → K个50ms动作 → 下一次观测`，等待与动作期间物体都继续运动。
+
+完整周期的平均动作频率为 `K / (τ + 0.05K)`。因此缩短前缀既增加重新观察次数，也增加单位动作数对应的等待总量。报告任务成功、动作数、物理完成时间和等待总时长，才能区分这两种影响；600动作预算下，不同K的物理时长可能不同。
+
+隔离前缀的影响时，固定场景、初态、模型和 `--latency-seconds`，只改变 `--chunk-steps`，每次写入新输出目录。采用旧K8实测值作为K2/K1的固定等待时，结果仍属于反事实时间控制。测量各K的实际部署差异则分别使用 `--calibrate`，校准身份包含执行前缀。
+
+量化配对再增加精度这一维：同一已有checkpoint分别启动BF16和W8A8服务，评测端的 `--precision` 与服务一致。固定相同等待比较动作数值变化；采用各自校准等待比较精度与速度的联合效果。前端用K、精度与等待来源标识配置，两路视频按物理时间同步。
+
 ## 默认 GR00T 策略适配器
 
 `GrootChunkPolicy` 使用本项目的 `synchronous_plan` 服务入口，执行完整新鲜 VLM 和四次 DiT，再取默认8步前缀。图像和状态转换复用 NVIDIA 官方封装；模型输出完整长度单独保留，夹爪0/1约定只在送入原生LIBERO前转换一次。接口与宿主合同测试已实现，真实动态模型闭环结果单独报告。
@@ -108,6 +118,8 @@ python -m coexecution.libero_dynamic evaluate-pir2 \
 ```
 
 上述四个延迟是显式的 **counterfactual 算法控制参数**，示例值不是硬件实测。S1、S2 在逻辑时间上有独立服务通道，真实 CUDA 请求与仿真在宿主控制线程依次执行；模型结果在所声明的逻辑完成时刻才发布。结果标记 `counterfactual_discrete_event`、`independent_stage_service` 和 `serialized_gpu_simulation`，实际 RPC/server wall 时间另存，不能据此宣称同卡并发部署延迟。
+
+πR² 的量化对照仍加载同一已有πR² checkpoint。paired服务设置 `--inference-precision w8a8 --quantization-scope all`，评测设置 `--precision w8a8`，并使用独立输出目录。先保持BF16/W8A8的四个阶段延迟、承诺策略、场景和初态一致，比较量化后的动态控制质量；阶段速度收益需要分别校准，不能沿用默认Flow4的整轮延迟。RPC身份中的 `inference_optimization.coverage` 记录实际转换的VLM和动作侧模块。πR²可以使用分DiT CUDA Graph；整段 `--action-cuda-graph` 和 `--group-conditioning` 属于Flow路径，服务会拒绝将它们用于πR²。
 
 初始化沿用同一任务、轨迹、速度、seed0/init0 和40个真实 pre-policy 步。默认每场景预热8轮；responsive 调度逐轮覆盖 d=1..5，`--fixed-delay d` 只预热该 d。每次预热执行真实 bootstrap→S2→S1，世界时间保持不变，记录均标为 warmup。`--warmup-requests 0` 可用于明确不预热的诊断。正式开始时重新 bootstrap/reset seed；启动的真实 VLM1/DiT4 对应 `bootstrap-latency-seconds`，只冻结机器人并推进移动世界，随后强制读取新状态。bootstrap 图像保留原 capture，不能将它改写为启动等待后的新时间。
 
