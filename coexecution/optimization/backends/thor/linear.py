@@ -31,7 +31,14 @@ class FloatingLinear(torch.nn.Module):
     """Explicit E4M3 or block-scaled E2M1 GEMM, with independent packed formats."""
 
     def __init__(
-        self, linear, name, precision="fp8", *, fast_fp8=False, fp4_swap_ab=False
+        self,
+        linear,
+        name,
+        precision="fp8",
+        *,
+        fast_fp8=False,
+        fp4_swap_ab=False,
+        smoothing_scale=None,
     ):
         super().__init__()
         if precision not in ("fp8", "fp4"):
@@ -53,6 +60,22 @@ class FloatingLinear(torch.nn.Module):
         self.fp4_swap_ab = fp4_swap_ab
         self.in_features = linear.in_features
         self.out_features = linear.out_features
+        weight_input = linear.weight.detach().contiguous()
+        if smoothing_scale is not None:
+            from coexecution.optimization.backends.thor.packing import (
+                _check_smoothing_metadata,
+            )
+
+            _check_smoothing_metadata(smoothing_scale, weight_input)
+            if (
+                not torch.isfinite(smoothing_scale).all()
+                or not (smoothing_scale > 0).all()
+            ):
+                raise ValueError("SmoothQuant scales must be finite and positive")
+            weight_input = (weight_input.float() * smoothing_scale).to(torch.bfloat16)
+            if not torch.isfinite(weight_input).all():
+                raise ValueError("SmoothQuant overflowed BF16 weights")
+        self.register_buffer("smoothing_scale", smoothing_scale)
         if precision == "fp8":
             from coexecution.kernels.blackwell.fp8_linear import require_fp8_backend
 
@@ -71,9 +94,7 @@ class FloatingLinear(torch.nn.Module):
                     "FP4 Swap-AB requires the owned FP4 backend; rebuild it"
                 )
             pack = self.ops.pack_linear_weight_gemm_bf16
-        weight, scale, metadata = pack(
-            linear.weight.detach().contiguous(), "pir2", name
-        )
+        weight, scale, metadata = pack(weight_input, "pir2", name)
         self.register_buffer("packed_weight", weight)
         self.register_buffer("weight_scale", scale)
         self.register_buffer("metadata", metadata)
@@ -88,6 +109,7 @@ class FloatingLinear(torch.nn.Module):
                 value.precision != self.precision
                 or value.shape[-1] != self.in_features
                 or value.data.device != self.packed_weight.device
+                or value.smoothing_scale is not self.smoothing_scale
             ):
                 raise ValueError("Floating packed input does not match its consumer")
             return value.data, value.scale
@@ -103,6 +125,11 @@ class FloatingLinear(torch.nn.Module):
                 "Floating quantization requires nonempty CUDA BF16 inference activations"
             )
         matrix = value.reshape(-1, self.in_features).contiguous()
+        if self.smoothing_scale is not None:
+            from coexecution.optimization.backends.thor.packing import prepare_smoothed
+
+            packed = prepare_smoothed(matrix, self.precision, self.smoothing_scale)
+            return packed.data, packed.scale
         if self.precision == "fp8" and self.fast_fp8:
             from coexecution.optimization.backends.thor.packing import prepare_fp8
 
@@ -173,6 +200,8 @@ class FloatingInputGroup:
     """
 
     def __init__(self, linears):
+        if any(q.smoothing_scale is not linears[0].smoothing_scale for q in linears):
+            raise ValueError("Shared packing requires identical SmoothQuant scales")
         self.linears = linears
         self.active = False
         self.cache = None
@@ -209,7 +238,15 @@ class FloatingProjectionGroup:
     """
 
     def __init__(
-        self, modules, name, precision, fast_fp8, contiguous=False, *, fp4_swap_ab=False
+        self,
+        modules,
+        name,
+        precision,
+        fast_fp8,
+        contiguous=False,
+        *,
+        fp4_swap_ab=False,
+        smoothing_scale=None,
     ):
         self.sizes = [m.out_features for m in modules]
         merged = torch.nn.Linear(
@@ -235,7 +272,12 @@ class FloatingProjectionGroup:
                 requires_grad=False,
             )
         self.linear = FloatingLinear(
-            merged, name, precision, fast_fp8=fast_fp8, fp4_swap_ab=fp4_swap_ab
+            merged,
+            name,
+            precision,
+            fast_fp8=fast_fp8,
+            fp4_swap_ab=fp4_swap_ab,
+            smoothing_scale=smoothing_scale,
         )
         self.contiguous = contiguous
         self.active, self.cache = False, None

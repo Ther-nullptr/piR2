@@ -45,6 +45,39 @@ def test_fp4_swap_ab_is_opt_in_and_precision_specific():
 
 
 @pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_smoothquant_profile_is_explicit_floating_only(precision):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            ["--inference-precision", precision, "--fp-smoothquant", "calibrated.pt"]
+        )
+    )
+    assert config.fp_smoothquant == Path("calibrated.pt")
+    assert OptimizationConfig().fp_smoothquant is None
+    for other in ("bf16", "w8a8", "w4a4"):
+        with pytest.raises(ValueError, match="SmoothQuant profile requires"):
+            OptimizationConfig(precision=other, fp_smoothquant=Path("calibrated.pt"))
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+@pytest.mark.parametrize("flag", ["fp_gelu", "fp_rmsnorm"])
+def test_floating_producers_are_explicit_and_precision_specific(precision, flag):
+    parser = argparse.ArgumentParser()
+    add_optimization_arguments(parser)
+    config = optimization_config(
+        parser.parse_args(
+            ["--inference-precision", precision, "--" + flag.replace("_", "-")]
+        )
+    )
+    assert getattr(config, flag)
+    assert not getattr(OptimizationConfig(), flag)
+    for other in ("bf16", "w8a8", "w4a4"):
+        with pytest.raises(ValueError, match="Floating producers require"):
+            OptimizationConfig(precision=other, **{flag: True})
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
 def test_floating_precision_is_opt_in_and_accepts_serial_graph(precision):
     parser = argparse.ArgumentParser()
     add_optimization_arguments(parser)

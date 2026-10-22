@@ -13,6 +13,7 @@ class FloatingConnections:
     def __init__(self, policy, controller, *, residual=False):
         self.saved = []
         self.norms, self.blocks = [], []
+        norm_scales, block_scales = {}, {}
         precision = controller.precision
         selected = {id(module) for module, _, _ in controller.sites.values()}
         for block in policy.model.action_head.model.transformer_blocks:
@@ -29,12 +30,14 @@ class FloatingConnections:
                         "Floating norm fusion requires no position embeddings"
                     )
                 self.norms.append(block.norm1)
+                norm_scales[id(block.norm1)] = block.attn1.to_q
             if residual and id(block.ff.net[0].proj) in selected:
                 if block.pos_embed is not None:
                     raise ValueError(
                         "Floating residual fusion requires no position embeddings"
                     )
                 self.blocks.append(block)
+                block_scales[id(block)] = block.ff.net[0].proj
         if not self.norms or (residual and not self.blocks):
             raise ValueError(
                 "Floating norm fusion selected no compatible DiT projections"
@@ -42,13 +45,26 @@ class FloatingConnections:
         for norm in [*(m.norm for m in self.norms), *(b.norm3 for b in self.blocks)]:
             if not isinstance(norm, torch.nn.LayerNorm) or norm.elementwise_affine:
                 raise ValueError("Floating norm fusion requires non-affine LayerNorm")
+        norm_scales = {
+            key: controller.input_smoothing(value) for key, value in norm_scales.items()
+        }
+        block_scales = {
+            key: controller.input_smoothing(value)
+            for key, value in block_scales.items()
+        }
         try:
             for norm in self.norms:
+                smooth = norm_scales[id(norm)]
 
-                def forward(x, temb=None, norm=norm):
+                def forward(x, temb=None, norm=norm, smooth=smooth):
                     scale, shift = norm.linear(norm.silu(temb)).chunk(2, dim=-1)
                     packed, _ = prepare_norm(
-                        x, precision, eps=norm.norm.eps, scale=scale, shift=shift
+                        x,
+                        precision,
+                        eps=norm.norm.eps,
+                        scale=scale,
+                        shift=shift,
+                        smoothing_scale=smooth,
                     )
                     return packed
 
@@ -57,6 +73,7 @@ class FloatingConnections:
                 from gr00t.model.modules.dit import _sdpa_context
 
                 for block in self.blocks:
+                    smooth = block_scales[id(block)]
 
                     def forward(
                         hidden_states,
@@ -65,6 +82,7 @@ class FloatingConnections:
                         encoder_attention_mask=None,
                         temb=None,
                         block=block,
+                        smooth=smooth,
                     ):
                         x = hidden_states
                         normalized = (
@@ -87,6 +105,7 @@ class FloatingConnections:
                             precision,
                             eps=block.norm3.eps,
                             residual=attention.contiguous(),
+                            smoothing_scale=smooth,
                         )
                         return summed + block.ff(packed)
 
