@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .catalog import LEVELS, SPEEDS_MPS, SUITES, build_inventory
+from .world import NativeFixtureTiming, observation_registry, observe_objects
 
 TIMING_RULES = ("release_continuous_sync", "paper_quantized_sync")
 OBSERVATION_KEYS = (
@@ -660,22 +661,30 @@ def make_episode_type(source, options, session):
             self.active_chunk_id = None
             self.video_samples = []
             self.next_video_sample_s = 1.0 / options.video_fps
+            self.fixture_timing = None
+            self.latency_backend = (
+                "source_preview_exact_hold" if self.use_preview else None
+            )
+            self.observed_objects = []
+            self._source_action_callback_offset_s = 0.0
+
+        def _motion_phase_s(self):
+            if self.fixture_timing is not None:
+                return float(self.env.dynamic_fixture_body_state["elapsed"])
+            return float(self.preview_elapsed)
 
         def _motion_event(self, kind, **fields):
             if self.env is None:
                 return
-            targets = runtime._target_entries(self.item, self.env)
-            poses = {}
-            for target in targets:
-                name = target.get("target_object_name") or target.get("object_name")
-                if name:
-                    poses[str(name)] = runtime._object_pose(self.env, str(name), target)
+            poses = observe_objects(
+                self.env, self.observed_objects, runtime._object_pose
+            )
             self.motion_events.append(
                 {
                     "kind": kind,
                     "wall_s": time.monotonic(),
                     "rollout_sim_time_s": self.rollout_sim_time_s,
-                    "motion_phase_s": float(self.preview_elapsed),
+                    "motion_phase_s": self._motion_phase_s(),
                     "physics_sim_time_s": float(self.env.sim.data.time),
                     "target_object_poses": poses,
                     "action_step": self.action_step,
@@ -687,10 +696,17 @@ def make_episode_type(source, options, session):
         def _setup_world(self, env, init_state):
             self.env = env
             result = super()._setup_world(env, init_state)
-            if not self.use_preview or result[3] != 40:
-                raise ValueError(
-                    "Require reviewed physical carriers and 40 actual moving setup steps"
-                )
+            if result[3] != 40:
+                raise ValueError("Require 40 actual source pre-policy control steps")
+            if not self.use_preview:
+                # Preserve source-native fixture initialization and env.step.
+                # Its pending-latency path is extracted below, never forced into
+                # the carrier-only preview setup.
+                self.fixture_timing = NativeFixtureTiming(env)
+                self.latency_backend = self.fixture_timing.backend
+            self.observed_objects = observation_registry(
+                self.item, env, runtime._target_entries(self.item, env)
+            )
             self.initial_observation = result[0]
             # _step_env timestamps the actual returned observation. The fallback
             # is only for an alternative source setup returning its own capture.
@@ -701,14 +717,29 @@ def make_episode_type(source, options, session):
 
         def _step_env(self, env, action, **kwargs):
             started = time.monotonic()
+            physics_started = float(env.sim.data.time)
             if self.control_started:
+                callback = kwargs.get("on_substep")
+                offset = self._source_action_callback_offset_s
+                self._source_action_callback_offset_s = 0.0
+                if callback is not None and offset:
+                    # Native run() expects hold physics inside this action and
+                    # subtracts tau from its video base. Hold has already run,
+                    # so correct only its callback, not our physical frame map.
+                    kwargs = {**kwargs, "on_substep": lambda dt: callback(dt + offset)}
                 kwargs = self._recording_kwargs(kwargs, "action")
             result = super()._step_env(env, action, **kwargs)
             self.last_capture_s = time.monotonic()
             if self.control_started:
-                self.rollout_sim_time_s += self.preview_dt
+                advanced = float(env.sim.data.time) - physics_started
+                if not math.isclose(advanced, self.preview_dt, rel_tol=0, abs_tol=1e-8):
+                    raise RuntimeError(
+                        "Action physics duration differs from one control step"
+                    )
+                self.rollout_sim_time_s += advanced
                 self._motion_event(
                     "action_completed",
+                    physics_elapsed_s=advanced,
                     action=np.asarray(action).copy(),
                     wall_started_s=started,
                     capture_s=self.last_capture_s,
@@ -718,9 +749,12 @@ def make_episode_type(source, options, session):
 
         def _apply_sync_latency(self, env, duration, **kwargs):
             self._motion_event("hold_started", applied_latency_s=float(duration))
-            advanced = super()._apply_sync_latency(
-                env, duration, **self._recording_kwargs(kwargs, "inference_hold")
-            )
+            recording = self._recording_kwargs(kwargs, "inference_hold")
+            if self.fixture_timing is not None:
+                advanced = self.fixture_timing.advance(duration, **recording)
+                self._source_action_callback_offset_s += float(advanced)
+            else:
+                advanced = super()._apply_sync_latency(env, duration, **recording)
             self.rollout_sim_time_s += float(advanced)
             self._motion_event("hold_completed", applied_latency_s=float(advanced))
             return advanced
@@ -819,7 +853,7 @@ def make_episode_type(source, options, session):
                     "source_tick": 0,
                     "source_tick_kind": "action_step",
                     "rollout_sim_time_s": 0.0,
-                    "motion_phase_s": float(self.preview_elapsed),
+                    "motion_phase_s": self._motion_phase_s(),
                     "pre_policy_dynamic_steps": 40,
                     "request_contract": {
                         "chunk_steps": policy.chunk_steps,
@@ -961,6 +995,14 @@ def make_episode_type(source, options, session):
                         "records": self.policy.records,
                         "chunks": self.chunk_events,
                         "motion_events": self.motion_events,
+                        "observation_registry": self.observed_objects,
+                        "latency_backend": self.latency_backend,
+                        "fixture_timing": None
+                        if self.fixture_timing is None
+                        else self.fixture_timing.records,
+                        "fixture_driver": None
+                        if self.fixture_timing is None
+                        else self.fixture_timing.driver_evidence,
                         "video_samples": self.video_samples,
                         "cleanup_errors": self.cleanup_errors,
                         "clocks": {
@@ -1008,7 +1050,16 @@ def make_episode_type(source, options, session):
                         for record in self.policy.records
                         if record.get("phase") == "scored"
                     ),
-                    "world_contract": "Physical carriers move throughout controls and joint-held inference latency. "
+                    "latency_backend": self.latency_backend,
+                    "fixture_driver": None
+                    if self.fixture_timing is None
+                    else self.fixture_timing.driver_evidence,
+                    "world_contract": (
+                        "Physical carriers move throughout controls and robot-held inference latency. "
+                        if self.use_preview
+                        else "Source-native fixture body controls; owned exact-duration robot-held latency, "
+                        "with final 10 ms fixture update block shortened to the actual remainder. "
+                    )
                     + (
                         "Latency uses exact calibrated seconds."
                         if options.timing_rule == TIMING_RULES[0]
