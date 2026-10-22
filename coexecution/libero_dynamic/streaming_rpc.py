@@ -90,9 +90,14 @@ class Pir2RPC:
 
     def prepare(self):
         """Validate identities without executing a model or changing model RNG."""
+        self._ensure_prepared()
+        return deepcopy(self.identities)
+
+    def _ensure_prepared(self):
+        """Validate once; retain ownership checks without exporting metadata."""
         self._thread()
         if self.identities is not None:
-            return deepcopy(self.identities)
+            return
         identities = {}
         for role, options in self._options.items():
             if role not in self._clients:
@@ -136,10 +141,9 @@ class Pir2RPC:
         if self._clients["action"] is self._clients["vlm"]:
             raise ValueError("S1 and S2 require independent client connections")
         self.identities = identities
-        return deepcopy(identities)
 
     def _call(self, role, endpoint, payload):
-        self.prepare()
+        self._ensure_prepared()
         record = {
             "endpoint": endpoint,
             "role": role,
@@ -173,7 +177,7 @@ class Pir2RPC:
             raise ValueError("Bootstrap delay must be 1..5")
         if type(seed) is not int or seed < 0:
             raise ValueError("Bootstrap seed must be a nonnegative integer")
-        self.prepare()
+        self._ensure_prepared()
         # Reset S2 first: a split server may reseed its RNG. S1 bootstrap then
         # resets its own seed and streaming state, so its first action is stable.
         self._clients["vlm"].call_endpoint("reset", {"options": {"seed": seed}})
