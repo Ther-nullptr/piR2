@@ -1,0 +1,28 @@
+# Simulation environment only. Install a host-compatible CUDA PyTorch build first.
+numpy==1.22.4
+mujoco==2.3.7
+robosuite==1.4.0
+bddl==1.0.1
+gym==0.25.2
+gymnasium==1.2.0
+PyYAML==6.0.3
+easydict==1.9
+opencv-python==4.6.0.66
+numba==0.59.1
+scipy==1.10.1
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+websockets>=13.1,<14
+msgpack-numpy==0.4.8
+h5py==3.11.0
+pyzmq==27.2.0
+msgpack==1.2.3
+av==17.1.0
+Pillow==12.3.0
+cloudpickle==2.1.0
+future==0.18.2
+matplotlib==3.5.3
+termcolor==2.4.0
+pydantic==2.12.3
+# The upstream RPC package eagerly imports its policy interface; no model loads.
+transformers==4.57.3

@@ -47,6 +47,10 @@ flowchart LR
 
 测量分层对应不同结论：固定输入回放解释模型开销，闭环轨迹解释调度和动作时效，任务评测衡量控制质量。成功率与时序指标按 checkpoint、协议、初始条件和硬件配置配对报告；具体精度和平台的可用接口见[能力表](docs/platform-handoff.md#precision-support)。
 
+## 移动目标研究
+
+[LIBERO-Dynamic 接入](coexecution/libero_dynamic/README.md)面向移动目标下的速度与任务质量：已固定完整评测清单和默认GR00T策略接口，后续接入量化与πR²动态闭环；本阶段使用现成权重，不采用论文微调方法。
+
 <a id="start--开始"></a>
 
 ## 开始使用

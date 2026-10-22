@@ -198,3 +198,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/train_groot_spatial.py \
 历史固定拓扑入口 `scripts/run_libero_protocols.py --step 500` 保留 GPU0 action、GPU2 VLM、GPU3 rendering 的四条件顺序评测，每条件 10 任务 × 20 episodes。新实验优先使用可声明资源的 plan。`run_libero_protocol_pipeline.py` 保留阶段续训管理，要求已有 `protocol-v4-integration` 和 `check_libero_timing_gpu.py` 检查记录；`--adopt-step500-client` 用于停止旧 supervisor 后转接已知 client。同一输出只运行一个 supervisor，续训保留 step500 归档。
 
 环境、数据、权重和实验结果留在本地；源码检查与贡献流程见 [CONTRIBUTING.md](../CONTRIBUTING.md)。SO100 演示与 Leap 重建另有[辅助实验说明](../README.md#算法来源与辅助实验)。
+
+## 移动目标扩展
+
+[LIBERO-Dynamic](../coexecution/libero_dynamic/README.md)固定第二套仿真协议的源码与1800个动态条件，重点研究目标运动下的推理速度与任务成功率。静态LIBERO现有入口保持不变；新模块明确记录接入与验证阶段，默认使用现成VLA权重，不采用论文微调流程。
