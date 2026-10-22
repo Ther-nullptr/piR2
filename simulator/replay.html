@@ -37,12 +37,6 @@
         ><span>视频播放与模型组件时间线使用不同证据</span>
       </nav>
       <section class="control-band" aria-label="实验选择">
-        <label
-          >证据视图<select id="evidence-mode">
-            <option value="model">独立模型回放</option>
-            <option value="deployment">机器人闭环对照</option>
-          </select></label
-        >
         <label id="record-label"
           >记录类型<select id="record-type">
             <option value="clean">Clean · 耗时与动作</option>
@@ -52,6 +46,18 @@
         <label id="scope-label">测量边界<select id="scope"></select></label>
         <label id="execution-clock-label"
           >执行时钟<select id="execution-clock"></select
+        ></label>
+        <label id="execution-coupling-label"
+          >动作与推理<select id="execution-coupling"></select
+        ></label>
+        <label id="controller-policy-label"
+          >控制策略<select id="controller-policy"></select
+        ></label>
+        <label id="execution-prefix-label"
+          >执行前缀 K<select id="execution-prefix-steps"></select
+        ></label>
+        <label id="async-overlap-label"
+          >提前步数 D<select id="async-overlap-steps"></select
         ></label>
         <label
           ><span id="sample-label">输入 / 随机种子</span
@@ -120,7 +126,7 @@
         </div>
         <div class="section-heading">
           <div>
-            <h2>VLM / DiT · 运行时间线</h2>
+            <h2>VLM / DiT / 动作执行 · 运行时间线</h2>
             <p id="timeline-note">
               任务块按真实起止时间移动；S1[xx].k 使用 S2-xx 的特征。
             </p>
@@ -130,7 +136,9 @@
               >模块<select id="stage">
                 <option value="all">全部模块</option>
                 <option value="vlm">VLM / S2</option>
-                <option value="action">Action / S1</option>
+                <option value="action">DiT / S1</option>
+                <option value="phase">Inference / Execution phases</option>
+                <option value="control">动作执行 / Control</option>
               </select></label
             ><label
               >内核类别<select id="category">

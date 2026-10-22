@@ -163,3 +163,66 @@ def test_strict_task_loading_restores_loader_and_cuda_context(
     assert (tmp_path / "weight-loading.json").read_text() == service.json.dumps(
         info, indent=2
     ) + "\n"
+
+
+@pytest.mark.parametrize("location", ["root", "processor"])
+def test_checkpoint_decoded_horizon_reads_actual_processor_without_loading(
+    tmp_path, location
+):
+    import json
+
+    from coexecution.libero.loading import checkpoint_decoded_horizon
+
+    target = tmp_path if location == "root" else tmp_path / "processor"
+    target.mkdir(exist_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps({"action_horizon": 40}))
+    (target / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_kwargs": {
+                    "modality_configs": {
+                        "libero_sim": {"action": {"delta_indices": list(range(24))}},
+                        "other_robot": {"action": {"delta_indices": list(range(40))}},
+                    }
+                }
+            }
+        )
+    )
+    assert checkpoint_decoded_horizon(tmp_path) == 24
+    if location == "processor":
+        (tmp_path / "processor_config.json").write_text(
+            json.dumps(
+                {
+                    "processor_kwargs": {
+                        "modality_configs": {
+                            "libero_sim": {"action": {"delta_indices": list(range(12))}}
+                        }
+                    }
+                }
+            )
+        )
+        assert checkpoint_decoded_horizon(tmp_path) == 12
+        (tmp_path / "processor_config.json").write_text("invalid")
+        with pytest.raises(ValueError, match="decoded action horizon"):
+            checkpoint_decoded_horizon(tmp_path)
+
+
+@pytest.mark.parametrize("indices", [[], None, [True], [0, "1"], "0123"])
+def test_checkpoint_decoded_horizon_rejects_malformed_native_actions(tmp_path, indices):
+    import json
+
+    from coexecution.libero.loading import checkpoint_decoded_horizon
+
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_kwargs": {
+                    "modality_configs": {
+                        "libero_sim": {"action": {"delta_indices": indices}}
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="delta_indices"):
+        checkpoint_decoded_horizon(tmp_path)

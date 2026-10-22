@@ -19,6 +19,13 @@ def main(argv=None):
         help="Explicit robot playback default; must exist in recorded evidence",
     )
     build.add_argument(
+        "--default-execution-coupling",
+        choices=("asynchronous", "synchronous", "one_step_async", "chunked_async"),
+        help="Explicit robot coupling default; must exist with the selected clock",
+    )
+    build.add_argument("--default-execution-prefix-steps", type=int)
+    build.add_argument("--default-async-overlap-steps", type=int)
+    build.add_argument(
         "--clock-cohort",
         help="Operator-declared audited common device/clock cohort; omitted disables paired comparison claims",
     )
@@ -62,6 +69,9 @@ def main(argv=None):
         output=args.output,
         clock_cohort=args.clock_cohort,
         default_execution_clock=args.default_execution_clock,
+        default_execution_coupling=args.default_execution_coupling,
+        default_execution_prefix_steps=args.default_execution_prefix_steps,
+        default_async_overlap_steps=args.default_async_overlap_steps,
     )
     print(f"Built {len(catalog['runs'])} replay runs at {args.output / 'catalog.json'}")
 

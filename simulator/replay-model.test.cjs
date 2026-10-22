@@ -17,6 +17,117 @@ const clean = {
   instrumented: false,
   output: { status: "recorded" },
 };
+
+test("control intervals separate measured execution from pacing and physical time", () => {
+  const episode = {
+    id: "e",
+    controlled_start_s: 100,
+    controlled_end_s: 100.1,
+    metadata: { control_steps: 2 },
+    ticks: [
+      {
+        id: "t0",
+        tick: 0,
+        applied_s: 100.002,
+        next_observation_computed_s: 100.026,
+        physics_step_seconds: 0.05,
+      },
+      {
+        id: "t1",
+        tick: 1,
+        applied_s: 100.051,
+        next_observation_computed_s: 100.074,
+        physics_step_seconds: 0.05,
+      },
+    ],
+  };
+  const spans = R.controlIntervals(episode);
+  assert.deepEqual(
+    spans.map((p) => p.kind),
+    ["gap", "execution", "gap", "execution", "gap"],
+  );
+  const execute = spans.filter((p) => p.kind === "execution");
+  assert.ok(Math.abs(execute[0].end_s - execute[0].start_s - 0.024) < 1e-10);
+  assert.equal(execute[0].tick.physics_step_seconds, 0.05);
+  assert.ok(Math.abs(spans[2].end_s - spans[2].start_s - 0.025) < 1e-10);
+  assert.ok(Math.abs(spans.at(-1).end_s - 0.1) < 1e-10);
+  const late = structuredClone(episode);
+  late.ticks[0].next_observation_computed_s = 100.06;
+  late.ticks[1].applied_s = 100.062;
+  const delayed = R.controlIntervals(late);
+  assert.ok(delayed.find((p) => p.kind === "execution").end_s > 0.05);
+  assert.ok(Math.abs(delayed[2].end_s - delayed[2].start_s - 0.002) < 1e-10);
+});
+
+test("missing control completion or omitted ticks never turn into invented execution or waiting", () => {
+  const episode = {
+    id: "e",
+    controlled_start_s: 100,
+    controlled_end_s: 100.2,
+    metadata: { control_steps: 4 },
+    ticks: [
+      { id: "t0", tick: 0, applied_s: 100.002 },
+      {
+        id: "t2",
+        tick: 2,
+        applied_s: 100.1,
+        next_observation_computed_s: 100.12,
+      },
+    ],
+  };
+  const spans = R.controlIntervals(episode);
+  assert.deepEqual(
+    spans.map((p) => p.kind),
+    ["gap", "execution", "execution"],
+  );
+  assert.equal(spans[1].end_s, null);
+  assert.equal(spans[2].tick.physics_step_seconds, undefined);
+  assert.deepEqual(
+    R.controlIntervals({ ...episode, controlled_start_s: null }),
+    [],
+  );
+});
+test("policy identity uses worker metadata, never filenames or scheduling labels", () => {
+  assert.equal(R.policyVariant({ label: "pir2 checkpoint-10000" }), null);
+  assert.equal(R.policyVariant({ configuration: { variant: "pir2" } }), null);
+  const run = {
+    kind: "deployment",
+    policy_variant: "pir2",
+    policy_identity: {
+      variant: "pir2",
+      predicted_horizon: 40,
+      decoded_horizon: 40,
+      training: { global_step: 10000 },
+    },
+  };
+  assert.equal(R.policyVariant(run), "pir2");
+  assert.match(R.policyLabel(run), /πR².*10000/);
+  assert.match(R.policyNote(run), /独立.*S2/);
+  assert.doesNotMatch(R.policyNote(run), /Flow4|解码16/);
+  assert.equal(R.policyVariant({ ...run, policy_variant: "flow" }), "invalid");
+  assert.equal(
+    R.policyVariant({ ...run, configuration: { variant: "flow" } }),
+    "invalid",
+  );
+});
+test("legacy and current stream projections cannot change the resolved policy cohort", () => {
+  const descriptor = { id: "test", kind: "deployment", precision: "bf16" };
+  const pir2 = { ...descriptor, policy_variant: "pir2" };
+  const flow = { ...descriptor, policy_variant: "flow" };
+  assert.equal(R.matchesDescriptor(pir2, descriptor, null, "pir2"), true);
+  assert.equal(R.matchesDescriptor(flow, descriptor, null, "pir2"), false);
+  assert.equal(
+    R.matchesDescriptor(descriptor, descriptor, null, "pir2"),
+    false,
+  );
+  assert.equal(R.matchesDescriptor(pir2, descriptor, null, null), false);
+  assert.equal(R.matchesDescriptor(descriptor, descriptor, null, null), true);
+  assert.equal(R.matchesDescriptor(flow, pir2), false);
+  assert.equal(
+    R.matchesDescriptor(pir2, { ...descriptor, policy_variant: null }),
+    false,
+  );
+});
 test("execution cadence selects an explicit matched set and treats legacy runs as paced", () => {
   assert.equal(typeof R.deploymentCadence, "function");
   assert.equal(typeof R.replayDescriptors, "function");
@@ -353,4 +464,162 @@ test("unknown instrumentation blocks cross-run pairing even with a matching key 
     assert.equal(aligned[0].comparable, false);
     assert.equal(aligned[1].record, null);
   }
+});
+
+test("coupling filters prevent mixing synchronous and asynchronous robot evidence", () => {
+  const runs = [
+    { id: "legacy", kind: "deployment", execution_clock: "paced" },
+    {
+      id: "sync",
+      kind: "deployment",
+      execution_clock: "paced",
+      execution_coupling: "synchronous",
+    },
+    {
+      id: "ready",
+      kind: "deployment",
+      execution_clock: "ready",
+      execution_coupling: "synchronous",
+    },
+  ];
+  assert.equal(typeof R.deploymentCoupling, "function");
+  assert.equal(R.deploymentCoupling(runs[0]), "asynchronous");
+  assert.deepEqual(
+    R.replayDescriptors(runs, "deployment", "paced", "synchronous").map(
+      (r) => r.id,
+    ),
+    ["sync"],
+  );
+  assert.deepEqual(
+    R.replayDescriptors(runs, "deployment", "paced").map((r) => r.id),
+    ["legacy"],
+  );
+});
+
+test("synchronous phase and physics cursor follow recorded intervals and completed steps", () => {
+  const measured = {
+    ...episode,
+    phases: [
+      { phase: "inference", start_s: 0, end_s: 0.1 },
+      { phase: "execution", start_s: 0.1, end_s: 0.9 },
+      { phase: "inference", start_s: 0.9, end_s: 2 },
+    ],
+    ticks: episode.ticks.map((row, i) => ({
+      ...row,
+      next_observation_computed_s: i === 0 ? 100.2 : 100.8,
+      simulated_elapsed_seconds: (i + 1) * 0.05,
+    })),
+  };
+  assert.equal(typeof R.phaseAt, "function");
+  assert.equal(typeof R.physicsAt, "function");
+  assert.equal(R.phaseAt(measured, 0.05).phase, "inference");
+  assert.equal(R.phaseAt(measured, 0.1).phase, "execution");
+  assert.equal(R.phaseAt(measured, 0.95).phase, "inference");
+  assert.equal(R.phaseAt(measured, 2), null);
+  assert.equal(R.physicsAt(measured, 0.15), 0);
+  assert.equal(R.physicsAt(measured, 0.21), 0.05);
+  assert.equal(R.physicsAt(measured, 0.95), 0.1);
+  assert.equal(R.robotAt(measured, 0.95, "image").frame.frame_id, "b");
+  assert.equal(R.robotAt(measured, 1.95, "image").frame.frame_id, "b");
+});
+
+test("physics cursor distinguishes known zero before the first step from missing evidence", () => {
+  const complete = {
+    controlled_start_s: 100,
+    ticks: [
+      { next_observation_computed_s: 100.2, simulated_elapsed_seconds: 0.05 },
+      { next_observation_computed_s: 100.4, simulated_elapsed_seconds: 0.1 },
+    ],
+  };
+  assert.equal(R.physicsAt(complete, 0.1), 0);
+  assert.equal(R.physicsAt(complete, 0.3), 0.05);
+  assert.equal(R.physicsAt({ ...complete, ticks: [] }, 0.1), null);
+  assert.equal(R.physicsAt({ controlled_start_s: 100 }, 0.1), null);
+  for (const value of [undefined, null, NaN, Infinity]) {
+    for (const field of [
+      "next_observation_computed_s",
+      "simulated_elapsed_seconds",
+    ]) {
+      const incomplete = {
+        ...complete,
+        ticks: complete.ticks.map((tick, i) =>
+          i === 1 ? { ...tick, [field]: value } : tick,
+        ),
+      };
+      assert.equal(R.physicsAt(incomplete, 0.1), null);
+      assert.equal(R.physicsAt(incomplete, 0.3), null);
+    }
+  }
+});
+
+test("metric scaling preserves missing values while keeping measured zero", () => {
+  assert.equal(typeof R.scaleMetric, "function");
+  for (const value of [undefined, null, NaN, Infinity, false, "0"]) {
+    assert.equal(R.scaleMetric(value, 1000), null);
+    assert.equal(R.scaleMetric(value, 100), null);
+  }
+  assert.equal(R.scaleMetric(0, 1000), 0);
+  assert.equal(R.scaleMetric(0.025, 1000), 25);
+  assert.equal(R.scaleMetric(0.25, 100), 25);
+  assert.equal(R.scaleMetric(Number.MAX_VALUE, 1000), null);
+});
+
+test("controller policy is a bound cohort dimension across precision and SSE", () => {
+  assert.equal(typeof R.controllerPolicy, "function");
+  const descriptor = {
+    id: "b",
+    kind: "deployment",
+    precision: "bf16",
+    policy_variant: "pir2",
+    deployment_scheduling_policy: "responsive",
+  };
+  const other = {
+    ...descriptor,
+    id: "w",
+    precision: "w8a8",
+    deployment_scheduling_policy: "conservative",
+  };
+  assert.deepEqual(
+    R.replayDescriptors(
+      [descriptor, other],
+      "deployment",
+      "paced",
+      "asynchronous",
+      null,
+      "responsive",
+    ),
+    [descriptor],
+  );
+  assert.equal(
+    R.matchesDescriptor(
+      { ...descriptor },
+      descriptor,
+      null,
+      "pir2",
+      "responsive",
+    ),
+    true,
+  );
+  assert.equal(
+    R.matchesDescriptor(
+      { ...descriptor, deployment_scheduling_policy: "conservative" },
+      descriptor,
+      null,
+      "pir2",
+      "responsive",
+    ),
+    false,
+  );
+  const legacy = { id: "old", kind: "deployment", precision: "bf16" };
+  assert.equal(R.controllerPolicy(legacy), null);
+  assert.equal(
+    R.matchesDescriptor(
+      { ...legacy, deployment_scheduling_policy: "responsive" },
+      legacy,
+      null,
+      undefined,
+      null,
+    ),
+    false,
+  );
 });

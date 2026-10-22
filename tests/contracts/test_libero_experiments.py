@@ -86,6 +86,29 @@ def test_image_resolution_plan_default_override_and_explicit_disable(plan, layou
     assert all("--image-resolution" not in command for command in commands.values())
 
 
+@pytest.mark.parametrize("coupling", ["synchronous", "one_step_async", "chunked_async"])
+def test_single_policy_coupling_keeps_resolution_and_runtime_receipt(plan, coupling):
+    plan.update(
+        execution_coupling=coupling,
+        execution_clock="ready",
+        execution_prefix_steps=1,
+        image_resolution=192,
+        runtime_receipt=True,
+    )
+    if coupling == "chunked_async":
+        plan["async_overlap_steps"] = 1
+    module().validate_plan(plan)
+    commands = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/out")
+    )
+    assert set(commands) == {"action", "evaluate"}
+    action = commands["action"]
+    assert action[action.index("--image-resolution") + 1] == "192"
+    assert "--runtime-receipt" in action
+    assert "--image-resolution" not in commands["evaluate"]
+    assert "--runtime-receipt" not in commands["evaluate"]
+
+
 @pytest.mark.parametrize("size", [False, 0, -32, 128.0, "128"])
 @pytest.mark.parametrize("location", ["plan", "case"])
 def test_invalid_image_resolution_fails_before_worker_launch(plan, size, location):
@@ -641,3 +664,223 @@ def test_subset_deployment_report_reads_actual_trace_and_reports_selected_scope(
     assert "subset" in report["scope"] and "Full Spatial" not in report["scope"]
     assert len(report["conditions"][0]["episodes"]) == 1
     assert (tmp_path / "feature-usage.json").is_file()
+
+
+def test_synchronous_plan_owns_only_one_worker_and_propagates_coupling(plan):
+    plan.update(execution_coupling="synchronous", synchronous_chunk_steps=8)
+    module().validate_plan(plan)
+    commands = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/out")
+    )
+    assert set(commands) == {"action", "evaluate"}
+    evaluate = commands["evaluate"]
+    assert evaluate[evaluate.index("--execution-coupling") + 1] == "synchronous"
+    assert evaluate[evaluate.index("--synchronous-chunk-steps") + 1] == "8"
+    plan["conditions"][1]["server_layout"] = "paired"
+    with pytest.raises(ValueError, match="Synchronous"):
+        module().validate_plan(plan)
+
+
+def test_declared_uuid_mask_wins_over_physical_ordinal(plan):
+    uuid = "GPU-a96bcf12-94d7-95fc-c078-b597412cdd63"
+    plan["gpu_uuids"] = {role: uuid for role in plan["gpus"]}
+    module().validate_plan(plan)
+    assert module().environment(plan, "action")["CUDA_VISIBLE_DEVICES"] == uuid
+    assert module().environment(plan, "simulation")["MUJOCO_EGL_DEVICE_ID"] == "0"
+    for wrong in [{"action": uuid}, dict.fromkeys(plan["gpus"], "GPU-a96b")]:
+        plan["gpu_uuids"] = wrong
+        with pytest.raises(ValueError, match="UUID"):
+            module().validate_plan(plan)
+
+
+def test_uuid_index_mismatch_rejects_before_resource_admission(plan, monkeypatch):
+    m = module()
+    declared = "GPU-a96bcf12-94d7-95fc-c078-b597412cdd63"
+    observed = "GPU-4a56586b-2b20-8158-2085-c97765614e2c"
+    plan["gpu_uuids"] = dict.fromkeys(plan["gpus"], declared)
+    calls = []
+
+    def query(command, **kwargs):
+        calls.append(command)
+        assert "--query-gpu=index,uuid" in command
+        return f"0, {observed}\n"
+
+    monkeypatch.setattr(m.subprocess, "check_output", query)
+    with pytest.raises(RuntimeError, match="UUID.*mismatch"):
+        m._admit_devices(plan)
+    assert len(calls) == 1
+
+
+def test_uuid_admission_returns_verified_role_mapping(plan, monkeypatch):
+    m = module()
+    uuid = "GPU-a96bcf12-94d7-95fc-c078-b597412cdd63"
+    plan["gpu_uuids"] = dict.fromkeys(plan["gpus"], uuid)
+
+    def query(command, **kwargs):
+        if "--query-gpu=index,uuid" in command:
+            return f"0, {uuid}\n"
+        if "--query-gpu=memory.used,utilization.gpu" in command:
+            return "0, 0"
+        return ""
+
+    monkeypatch.setattr(m.subprocess, "check_output", query)
+    mapping = m._admit_devices(plan)
+    assert mapping == {
+        role: {"physical_index": 0, "uuid": uuid} for role in plan["gpus"]
+    }
+
+
+def test_synchronous_warmup_timeout_reaches_evaluator(plan):
+    plan.update(
+        execution_coupling="synchronous", synchronous_warmup_timeout_seconds=600
+    )
+    m = module()
+    m.validate_plan(plan)
+    command = m.build_commands(plan, plan["conditions"][0], "deployment", Path("/out"))[
+        "evaluate"
+    ]
+    assert command[command.index("--synchronous-warmup-timeout-seconds") + 1] == "600"
+    plan["conditions"][0]["synchronous_warmup_timeout_seconds"] = -1
+    with pytest.raises(ValueError, match="warmup.*timeout"):
+        m.validate_plan(plan)
+
+
+def test_one_step_async_plan_owns_single_worker_and_prefix_alias(plan):
+    plan.update(
+        execution_coupling="one_step_async",
+        execution_clock="ready",
+        execution_prefix_steps=1,
+    )
+    module().validate_plan(plan)
+    commands = module().build_commands(
+        plan, plan["conditions"][0], "deployment", Path("/out")
+    )
+    assert set(commands) == {"action", "evaluate"}
+    evaluate = commands["evaluate"]
+    assert evaluate[evaluate.index("--execution-coupling") + 1] == "one_step_async"
+    assert evaluate[evaluate.index("--synchronous-chunk-steps") + 1] == "1"
+    plan["conditions"][1]["synchronous_chunk_steps"] = 8
+    with pytest.raises(ValueError, match="exactly one"):
+        module().validate_plan(plan)
+    plan["conditions"][1]["execution_prefix_steps"] = 1
+    with pytest.raises(ValueError, match="Conflicting"):
+        module().validate_plan(plan)
+
+
+def launchable_plan(plan, tmp_path, horizon=16):
+    """Real checkpoint JSON layout and files, without a model or CUDA runtime."""
+    import json
+
+    root = tmp_path / "runtime"
+    upstream = root / "upstream/learning/Isaac-GR00T"
+    checkpoint = tmp_path / "checkpoint"
+    for path in (
+        root / "coexecution/libero/service.py",
+        root / "scripts/evaluate_libero_protocol.py",
+        tmp_path / "model-python",
+        tmp_path / "evaluation-python",
+        tmp_path / "libero-config",
+        upstream / "gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
+        upstream / "gr00t/policy/decoupled_policy.py",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"action_horizon": 40}))
+    (checkpoint / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_class": "Gr00tN1d7Processor",
+                "processor_kwargs": {
+                    "modality_configs": {
+                        "libero_sim": {
+                            "action": {"delta_indices": list(range(horizon))}
+                        }
+                    }
+                },
+            }
+        )
+    )
+    result = deepcopy(plan)
+    result.update(
+        runtime_root=str(root),
+        model_python=str(tmp_path / "model-python"),
+        evaluation_python=str(tmp_path / "evaluation-python"),
+        upstream=str(upstream),
+        libero_config=str(tmp_path / "libero-config"),
+        execution_clock="ready",
+        execution_coupling="chunked_async",
+        execution_prefix_steps=8,
+        async_overlap_steps=1,
+    )
+    for condition in result["conditions"]:
+        condition["checkpoint"] = str(checkpoint)
+    return result
+
+
+@pytest.mark.parametrize("coupling", ["synchronous", "chunked_async"])
+@pytest.mark.parametrize("override", [False, True], ids=["global", "last-condition"])
+def test_native_prefix_preflight_rejects_before_any_gpu_or_child(
+    plan, tmp_path, monkeypatch, coupling, override
+):
+    m = module()
+    plan = launchable_plan(plan, tmp_path)
+    plan["execution_coupling"] = coupling
+    plan["async_overlap_steps"] = 1 if coupling == "chunked_async" else 0
+    if override:
+        plan["conditions"][-1]["execution_prefix_steps"] = 17
+    else:
+        plan["execution_prefix_steps"] = 17
+    activity = []
+    monkeypatch.setattr(m, "_admit_devices", lambda *_: activity.append("gpu"))
+    monkeypatch.setattr(m.OwnedProcesses, "start", lambda *_: activity.append("child"))
+    with pytest.raises(ValueError, match="prefix 17 exceeds native decoded horizon 16"):
+        m.run(plan, tmp_path / "output")
+    assert activity == []
+    assert not (tmp_path / "output").exists()
+
+
+def test_native_prefix_preflight_uses_condition_override_and_actual_length(
+    plan, tmp_path
+):
+    m = module()
+    plan = launchable_plan(plan, tmp_path, horizon=24)
+    plan["execution_prefix_steps"] = 30
+    for condition in plan["conditions"]:
+        condition["execution_prefix_steps"] = 24
+    m.validate_plan(plan)
+    m.validate_launch_paths(plan)
+    plan["conditions"][-1]["execution_prefix_steps"] = 25
+    with pytest.raises(ValueError, match="prefix 25 exceeds native decoded horizon 24"):
+        m.validate_launch_paths(plan)
+
+
+def test_one_step_preflight_requires_readable_native_processor(plan, tmp_path):
+    m = module()
+    plan = launchable_plan(plan, tmp_path)
+    plan.update(execution_coupling="one_step_async", execution_prefix_steps=1)
+    m.validate_plan(plan)
+    m.validate_launch_paths(plan)
+    (Path(plan["conditions"][0]["checkpoint"]) / "processor_config.json").unlink()
+    with pytest.raises(ValueError, match="decoded action horizon"):
+        m.validate_launch_paths(plan)
+
+
+def test_responsive_plan_global_and_condition_identity(plan):
+    plan["deployment_scheduling_policy"] = "responsive"
+    for case in plan["conditions"]:
+        case["variant"] = "pir2"
+        case["flags"] = []
+    plan["conditions"][1]["deployment_scheduling_policy"] = "conservative"
+    module().validate_plan(plan)
+    for case, expected in zip(
+        plan["conditions"], ("responsive", "conservative"), strict=True
+    ):
+        command = module().build_commands(plan, case, "deployment", Path("/out"))[
+            "evaluate"
+        ]
+        assert "--deployment-scheduling-policy" in command
+        assert command[command.index("--deployment-scheduling-policy") + 1] == expected
+    plan["conditions"][0]["deployment_fixed_delay"] = 1
+    with pytest.raises(ValueError, match="Responsive"):
+        module().validate_plan(plan)

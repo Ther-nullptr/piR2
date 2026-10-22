@@ -163,3 +163,33 @@ test("unknown bootstrap image capture never inherits the state timestamp", () =>
   assert.equal(snapshot.imageAgeMs, null);
   assert.equal(snapshot.stateAgeMs, 250);
 });
+
+test("between-tick buffer and d snapshots retain their actual publication time", () => {
+  const episode = {
+    duration_s: 0.1,
+    initial_delay: 3,
+    ticks: [{ t: 0, action_buffer: { slots: [] } }],
+    requests: [
+      {
+        role: "S1",
+        start_s: 0,
+        completed_s: 0.02,
+        adopted_s: 0.05,
+        publication: { processed_s: 0.025 },
+      },
+    ],
+    publication_snapshots: [
+      {
+        t: 0.025,
+        action_buffer: { slots: [{ tick: 3 }] },
+        phase: "after_publication_before_next_tick",
+      },
+    ],
+    delay_transitions: [{ t: 0.025, after: 2 }],
+  };
+  assert.deepEqual(M.stateAt(episode, 0.024).actionBuffer.slots, []);
+  assert.equal(M.stateAt(episode, 0.024).ready.length, 1);
+  assert.equal(M.stateAt(episode, 0.026).actionBuffer.slots[0].tick, 3);
+  assert.equal(M.stateAt(episode, 0.026).ready.length, 0);
+  assert.equal(M.stateAt(episode, 0.026).delay, 2);
+});
