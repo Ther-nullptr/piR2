@@ -274,6 +274,37 @@ test("streaming metadata distinguishes physical steps, committed delay and warmu
   assert.ok(!label.includes("校准"));
 });
 
+test("startup barrier is a physical wait with its own label and unmodified service", () => {
+  const e = {
+    protocol: "pir2_dynamic",
+    timing_mode: "native",
+    requested_startup_release_seconds: 0.4,
+    startup_seconds: 0.4,
+    startup_seconds_applied: 0.4,
+    bootstrap_service_seconds: 0.125,
+    startup_barrier_seconds: 0.275,
+    startup_alignment_met: true,
+    events: [
+      { kind: "bootstrap_hold", start_s: 0, end_s: 0.125 },
+      { kind: "startup_barrier", start_s: 0.125, end_s: 0.4 },
+      { kind: "action", start_s: 0.4, end_s: 0.45 },
+    ],
+  };
+  assert.equal(D.at(e, 0.3).event.kind, "startup_barrier");
+  assert.match(D.phaseLabel(D.at(e, 0.3), e), /共同起点等待/);
+  assert.match(D.startupLabel(e), /400\.0 ms.*125\.0 ms.*275\.0 ms/);
+  assert.match(D.startupLabel(e), /对齐已达标/);
+  assert.match(
+    D.startupLabel({ ...e, startup_alignment_met: false }),
+    /对齐未达标/,
+  );
+  assert.match(D.startupLabel({ startup_seconds: 0.12 }), /未设置共同起点/);
+  assert.match(
+    D.startupLabel({ ...e, startup_seconds_applied: 0.3 }),
+    /对齐尚未完成/,
+  );
+});
+
 test("S1 state tick and S2 image tick have distinct labels and RPC boundary", () => {
   assert.equal(
     D.observationLabel({ lane: "s1", request_tick: 9, feature_source_tick: 3 }),

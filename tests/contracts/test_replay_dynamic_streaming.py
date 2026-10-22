@@ -301,6 +301,134 @@ def test_native_replay_preserves_each_measured_call_and_separate_rpc_boundary(
     assert requests["s1"]["parent_request_id"] == requests["bootstrap"]["id"]
 
 
+def aligned_native_evidence(evidence):
+    root, manifest, audit = native_evidence(evidence)
+    stream = audit["streaming"]
+    startup = {
+        "requested_startup_release_seconds": 0.4,
+        "bootstrap_service_seconds": 0.2,
+        "startup_barrier_seconds": 0.2,
+        "startup_seconds": 0.4,
+        "control_origin_s": 1000.4,
+        "startup_alignment_met": True,
+        "startup_policy": "common_startup_release_moving_world_hold",
+    }
+    for record in (manifest, stream, stream["config"], stream["bootstrap"]):
+        record.update(startup)
+    manifest["rollout_sim_time_s"] = stream["physical_seconds"] = 0.5
+    manifest["startup_seconds_applied"] = 0.4
+    s2, s1 = stream["requests"]
+    for request in (s2, s1):
+        request["logical_started_s"] += 0.2
+        request["logical_completed_s"] += 0.2
+    s2["capture_s"] += 0.2
+    s2["server_audit"]["capture_s"] += 0.2
+    s1["state_capture_s"] += 0.2
+    s1["feature_age_s"] += 0.2
+    s1["publication"]["logical_published_s"] += 0.2
+    for action in stream["actions"]:
+        action["logical_started_s"] += 0.2
+        action["logical_completed_s"] += 0.2
+        action["feature_age_s"] += 0.2
+        if action["tick"] == 0:
+            action["state_age_s"] += 0.2
+        else:
+            action["state_capture_s"] += 0.2
+    for event in stream["events"]:
+        event["t_s"] += 0.2
+        event["logical_published_s"] += 0.2
+    for motion in audit["motion_events"][1:]:
+        motion["rollout_sim_time_s"] += 0.2
+    for sample in audit["video_samples"][2:]:
+        sample["sample_sim_time_s"] += 0.2
+    audit["video_samples"].insert(
+        2,
+        {**audit["video_samples"][1], "sample_sim_time_s": 0.3},
+    )
+    for i, sample in enumerate(audit["video_samples"]):
+        sample.update(frame_index=i, media_time_s=i / 60)
+    manifest["video_frame_count"] = len(audit["video_samples"])
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    return root, manifest, audit
+
+
+def test_startup_alignment_splits_wait_without_stretching_service_or_frames(
+    streaming_evidence, tmp_path
+):
+    root, _, audit = aligned_native_evidence(streaming_evidence)
+    episode = build(root, tmp_path)["episodes"][0]
+    holds = [
+        e
+        for e in episode["events"]
+        if e["kind"] in ("bootstrap_hold", "startup_barrier")
+    ]
+    assert [(h["kind"], h["start_s"], h["end_s"]) for h in holds] == [
+        ("bootstrap_hold", 0.0, pytest.approx(0.2)),
+        ("startup_barrier", pytest.approx(0.2), pytest.approx(0.4)),
+    ]
+    requests = {r["lane"]: r for r in episode["requests"]}
+    assert requests["bootstrap"]["service_duration_ms"] == pytest.approx(200)
+    assert requests["bootstrap"]["end_s"] == pytest.approx(0.2)
+    assert requests["s1"]["service_duration_ms"] == pytest.approx(40)
+    assert requests["s2"]["service_duration_ms"] == pytest.approx(10)
+    assert requests["s1"]["state_capture_s"] == pytest.approx(1000.4)
+    assert requests["s1"]["feature_capture_s"] == 1000.0
+    assert [f["relative_s"] for f in episode["frames"]] == [
+        f["sample_sim_time_s"] for f in audit["video_samples"]
+    ]
+    assert episode["frames"][2]["phase"] == "bootstrap_hold"
+    assert episode["frames"][2]["relative_s"] == 0.3
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda m, s: m.update(startup_barrier_seconds=0.0),
+        lambda m, s: m.update(requested_startup_release_seconds=0.5),
+        lambda m, s: m.pop("requested_startup_release_seconds"),
+        lambda m, s: s["bootstrap"].update(bootstrap_service_seconds=0.4),
+        lambda m, s: s["bootstrap"].update(startup_seconds=0.2),
+        lambda m, s: s["config"].update(control_origin_s=1000.2),
+        lambda m, s: s.update(startup_alignment_met=False),
+    ],
+)
+def test_startup_alignment_rejects_inconsistent_accounting(
+    streaming_evidence, tmp_path, mutation
+):
+    root, manifest, audit = aligned_native_evidence(streaming_evidence)
+    mutation(manifest, audit["streaming"])
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    with pytest.raises(ValueError):
+        build(root, tmp_path)
+
+
+def test_interrupted_startup_preserves_observed_barrier_without_inventing_end(
+    streaming_evidence, tmp_path
+):
+    root, manifest, audit = aligned_native_evidence(streaming_evidence)
+    manifest.update(
+        status="error",
+        steps=0,
+        rollout_sim_time_s=0.3,
+        startup_seconds_applied=0.3,
+        video_frame_count=3,
+    )
+    audit["streaming"].update(requests=[], actions=[], events=[])
+    audit["motion_events"] = audit["motion_events"][:1]
+    audit["video_samples"] = audit["video_samples"][:3]
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    episode = build(root, tmp_path)["episodes"][0]
+    assert len(episode["events"]) == 2
+    assert episode["events"][0]["end_s"] == pytest.approx(0.2)
+    assert episode["events"][1]["kind"] == "startup_barrier"
+    assert episode["events"][1]["start_s"] == pytest.approx(0.2)
+    assert episode["events"][1]["end_s"] is None
+    assert episode["startup_seconds_applied"] == 0.3
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -520,8 +648,9 @@ def test_streaming_rejects_mislabeled_timing_or_gripper_mapping(
         build(root, tmp_path)
 
 
-def test_real_runner_partial_result_retains_top_level_bootstrap(
-    streaming_evidence, tmp_path
+@pytest.mark.parametrize("legacy_partial", [False, True])
+def test_real_runner_partial_result_retains_startup_evidence(
+    streaming_evidence, tmp_path, legacy_partial
 ):
     from types import SimpleNamespace
 
@@ -530,18 +659,33 @@ def test_real_runner_partial_result_retains_top_level_bootstrap(
 
     root, manifest, audit = streaming_evidence
     full = audit["streaming"]
+    startup = {
+        "requested_startup_release_seconds": None,
+        "startup_policy": "paid_moving_world_hold",
+        "bootstrap_service_seconds": 0.2,
+        "startup_barrier_seconds": 0.0,
+        "startup_seconds": 0.2,
+        "control_origin_s": 1000.2,
+        "startup_alignment_met": None,
+    }
     controller = SimpleNamespace(
         timing_mode="fixed",
         latencies=StageLatencies(bootstrap_s=0.2, s1_s=0.04, s2_s=0, recovery_s=0.2),
         logical_time_s=1000.3,
+        epoch_s=1000.0,
+        startup_metadata=lambda: dict(startup),
+        bootstrap_evidence=deepcopy(full["bootstrap"]),
         requests=full["requests"],
         actions=full["actions"],
         trace=SimpleNamespace(records=lambda: full["events"]),
     )
     audit["bootstrap"] = full["bootstrap"]
     audit["streaming"] = _partial_streaming(controller)
-    assert "bootstrap" not in audit["streaming"]
-    assert "config" not in audit["streaming"]
+    assert audit["streaming"]["bootstrap"] == full["bootstrap"]
+    assert audit["streaming"]["config"]["startup_seconds"] == 0.2
+    if legacy_partial:
+        audit["streaming"].pop("bootstrap")
+        audit["streaming"].pop("config")
     manifest.update(status="error", error="step callback failed")
     write(root / "manifest.jsonl", manifest)
     write(root / "audit.json", audit)

@@ -53,7 +53,7 @@ window.DynamicReplayView = (() => {
           ? "任务未成功"
           : "结果未知";
   const conditionLabel = (e) =>
-    `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${fmt(e.speed_mps, 3)} m/s · seed ${e.seed ?? "—"}`;
+    `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${fmt(e.speed_mps, 3)} m/s${e.speed_scope === "custom" ? "（自定义物体速度）" : ""} · seed ${e.seed ?? "—"}`;
   const streaming = (e) => e.protocol === "pir2_dynamic";
   const timingLabel = D.timingLabel;
   const runLabel = ({ run, episode: e }) =>
@@ -69,7 +69,9 @@ window.DynamicReplayView = (() => {
           ? `A${e.action_step}${e.partial ? " · 中断物理步" : e.fallback ? " · Fallback" : ""}`
           : e.kind === "bootstrap_hold"
             ? "Bootstrap hold"
-            : `Hold C${e.chunk_id}`;
+            : e.kind === "startup_barrier"
+              ? "Startup barrier"
+              : `Hold C${e.chunk_id}`;
   const dependencyLabel = (e) =>
     e.kind === "s1"
       ? `← ${e.source.feature_sequence === 0 ? "Bootstrap" : `S2-${e.source.feature_sequence}`} · valid [${e.source.server_audit?.valid_start_tick ?? "?"}, ${e.source.server_audit?.valid_end_tick ?? "?"})`
@@ -77,11 +79,13 @@ window.DynamicReplayView = (() => {
         ? `观测 tick ${e.source.source_tick}`
         : e.kind === "bootstrap_hold"
           ? "启动 · 物体持续运动"
-          : e.producer_kind === "request"
-            ? `← S1[t${e.source.source?.producer_request_tick}] · AoI ${fmt(ms(e.feature_age_s), 0)} ms`
-            : e.producer_kind
-              ? e.producer_kind
-              : `← C${e.chunk_id}`;
+          : e.kind === "startup_barrier"
+            ? "调用已完成 · 等待共同起点"
+            : e.producer_kind === "request"
+              ? `← S1[t${e.source.source?.producer_request_tick}] · AoI ${fmt(ms(e.feature_age_s), 0)} ms`
+              : e.producer_kind
+                ? e.producer_kind
+                : `← C${e.chunk_id}`;
   function navigate(view) {
     const url = new URL(location.href);
     url.searchParams.set("view", view);
@@ -139,7 +143,7 @@ window.DynamicReplayView = (() => {
       <select class="dynamic-run" data-index="${i}" aria-label="${esc(name(run))} 动态配置"></select><button class="dynamic-compare" data-index="${i}">${state.rows[i].comparison ? "移除对照列" : "添加同协议对照"}</button>
       <div class="media-stage"><span class="media-message">等待实际物理帧</span><div class="frame-meta"></div></div>
       <div class="card-status">${esc(result(e))}</div><p class="dynamic-language">${esc(e.language ?? "任务语言未记录")}</p>
-      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(timingLabel(e))} · ${esc(e.timing_rule ?? e.timing_domain ?? "未知")}${streaming(e) ? "<br>启动等待 " + fmt(ms(e.startup_seconds ?? e.stage_latencies?.bootstrap_s), 1) + " ms；真实 GPU RPC 串行计算，逻辑通道独立服务。" : ""}<br>${esc(D.modelContract(e))}<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>
+      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(timingLabel(e))} · ${esc(e.timing_rule ?? e.timing_domain ?? "未知")}${streaming(e) ? "<br>" + esc(D.startupLabel(e)) : ""}<br>${esc(D.modelContract(e))}<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>
       <a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
         )
         .join("") || '<p class="loading">此条件没有记录。</p>';
@@ -219,7 +223,8 @@ window.DynamicReplayView = (() => {
         const events = e.events.filter(
           (v) =>
             (v.kind === kind ||
-              (kind === "action" && v.kind === "bootstrap_hold")) &&
+              (kind === "action" &&
+                ["bootstrap_hold", "startup_barrier"].includes(v.kind))) &&
             v.start_s < end &&
             (!finite(v.end_s) || v.end_s > start),
         );
@@ -244,7 +249,13 @@ window.DynamicReplayView = (() => {
             const evidence = publication
               ? ` · 入队 ${publication.installed_slots ?? "—"} / 过期 ${publication.expired_slots ?? "—"} / 保护 ${publication.protected_slots ?? "—"}`
               : "";
-            return `<button class="task-block${selected ? " source-selected" : ""}${v.fallback ? " dynamic-fallback" : ""}" data-event="${esc(v.id)}" data-column="${esc(row.columnKey)}" data-run="${esc(run.id)}" data-phase="${phase}" data-phase-kind="${kind === "action" ? "execution" : "inference"}" style="left:${pct(v.start_s)}%;width:${(100 * ((v.end_s ?? end) - v.start_s)) / width}%" title="${esc(`${eventLabel(v)} · ${dependencyLabel(v)} · ${fmt(v.start_s, 6)}–${fmt(v.end_s, 6)} sim s${evidence}`)}"><strong>${esc(eventLabel(v))}</strong><small>${esc(dependencyLabel(v))}</small></button>`;
+            const phaseKind =
+              v.kind === "startup_barrier"
+                ? "wait"
+                : v.kind === "action"
+                  ? "execution"
+                  : "inference";
+            return `<button class="task-block${selected ? " source-selected" : ""}${v.fallback ? " dynamic-fallback" : ""}" data-event="${esc(v.id)}" data-column="${esc(row.columnKey)}" data-run="${esc(run.id)}" data-phase="${phase}" data-phase-kind="${phaseKind}" style="left:${pct(v.start_s)}%;width:${(100 * ((v.end_s ?? end) - v.start_s)) / width}%" title="${esc(`${eventLabel(v)} · ${dependencyLabel(v)} · ${fmt(v.start_s, 6)}–${fmt(v.end_s, 6)} sim s${evidence}`)}"><strong>${esc(eventLabel(v))}</strong><small>${esc(dependencyLabel(v))}</small></button>`;
           })
           .join("");
         html += `</div><div class="task-playhead" style="left:${pct(state.clock)}%"></div></div></div>`;
@@ -411,9 +422,9 @@ window.DynamicReplayView = (() => {
       "image",
     );
     $("evidence-note").textContent =
-      "LIBERO-Dynamic：主时间轴采用物理仿真时间，包含推理等待期间目标物体的运动。模型使用本项目已有 GR00T 权重。各配置注明逐请求实测或固定延迟；Flow4 每次等待后执行 K 步，πR² 按 S2/S1 逻辑通道调度。实际 GPU RPC 串行计算，测量边界在独立 wall 面板展示。";
+      "主轴：物理仿真时间。推理：真实模型调用，各配置标明逐请求实测或固定延迟。GPU 推理与物理计算实际串行；πR² 的 S1/S2 重叠表示逻辑调度，不能作为真实墙钟并发性能。模型使用本项目已有 GR00T 权重。";
     $("timeline-note").textContent =
-      "Hold 是应用到物理世界的 τ；执行动作按真实物理边界显示。视频逐帧依照 sample_sim_time_s 映射，60 fps 视频与 20 Hz 控制分别计数。πR² 首次启动等待付费，随后动作每步推进；点击 S1 关联 S2，点击动作关联实际生产请求；高亮只表示记录中的依赖。";
+      "主轴为物理仿真时间，GPU / 物理实际串行。Bootstrap hold 为启动调用等待；Startup barrier 为调用完成后等待共同起点，两段期间物体持续运动，S1/S2 后续时长不对齐。视频依据实际物理帧时间播放，60 fps 视频与 20 Hz 控制分别计数。点击 S1 关联 S2，点击动作关联实际生产请求。";
     document.querySelector(".timeline-section h2").textContent =
       "LIBERO-Dynamic · 物理时间与动作来源";
     $("curve-title").textContent = "真实 VLM → DiT · 独立 Wall 时间";

@@ -673,6 +673,116 @@ def test_native_startup_pays_measured_bootstrap_once_in_physical_world(
     assert result["control_origin_s"] == pytest.approx(1000.137)
 
 
+@pytest.mark.parametrize("service", [0.137, 0.2113, 0.413])
+def test_common_release_uses_one_hold_and_preserves_late_trial_evidence(
+    tmp_path, monkeypatch, service
+):
+    from coexecution.libero_dynamic import streaming_evaluation as module
+    from tests.contracts.test_dynamic_streaming import native_setup
+
+    source, options, args, item, _, _, env, writers = fixtures(tmp_path)
+    options.timing_mode = "native"
+    options.warmup_requests = 0
+    options.startup_release_seconds = 0.4
+    for name in ("bootstrap", "s1", "s2", "recovery"):
+        setattr(options, name + "_latency_seconds", None)
+    _, rpc, endpoints, _, clock, _ = native_setup(tmp_path, bootstrap=service)
+    original = module.StreamingController
+
+    def make_controller(*a, **kw):
+        controller = original(*a, clock=clock, **kw)
+        old_bootstrap = controller.bootstrap
+
+        def mutate_detached_receipt(*args, **kwargs):
+            receipt = old_bootstrap(*args, **kwargs)
+            receipt.update(
+                startup_seconds=99, control_origin_s=1099, startup_alignment_met=True
+            )
+            return receipt
+
+        controller.bootstrap = mutate_detached_receipt
+        return controller
+
+    monkeypatch.setattr(module, "StreamingController", make_controller)
+    runner = module.make_streaming_episode_type(source, options)(item, args, rpc=rpc)
+    hold_calls = []
+    original_hold = runner._apply_sync_latency
+
+    def hold_once(env, duration):
+        hold_calls.append(duration)
+        return original_hold(env, duration)
+
+    runner._apply_sync_latency = hold_once
+    result = runner.run()
+    aligned = service <= 0.4
+    total = max(service, 0.4)
+    assert hold_calls == pytest.approx([total])
+    assert result["status"] == ("ok" if aligned else "error")
+    assert result["steps"] == (3 if aligned else 0)
+    assert result["startup_seconds_applied"] == pytest.approx(total)
+    audit = json.loads(Path(result["policy_audit"]).read_text())
+    for record in (result, audit["bootstrap"], audit["streaming"]):
+        assert record["requested_startup_release_seconds"] == 0.4
+        assert record["bootstrap_service_seconds"] == pytest.approx(service)
+        assert record["startup_barrier_seconds"] == pytest.approx(max(0.4 - service, 0))
+        assert record["startup_seconds"] == pytest.approx(total)
+        assert record["control_origin_s"] == pytest.approx(1000 + total)
+        assert record["startup_alignment_met"] is aligned
+    assert audit["bootstrap"]["logical_duration_s"] == pytest.approx(service)
+    assert audit["bootstrap"]["logical_completed_s"] == pytest.approx(1000 + service)
+    post = next(
+        row
+        for row in audit["motion_events"]
+        if row["kind"] == "post_bootstrap_observation"
+    )
+    assert post["logical_capture_s"] == pytest.approx(1000 + total)
+    assert post["rollout_sim_time_s"] == pytest.approx(total)
+    assert env.sim.x == pytest.approx(0.06 * (2 + total + result["steps"] * 0.05))
+    assert env.closed and all(endpoint.closed for endpoint in endpoints.values())
+    assert all(writer.closed for writer in writers)
+    if not aligned:
+        assert "startup release" in result["error"]
+        assert audit["streaming"]["actions"] == audit["streaming"]["requests"] == []
+        assert audit["action_attempts"] == []
+        assert {row["phase"] for row in audit["video_samples"]} == {"bootstrap_hold"}
+
+
+def test_common_release_keeps_identical_physics_grid_for_different_bootstrap_times(
+    tmp_path,
+):
+    from coexecution.libero_dynamic import streaming_evaluation as module
+
+    physical_grids, captures = [], []
+    for index, service in enumerate((0.137, 0.2113)):
+        case = tmp_path / str(index)
+        case.mkdir()
+        source, options, args, item, rpc, _, env, _ = fixtures(case, videos=False)
+        options.bootstrap_latency_seconds = service
+        options.startup_release_seconds = 0.4
+        original_step = env.sim.step
+        grid = []
+
+        def step(*, _step=original_step, _env=env, _grid=grid):
+            _step()
+            _grid.append((_env.sim.data.time, _env.sim.model.opt.timestep, _env.sim.x))
+
+        env.sim.step = step
+        result = module.make_streaming_episode_type(source, options)(
+            item, args, rpc=rpc
+        ).run()
+        assert result["status"] == "ok"
+        audit = json.loads(Path(result["policy_audit"]).read_text())
+        post = next(
+            row
+            for row in audit["motion_events"]
+            if row["kind"] == "post_bootstrap_observation"
+        )
+        captures.append((post["physics_sim_time_s"], post["observation_sha256"]))
+        physical_grids.append(grid)
+    assert captures[0] == captures[1]
+    assert physical_grids[0] == physical_grids[1]
+
+
 @pytest.mark.parametrize(
     "mode, latency_args",
     [
@@ -758,8 +868,9 @@ def test_native_failure_before_receipt_does_not_invent_paid_startup(
 
 
 @pytest.mark.parametrize("timing_mode", ["native", "fixed"])
+@pytest.mark.parametrize("custom_speed", [False, True])
 def test_streaming_cli_remains_compatible_with_shared_source_arguments(
-    tmp_path, timing_mode
+    tmp_path, timing_mode, custom_speed
 ):
     import argparse
     import copy
@@ -800,6 +911,10 @@ def test_streaming_cli_remains_compatible_with_shared_source_arguments(
             ("recovery", "0.2"),
         ]:
             argv.extend([f"--{stage}-latency-seconds", seconds])
+    if custom_speed:
+        argv.extend(
+            ["--speed-mps", ".015", "--custom-speed", "--startup-release-seconds", ".4"]
+        )
     options = parser.parse_args(argv)
     validate_options(options)
     assert not hasattr(options, "native_latency")
@@ -818,4 +933,16 @@ def test_streaming_cli_remains_compatible_with_shared_source_arguments(
     assert runtime_args.latency_source == "fixed"
     assert runtime_args.calibrated_latency_seconds == 0
     assert options.timing_mode == timing_mode
+    assert options.startup_release_seconds == (0.4 if custom_speed else None)
+
+
+@pytest.mark.parametrize("seconds", [0, -0.1, True, float("nan"), float("inf")])
+def test_streaming_validation_rejects_invalid_startup_release(tmp_path, seconds):
+    from coexecution.libero_dynamic.streaming_evaluation import validate_options
+
+    _, options, _, _, _, _, _, _ = fixtures(tmp_path)
+    options.action_port, options.vision_port = 1001, 1002
+    options.startup_release_seconds = seconds
+    with pytest.raises(ValueError, match="startup release"):
+        validate_options(options)
     assert not hasattr(options, "native_latency")

@@ -625,7 +625,15 @@ class ServiceClock:
         return self.now
 
 
-def native_setup(tmp_path, *, s1=(0.023,), s2=(0.071,), bootstrap=0.137, fixed=None):
+def native_setup(
+    tmp_path,
+    *,
+    s1=(0.023,),
+    s2=(0.071,),
+    bootstrap=0.137,
+    fixed=None,
+    startup_release_seconds=None,
+):
     _, rpc, endpoints, _, _, _ = setup(tmp_path)
     _, Step, Controller, _ = api()
     clock = ServiceClock()
@@ -644,20 +652,139 @@ def native_setup(tmp_path, *, s1=(0.023,), s2=(0.071,), bootstrap=0.137, fixed=N
             return result
 
         setattr(rpc, name, measured)
-    controller = Controller(rpc, timing_mode="native", clock=clock, fixed_delay=fixed)
+    controller = Controller(
+        rpc,
+        timing_mode="native",
+        clock=clock,
+        fixed_delay=fixed,
+        startup_release_seconds=startup_release_seconds,
+    )
     receipt = controller.bootstrap({"frame": -1, "state": {}}, "pick cup", seed=1)
 
     def run(n):
         return controller.run(
             receipt,
             initial_observation={"frame": 0, "state": {}},
-            initial_capture_s=receipt["logical_completed_s"],
+            initial_capture_s=1000 + max(bootstrap, startup_release_seconds or 0),
             language="pick cup",
             step_fn=lambda action, tick: Step({"frame": tick + 1, "state": {}}),
             max_steps=n,
         )
 
     return controller, rpc, endpoints, receipt, clock, run
+
+
+def test_common_startup_release_keeps_every_native_service_duration(tmp_path):
+    _, _, _, receipt, _, run = native_setup(
+        tmp_path, s1=(0.023, 0.039), s2=(0.071, 0.083), startup_release_seconds=0.4
+    )
+    result = run(5)
+    assert receipt["logical_duration_s"] == pytest.approx(0.137)
+    assert receipt["logical_completed_s"] == pytest.approx(1000.137)
+    assert receipt["service_wall"]["duration_s"] == receipt["logical_duration_s"]
+    for record in (receipt, result, result["config"]):
+        assert record["requested_startup_release_seconds"] == 0.4
+        assert record["bootstrap_service_seconds"] == pytest.approx(0.137)
+        assert record["startup_barrier_seconds"] == pytest.approx(0.263)
+        assert record["startup_seconds"] == 0.4
+        assert record["control_origin_s"] == 1000.4
+        assert record["startup_alignment_met"] is True
+        assert record["startup_policy"] == "common_startup_release_moving_world_hold"
+    assert requests(result, "s1")[0]["state_capture_s"] == 1000.4
+    assert requests(result, "s1")[0]["feature_capture_s"] == 1000
+    assert requests(result, "s1")[0]["feature_age_s"] == pytest.approx(0.4)
+    assert requests(result, "s1")[0]["image_delay_ticks"] == 8
+    assert requests(result, "s1")[0]["image_delay_embedding_ticks"] == 5
+    assert [r["logical_duration_s"] for r in requests(result, "s1")][
+        :2
+    ] == pytest.approx([0.023, 0.039])
+    assert [r["logical_duration_s"] for r in requests(result, "s2")][
+        :2
+    ] == pytest.approx([0.071, 0.083])
+
+
+def test_receipt_tampering_cannot_change_private_common_release(tmp_path):
+    controller, _, _, receipt, _, run = native_setup(
+        tmp_path, startup_release_seconds=0.4
+    )
+    for key in (
+        "bootstrap_service_seconds",
+        "startup_barrier_seconds",
+        "startup_seconds",
+        "control_origin_s",
+    ):
+        receipt[key] = 999
+    receipt["requested_startup_release_seconds"] = 999
+    receipt["startup_alignment_met"] = False
+    snapshot = controller.bootstrap_evidence
+    snapshot["startup_seconds"] = 999
+    assert controller.startup_metadata()["startup_seconds"] == 0.4
+    result = run(1)
+    assert result["control_origin_s"] == 1000.4
+    assert result["bootstrap"]["startup_seconds"] == 0.4
+    assert result["startup_alignment_met"] is True
+
+
+def test_late_bootstrap_fails_before_actions_and_retains_native_service(tmp_path):
+    controller, _, endpoints, receipt, _, run = native_setup(
+        tmp_path, bootstrap=0.41, startup_release_seconds=0.4
+    )
+    assert receipt["startup_alignment_met"] is False
+    assert receipt["startup_seconds"] == pytest.approx(0.41)
+    assert receipt["startup_barrier_seconds"] == 0
+    assert receipt["service_wall"]["duration_s"] == receipt["logical_duration_s"]
+    receipt["startup_alignment_met"] = True
+    before = {port: len(endpoint.calls) for port, endpoint in endpoints.items()}
+    with pytest.raises(RuntimeError, match="startup release"):
+        run(2)
+    assert {port: len(endpoint.calls) for port, endpoint in endpoints.items()} == before
+    assert controller.logical_time_s == pytest.approx(1000.41)
+    with pytest.raises(RuntimeError, match="fresh bootstrap"):
+        run(1)
+
+
+def test_late_rebootstrap_does_not_retain_previous_run_actions(tmp_path):
+    controller, rpc, _, _, clock, run = native_setup(
+        tmp_path, startup_release_seconds=0.4
+    )
+    assert run(2)["action_steps"] == 2
+    original = rpc.bootstrap
+
+    def late(*args, **kwargs):
+        receipt = original(*args, **kwargs)
+        clock.now += 0.5
+        return receipt
+
+    rpc.bootstrap = late
+    receipt = controller.bootstrap({"frame": -1, "state": {}}, "pick cup", seed=1)
+    with pytest.raises(RuntimeError, match="startup release"):
+        controller.run(
+            receipt,
+            initial_observation={"frame": 0, "state": {}},
+            initial_capture_s=receipt["control_origin_s"],
+            language="pick cup",
+            step_fn=lambda *_: pytest.fail("late startup cannot step"),
+            max_steps=2,
+        )
+    assert controller.actions == controller.requests == []
+    assert controller.timeline is None
+
+
+def test_bootstrap_exactly_at_common_release_needs_no_extra_wait(tmp_path):
+    _, _, _, receipt, _, run = native_setup(
+        tmp_path, bootstrap=0.375, startup_release_seconds=0.375
+    )
+    result = run(1)
+    assert receipt["startup_alignment_met"] is True
+    assert receipt["startup_barrier_seconds"] == 0
+    assert result["physical_seconds"] == pytest.approx(0.425)
+
+
+@pytest.mark.parametrize("seconds", [0, -0.1, True, float("nan"), float("inf")])
+def test_common_startup_release_rejects_invalid_time(tmp_path, seconds):
+    _, _, Controller, _ = api()
+    with pytest.raises(ValueError, match="startup release"):
+        Controller(None, timing_mode="native", startup_release_seconds=seconds)
 
 
 def test_native_uses_every_complete_adapter_duration_without_alignment(tmp_path):

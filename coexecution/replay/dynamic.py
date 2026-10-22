@@ -531,6 +531,8 @@ def _episode(root, manifest, config, media, run_id):
                 "level",
                 "traj_index",
                 "speed_mps",
+                "speed_scope",
+                "template_condition_id",
                 "precision",
                 "protocol",
                 "status",

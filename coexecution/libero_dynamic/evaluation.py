@@ -73,21 +73,37 @@ def _distinct(values, allowed, name):
         raise ValueError(f"{name} must select distinct values from {tuple(allowed)}")
 
 
-def _speed(value):
-    if isinstance(value, bool) or value not in SPEEDS_MPS:
+def _speed(value, *, custom_speed=False):
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
         raise ValueError(
-            f"Dynamic speed must be one of {SPEEDS_MPS}; zero is not a static switch"
+            "Dynamic speed must be finite and positive; zero is not a static switch"
+        )
+    if not custom_speed and value not in SPEEDS_MPS:
+        raise ValueError(
+            f"Dynamic speed must be one of {SPEEDS_MPS}; use --custom-speed for an experimental override"
         )
     return float(value)
 
 
-def select_conditions(inventory, *, suite, task_ids, levels, traj_indices, speed_mps):
+def speed_metadata(options):
+    return {
+        "speed_mps": options.speed_mps,
+        "speed_scope": "custom"
+        if getattr(options, "custom_speed", False)
+        else "official",
+    }
+
+
+def select_conditions(
+    inventory, *, suite, task_ids, levels, traj_indices, speed_mps, custom_speed=False
+):
     """Resolve an exact, explicit condition set; missing members are errors."""
     _distinct([suite], SUITES, "suite")
     _distinct(task_ids, range(10), "task_ids")
     _distinct(levels, LEVELS, "levels")
     _distinct(traj_indices, range(5), "traj_indices")
-    speed_mps = _speed(speed_mps)
+    speed_mps = _speed(speed_mps, custom_speed=custom_speed)
+    template_speed = SPEEDS_MPS[0] if custom_speed else speed_mps
     selected = [
         copy.deepcopy(row)
         for row in inventory["conditions"]
@@ -95,19 +111,28 @@ def select_conditions(inventory, *, suite, task_ids, levels, traj_indices, speed
         and row["task_id"] in task_ids
         and row["level"] in levels
         and row["traj_index"] in traj_indices
-        and row["speed_mps"] == speed_mps
+        and row["speed_mps"] == template_speed
     ]
     expected = len(task_ids) * len(levels) * len(traj_indices)
     if len(selected) != expected or len({r["item_id"] for r in selected}) != expected:
         raise ValueError("Reviewed inventory does not provide exact selected coverage")
+    for row in selected:
+        row["speed_scope"] = "custom" if custom_speed else "official"
+        if custom_speed:
+            row["template_condition_id"] = row["condition_id"]
+            row["speed_mps"] = speed_mps
+            # Round-trip float representation distinguishes .01/.015 and close
+            # overrides without changing any of the official condition IDs.
+            token = repr(speed_mps).replace(".", "p")
+            row["condition_id"] = f"{row['item_id']}__custom_v{token}"
     return sorted(
         selected, key=lambda row: (row["level"], row["task_id"], row["traj_index"])
     )
 
 
-def override_motion_speed(config, speed_mps):
+def override_motion_speed(config, speed_mps, *, custom_speed=False):
     """Copy and replace every alpha_mps, preserving angular motion and geometry."""
-    speed_mps = _speed(speed_mps)
+    speed_mps = _speed(speed_mps, custom_speed=custom_speed)
     result, changes = copy.deepcopy(config), []
 
     def visit(node, path):
@@ -511,7 +536,12 @@ def add_scene_arguments(parser):
     parser.add_argument("--task-ids", nargs="+", type=int, default=list(range(10)))
     parser.add_argument("--levels", nargs="+", choices=LEVELS, default=list(LEVELS))
     parser.add_argument("--traj-indices", nargs="+", type=int, default=list(range(5)))
-    parser.add_argument("--speed-mps", type=float, choices=SPEEDS_MPS, required=True)
+    parser.add_argument("--speed-mps", type=float, required=True)
+    parser.add_argument(
+        "--custom-speed",
+        action="store_true",
+        help="Use a positive experimental object speed outside the official .03/.06/.09 m/s grid",
+    )
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init-state-id", type=int, default=0)
@@ -546,6 +576,7 @@ def add_evaluate_arguments(parser):
 
 
 def _validate_options(args):
+    _speed(args.speed_mps, custom_speed=getattr(args, "custom_speed", False))
     for name in ("max_steps", "warmup_requests", "calibration_requests", "camera_size"):
         if type(getattr(args, name)) is not int or getattr(args, name) < 1:
             raise ValueError(f"{name} must be a positive integer")
@@ -641,7 +672,9 @@ def _effective_items(source, args, options, conditions):
     for level, name in paths.items():
         path = Path(name)
         config, edits = override_motion_speed(
-            yaml.safe_load(path.read_text()), options.speed_mps
+            yaml.safe_load(path.read_text()),
+            options.speed_mps,
+            custom_speed=getattr(options, "custom_speed", False),
         )
         path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         changes[level] = {
@@ -651,7 +684,7 @@ def _effective_items(source, args, options, conditions):
         }
     _write_json(
         options.output / "speed-override.json",
-        {"speed_mps": options.speed_mps, "configs": changes},
+        {**speed_metadata(options), "configs": changes},
     )
     # build_items must READ the overridden copies, not the original config_dir.
     items = source.legacy.build_items(
@@ -931,7 +964,7 @@ def make_episode_type(source, options, session):
                     "precision": options.precision,
                     "timing_rule": options.timing_rule,
                     **latency_metadata(options),
-                    "speed_mps": options.speed_mps,
+                    **speed_metadata(options),
                     "policy_identity": self.policy.identity,
                     "raw_calibration_latency_s": None
                     if session["calibration"] is None
@@ -1038,6 +1071,7 @@ def prepare_conditions(options):
         levels=options.levels,
         traj_indices=options.traj_indices,
         speed_mps=options.speed_mps,
+        custom_speed=getattr(options, "custom_speed", False),
     )
     return inventory, conditions
 
@@ -1073,6 +1107,7 @@ def evaluate_default(options):
             "upstream": inventory["upstream"],
             "conditions": conditions,
             "protocol": "default_vla_flow4",
+            **speed_metadata(options),
             "phase_contract": inventory["phase_contract"],
             **latency_metadata(options),
             "calibration_policy": None

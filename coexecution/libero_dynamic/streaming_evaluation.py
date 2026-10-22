@@ -23,14 +23,23 @@ from .evaluation import (
     _jsonable,
     _load_runtime,
     _source_arguments,
+    _speed,
     _write_json,
     add_model_arguments,
     add_scene_arguments,
     observation_fingerprint,
     prepare_conditions,
+    speed_metadata,
 )
 from .physical import make_physical_episode_type
-from .streaming import StageLatencies, StepResult, StreamingController, timing_metadata
+from .streaming import (
+    STARTUP_MEASUREMENTS,
+    StageLatencies,
+    StepResult,
+    StreamingController,
+    startup_configuration,
+    timing_metadata,
+)
 from .streaming_rpc import Pir2RPC
 
 
@@ -52,6 +61,11 @@ def add_streaming_arguments(parser):
             help=f"Fixed counterfactual {stage} service duration in seconds",
         )
     parser.add_argument("--fixed-delay", type=int, choices=range(1, 6))
+    parser.add_argument(
+        "--startup-release-seconds",
+        type=float,
+        help="Common physical startup release; extra waiting is recorded separately from native model service",
+    )
 
 
 def stage_latencies(options):
@@ -74,6 +88,8 @@ def stage_latencies(options):
 
 def validate_options(options):
     stage_latencies(options)
+    startup_configuration(getattr(options, "startup_release_seconds", None))
+    _speed(options.speed_mps, custom_speed=getattr(options, "custom_speed", False))
     for name in ("max_steps", "camera_size"):
         if type(getattr(options, name)) is not int or getattr(options, name) < 1:
             raise ValueError(f"{name} must be a positive integer")
@@ -237,6 +253,13 @@ def _partial_streaming(controller):
     return {
         "status": "incomplete",
         **timing_metadata(controller.timing_mode, controller.latencies),
+        **controller.startup_metadata(),
+        "bootstrap": controller.bootstrap_evidence,
+        "logical_epoch_s": controller.epoch_s,
+        "config": {
+            **timing_metadata(controller.timing_mode, controller.latencies),
+            **controller.startup_metadata(),
+        },
         "logical_time_s": controller.logical_time_s,
         "requests": copy.deepcopy(getattr(controller, "requests", [])),
         "actions": copy.deepcopy(getattr(controller, "actions", [])),
@@ -319,6 +342,9 @@ def make_streaming_episode_type(source, options):
                     latencies=latencies,
                     fixed_delay=options.fixed_delay,
                     timing_mode=mode,
+                    startup_release_seconds=getattr(
+                        options, "startup_release_seconds", None
+                    ),
                 )
                 warmup_streaming(
                     self.rpc,
@@ -342,10 +368,11 @@ def make_streaming_episode_type(source, options):
                 start_physics = float(self.env.sim.data.time)
                 self.control_started = True
                 scored_record_start = len(self.rpc.records)
-                bootstrap = controller.bootstrap(
-                    observation, language, seed=options.seed
-                )
-                startup_seconds = bootstrap["logical_duration_s"]
+                controller.bootstrap(observation, language, seed=options.seed)
+                # The controller's private successful receipt owns startup
+                # timing; an external caller can only mutate detached copies.
+                bootstrap = controller.bootstrap_evidence
+                startup_seconds = bootstrap["startup_seconds"]
                 self.hold_phase = "bootstrap_hold"
                 self._apply_sync_latency(self.env, startup_seconds)
                 if not math.isclose(
@@ -360,7 +387,7 @@ def make_streaming_episode_type(source, options):
                 fresh = self.env.env._get_observations(force_update=True)
                 self._motion_event(
                     "post_bootstrap_observation",
-                    logical_capture_s=bootstrap["logical_completed_s"],
+                    logical_capture_s=bootstrap["control_origin_s"],
                     observation_sha256=observation_fingerprint(fresh, language),
                 )
 
@@ -407,7 +434,7 @@ def make_streaming_episode_type(source, options):
                 result = controller.run(
                     bootstrap,
                     initial_observation=fresh,
-                    initial_capture_s=bootstrap["logical_completed_s"],
+                    initial_capture_s=bootstrap["control_origin_s"],
                     language=language,
                     step_fn=step,
                     max_steps=options.max_steps,
@@ -467,6 +494,16 @@ def make_streaming_episode_type(source, options):
             if cleanup_errors:
                 status = "error"
                 error_text = "; ".join([error_text or "", *cleanup_errors]).lstrip("; ")
+            startup = (
+                controller.startup_metadata()
+                if controller is not None
+                else {
+                    **startup_configuration(
+                        getattr(options, "startup_release_seconds", None)
+                    ),
+                    **{key: None for key in STARTUP_MEASUREMENTS},
+                }
+            )
             evidence = {
                 "schema": "pir2.libero_dynamic.streaming_audit.v1",
                 **timing,
@@ -533,12 +570,12 @@ def make_streaming_episode_type(source, options):
                 "diagnostics": diagnostic_summary,
                 "language": language,
                 "precision": options.precision,
-                "speed_mps": options.speed_mps,
+                **speed_metadata(options),
                 **timing,
                 "resource_model": "independent_stage_service",
                 "compute_coupling": "serialized_gpu_simulation",
                 "fixed_delay": options.fixed_delay,
-                "startup_seconds": startup_seconds,
+                **startup,
                 "startup_seconds_applied": 0.0
                 if startup_seconds is None
                 else min(rollout, startup_seconds),
@@ -548,9 +585,6 @@ def make_streaming_episode_type(source, options):
                 "setup_counts": setup_counts,
                 "warmup_rounds": options.warmup_requests,
                 "logical_epoch_s": None if controller is None else controller.epoch_s,
-                "control_origin_s": None
-                if bootstrap is None
-                else bootstrap["logical_completed_s"],
                 "video_frame_count": min(videos.frame_counts),
                 "video_sample_attempts": len(self.video_samples),
                 "video_frame_counts": dict(
@@ -598,10 +632,11 @@ def evaluate_streaming(options):
         "upstream": inventory["upstream"],
         "conditions": conditions,
         "protocol": "pir2_dynamic",
+        **speed_metadata(options),
         "phase_contract": inventory["phase_contract"],
         **timing,
         "resource_model": "independent_stage_service",
-        "startup_policy": "paid_moving_world_hold",
+        **startup_configuration(getattr(options, "startup_release_seconds", None)),
         "action_budget_contract": "max_steps counts actual 50ms actions; startup hold adds physics once",
     }
     _write_json(options.output / "evaluation.json", evaluation)

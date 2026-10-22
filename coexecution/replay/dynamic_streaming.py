@@ -32,6 +32,52 @@ def _service_duration(record, expected):
     return duration
 
 
+def _startup_timing(manifest, stream, epoch, service, complete):
+    """Validate an optional common release without changing measured service."""
+    bootstrap = stream.get("bootstrap") or {}
+    evidence = (manifest, stream, bootstrap, stream.get("config") or {})
+    releases = [
+        r["requested_startup_release_seconds"]
+        for r in evidence
+        if r.get("requested_startup_release_seconds") is not None
+    ]
+    release = _number(releases[0]) if releases else None
+    if release is not None and release <= 0:
+        raise ValueError("Streaming common startup release must be positive")
+    total = max(service, release) if release is not None else service
+    met = None if release is None else service <= release
+    expected = {
+        "bootstrap_service_seconds": service,
+        "startup_barrier_seconds": total - service,
+        "startup_seconds": total,
+        "control_origin_s": epoch + total,
+    }
+    for record in evidence:
+        if release is not None:
+            _equal(
+                record.get("requested_startup_release_seconds"),
+                release,
+                "requested startup release",
+            )
+            if record.get("startup_alignment_met") is not met:
+                raise ValueError("Streaming startup alignment result disagrees")
+        elif record.get("startup_alignment_met") is not None:
+            raise ValueError("Streaming unrequested startup cannot claim alignment")
+        for key, value in expected.items():
+            if release is not None or key in record:
+                _equal(record.get(key), value, key)
+    if met is False and (complete or stream.get("actions") or stream.get("requests")):
+        raise ValueError("Streaming late bootstrap cannot start aligned control")
+    if "startup_seconds_applied" in manifest:
+        _equal(
+            manifest["startup_seconds_applied"],
+            min(_number(manifest["rollout_sim_time_s"]), total),
+            "applied startup hold",
+        )
+    _equal(manifest.get("control_origin_s"), epoch + total, "control origin")
+    return total
+
+
 def _wall(record, lane):
     rpc = _stage(record, "RPC", "wall_started_s", "wall_completed_s")
     server = record.get("server_audit", {})
@@ -353,7 +399,11 @@ def _events(
                 raise ValueError("Streaming startup hold has no bootstrap source")
             start = _number(pending["rollout_sim_time_s"])
             _equal(start, bootstrap["start_s"], "startup start")
-            _equal(end, bootstrap["end_s"], "startup end")
+            _equal(
+                end,
+                start + bootstrap.get("startup_seconds", bootstrap["end_s"] - start),
+                "startup end",
+            )
             event = {
                 "kind": "bootstrap_hold",
                 "start_s": start,
@@ -515,6 +565,40 @@ def _events(
     return events
 
 
+def _startup_display_events(events, records, observed_duration):
+    """Derive two display segments from one verified physical hold.
+
+    Frame validation uses the unsplit physical event. Its samples, raw phase and
+    media timestamps stay untouched; this split marks only the recorded service
+    completion inside that hold.
+    """
+    bootstrap = next((r for r in records if r["lane"] == "bootstrap"), None)
+    if not bootstrap or not bootstrap.get("startup_barrier_seconds"):
+        return events
+    displayed = []
+    for event in events:
+        if event["kind"] != "bootstrap_hold" or (
+            event["end_s"] is None and observed_duration < bootstrap["end_s"]
+        ):
+            displayed.append(event)
+            continue
+        common = {**event, "recorded_phase": "bootstrap_hold"}
+        boundary = bootstrap["end_s"]
+        if boundary > event["start_s"]:
+            displayed.append({**common, "end_s": boundary})
+        displayed.append(
+            {
+                **common,
+                "id": event["id"] + "-barrier",
+                "kind": "startup_barrier",
+                "start_s": boundary,
+                "label": "Startup barrier · additional wait for common release",
+                "boundary_source": "recorded_bootstrap_completion",
+            }
+        )
+    return displayed
+
+
 def _partial_physics(audit, manifest, events, episode_id, period):
     if manifest.get("status") == "ok":
         return
@@ -669,12 +753,12 @@ def streaming_episode(root, manifest, config, media, run_id):
         latencies = manifest.get("stage_latencies") or {}
         bootstrap = stream.get("bootstrap")
         if bootstrap or not native:
-            startup = (
+            service = (
                 _number(bootstrap.get("logical_duration_s"))
                 if native
                 else _number(latencies.get("bootstrap_s"))
             )
-            _equal(manifest.get("control_origin_s"), epoch + startup, "control origin")
+            startup = _startup_timing(manifest, stream, epoch, service, complete)
             if native:
                 _equal(manifest.get("startup_seconds"), startup, "native startup")
         elif complete or stream.get("requests") or stream.get("actions"):
@@ -699,6 +783,7 @@ def streaming_episode(root, manifest, config, media, run_id):
     assets, cameras = _media(
         root, manifest, audit, episode_id, duration, events, media, warnings
     )
+    events = _startup_display_events(events, records, duration)
     trace = stream.get("events", [])
     if manifest.get("step_trace"):
         trace_path = _path(root, manifest["step_trace"])
