@@ -155,8 +155,47 @@
       return `每步执行 1 · 承诺 d=${e.delay_ticks_observed?.join(", ") || "—"} · ${horizon} · 预热 ${e.episode_warmup_requests ?? "—"} 轮 / ${e.episode_warmup_recorded ?? "—"} 组 (${e.warmup_rpc_recorded ?? "—"} 次 RPC)`;
     return `K ${e.execution_prefix_steps ?? "—"} / ${horizon} · 校准保留 ${e.calibration.retained_requests ?? "—"} 次 / 校准热身 ${e.calibration.warmup_requests ?? "—"} 次 · 每回合热身 ${e.episode_warmup_recorded ?? "—"} / 配置 ${e.episode_warmup_requests ?? "—"} 次`;
   }
+  function timingLabel(e) {
+    if (e.protocol !== "pir2_dynamic") {
+      const kind =
+        e.calibration.kind === "measured"
+          ? "实测校准延迟"
+          : e.calibration.kind === "counterfactual"
+            ? "反事实固定延迟"
+            : `校准类型 ${e.calibration.kind ?? "未知"}`;
+      const tau = e.calibration.applied_latency_s;
+      return `${kind} · τ ${finite(tau) ? (tau * 1000).toFixed(1) : "—"} ms`;
+    }
+    const policy =
+      e.fixed_delay == null ? "responsive" : `fixed d=${e.fixed_delay}`;
+    if (e.timing_mode === "native") {
+      const range = (lane) => {
+        const values = (e.requests ?? [])
+          .filter((r) => r.lane === lane)
+          .map((r) => r.service_duration_ms)
+          .filter(finite);
+        if (!values.length) return "—";
+        const low = Math.min(...values),
+          high = Math.max(...values);
+        return low === high
+          ? low.toFixed(1)
+          : `${low.toFixed(1)}–${high.toFixed(1)}`;
+      };
+      return `逐请求实测延迟 · S2 ${range("s2")} / S1 ${range("s1")} ms · ${policy}`;
+    }
+    const ms = (v) => (finite(v) ? (v * 1000).toFixed(0) : "—");
+    return `反事实独立通道 · S2 ${ms(e.stage_latencies?.s2_s)} / S1 ${ms(e.stage_latencies?.s1_s)} ms · ${policy}`;
+  }
   function timelineAxis(start, end) {
     return `<div class="task-axis"><span>物理仿真时间 / s</span><div class="task-scale">${Array.from({ length: 6 }, (_, i) => `<span style="left:${i * 20}%">${(start + ((end - start) * i) / 5).toFixed(3)} s</span>`).join("")}</div></div>`;
+  }
+  function stageNfe(request, stage) {
+    const count = request.server_audit?.forward_counts?.dit;
+    return ["DiT server plan", "Bootstrap VLM + Flow4", "Flow DiT"].includes(
+      stage.name,
+    ) && finite(count)
+      ? count
+      : null;
   }
   function phaseLabel(now, episode) {
     if (episode.status && episode.status !== "ok") return "回合失败";
@@ -183,6 +222,8 @@
     wallPanel,
     timelineAxis,
     modelContract,
+    timingLabel,
+    stageNfe,
     observationLabel,
     rpcScope,
     phaseLabel,

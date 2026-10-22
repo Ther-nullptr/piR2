@@ -321,6 +321,8 @@ def test_cli_adds_pir2_without_changing_existing_flow_arguments(
         [
             "evaluate-pir2",
             *common,
+            "--timing-mode",
+            "fixed",
             "--action-port",
             "1001",
             "--vision-port",
@@ -500,17 +502,18 @@ def test_startup_actual_clock_mismatch_stops_before_steady_plan(tmp_path):
     assert env.closed
 
 
-def test_cli_help_declares_counterfactual_independent_lanes_and_serial_rpc(capsys):
+def test_cli_help_declares_native_default_independent_lanes_and_serial_work(capsys):
     from coexecution.libero_dynamic.__main__ import main
 
     with pytest.raises(SystemExit) as caught:
         main(["evaluate-pir2", "--help"])
     assert caught.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "fixed counterfactual latencies" in help_text
-    assert "independent logical S1/S2 lanes" in help_text
-    assert "real RPCs execute serially" in help_text
-    assert "not measured same-GPU concurrent deployment" in help_text
+    assert "native per-request latency by default" in help_text
+    assert "fixed counterfactual timing is an explicit control" in help_text
+    assert "Real GPU/physics work is serial" in help_text
+    assert "independent logical service lanes" in help_text
+    assert "--timing-mode {native,fixed}" in help_text
     for stage in ("bootstrap", "s1", "s2", "recovery"):
         assert f"Fixed counterfactual {stage} service duration in seconds" in help_text
 
@@ -569,3 +572,186 @@ def test_dual_written_frame_keeps_mapping_when_wrist_append_fails(tmp_path):
     assert sample["streams"]["wrist"]["status"] == "error"
     assert result["video_frame_counts"] == {"dual": 4, "wrist": 3}
     assert all(writer.closed for writer in writers)
+
+
+def test_cli_native_default_needs_no_fixed_latency_arguments(tmp_path):
+    import argparse
+
+    from coexecution.libero_dynamic.streaming_evaluation import (
+        add_streaming_arguments,
+        stage_latencies,
+    )
+
+    parser = argparse.ArgumentParser()
+    add_streaming_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--upstream",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "new"),
+            "--expected-checkpoint",
+            str(tmp_path),
+            "--action-port",
+            "1001",
+            "--vision-port",
+            "1002",
+            "--precision",
+            "bf16",
+            "--suite",
+            "libero_spatial",
+            "--speed-mps",
+            ".06",
+        ]
+    )
+    assert args.timing_mode == "native"
+    assert stage_latencies(args) is None
+
+
+@pytest.mark.parametrize(
+    "mode, values, valid",
+    [
+        ("native", (None, None, None, None), True),
+        ("native", (0.1, None, None, None), False),
+        ("fixed", (0.1, 0.05, 0.1, 0.2), True),
+        ("fixed", (0.1, 0.05, 0.1, None), False),
+        ("unknown", (None, None, None, None), False),
+    ],
+)
+def test_timing_mode_rejects_conflicting_or_missing_latency_options(
+    mode, values, valid
+):
+    from coexecution.libero_dynamic.streaming_evaluation import stage_latencies
+
+    options = SimpleNamespace(
+        timing_mode=mode,
+        **{
+            stage + "_latency_seconds": value
+            for stage, value in zip(
+                ("bootstrap", "s1", "s2", "recovery"), values, strict=True
+            )
+        },
+    )
+    if valid:
+        result = stage_latencies(options)
+        assert (result is None) == (mode == "native")
+    else:
+        with pytest.raises(ValueError):
+            stage_latencies(options)
+
+
+def test_native_startup_pays_measured_bootstrap_once_in_physical_world(
+    tmp_path, monkeypatch
+):
+    from coexecution.libero_dynamic import streaming_evaluation as module
+    from tests.contracts.test_dynamic_streaming import native_setup
+
+    source, options, args, item, _, _, env, _ = fixtures(tmp_path)
+    options.timing_mode = "native"
+    options.warmup_requests = 0
+    for name in ("bootstrap", "s1", "s2", "recovery"):
+        setattr(options, name + "_latency_seconds", None)
+    _, rpc, _, _, clock, _ = native_setup(tmp_path, bootstrap=0.137)
+    original = module.StreamingController
+    monkeypatch.setattr(
+        module, "StreamingController", lambda *a, **kw: original(*a, clock=clock, **kw)
+    )
+    result = module.make_streaming_episode_type(source, options)(
+        item, args, rpc=rpc
+    ).run()
+    assert result["status"] == "ok"
+    assert result["steps"] == 3
+    assert result["startup_seconds"] == pytest.approx(0.137)
+    assert result["startup_seconds_applied"] == pytest.approx(0.137)
+    assert result["rollout_sim_time_s"] == pytest.approx(0.287)
+    assert env.sim.x == pytest.approx(0.06 * 2.287)
+    assert result["timing_mode"] == "native"
+    assert result["stage_latencies"] is None
+    audit = json.loads(Path(result["policy_audit"]).read_text())
+    assert audit["bootstrap"]["logical_duration_s"] == result["startup_seconds"]
+    assert audit["streaming"]["startup_seconds"] == result["startup_seconds"]
+    assert result["control_origin_s"] == pytest.approx(1000.137)
+
+
+@pytest.mark.parametrize(
+    "mode, latency_args",
+    [
+        ("native", ["--s1-latency-seconds", ".04"]),
+        ("fixed", ["--s1-latency-seconds", ".04"]),
+    ],
+)
+def test_real_cli_rejects_conflicting_timing_before_loading_runtime(
+    tmp_path, monkeypatch, mode, latency_args
+):
+    from coexecution.libero_dynamic import streaming_evaluation
+    from coexecution.libero_dynamic.__main__ import main
+
+    def must_not_load(*args):
+        pytest.fail("invalid timing must be rejected before accessing upstream")
+
+    monkeypatch.setattr(streaming_evaluation, "prepare_conditions", must_not_load)
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "evaluate-pir2",
+                "--upstream",
+                str(tmp_path),
+                "--output",
+                str(tmp_path / "new"),
+                "--suite",
+                "libero_spatial",
+                "--speed-mps",
+                ".06",
+                "--expected-checkpoint",
+                str(tmp_path),
+                "--action-port",
+                "1001",
+                "--vision-port",
+                "1002",
+                "--precision",
+                "bf16",
+                "--timing-mode",
+                mode,
+                *latency_args,
+            ]
+        )
+    assert caught.value.code == 2
+    assert not (tmp_path / "new").exists()
+
+
+def test_native_failure_before_receipt_does_not_invent_paid_startup(
+    tmp_path, monkeypatch
+):
+    from coexecution.libero_dynamic import streaming_evaluation as module
+    from tests.contracts.test_dynamic_streaming import native_setup
+
+    source, options, args, item, _, _, env, _ = fixtures(tmp_path)
+    options.timing_mode = "native"
+    options.warmup_requests = 0
+    for name in ("bootstrap", "s1", "s2", "recovery"):
+        setattr(options, name + "_latency_seconds", None)
+    _, rpc, endpoints, _, clock, _ = native_setup(tmp_path)
+
+    def fail_bootstrap(endpoint, result):
+        if endpoint == "bootstrap":
+            raise RuntimeError("failed scored bootstrap")
+
+    endpoints[1001].mutate = fail_bootstrap
+    original = module.StreamingController
+    monkeypatch.setattr(
+        module, "StreamingController", lambda *a, **kw: original(*a, clock=clock, **kw)
+    )
+    result = module.make_streaming_episode_type(source, options)(
+        item, args, rpc=rpc
+    ).run()
+    assert result["status"] == "error"
+    assert result["startup_seconds"] is None
+    assert result["control_origin_s"] is None
+    assert result["startup_seconds_applied"] == result["rollout_sim_time_s"] == 0
+    assert env.sim.data.time == pytest.approx(2.0)
+    audit = json.loads(Path(result["policy_audit"]).read_text())
+    assert audit["bootstrap"] is None
+    assert audit["streaming"]["timing_mode"] == "native"
+    assert audit["streaming"]["stage_latencies"] is None
+    assert audit["rpc_records"][-1]["status"] == "error"
+    assert audit["cleanup_errors"] == []

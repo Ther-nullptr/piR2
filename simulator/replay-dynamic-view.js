@@ -52,19 +52,10 @@ window.DynamicReplayView = (() => {
         : e.success === false
           ? "任务未成功"
           : "结果未知";
-  const calibration = (e) =>
-    e.calibration.kind === "counterfactual"
-      ? "反事实固定延迟"
-      : e.calibration.kind === "measured"
-        ? "实测校准延迟"
-        : `校准类型 ${e.calibration.kind ?? "未知"}`;
   const conditionLabel = (e) =>
     `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${fmt(e.speed_mps, 3)} m/s · seed ${e.seed ?? "—"}`;
   const streaming = (e) => e.protocol === "pir2_dynamic";
-  const timingLabel = (e) =>
-    streaming(e)
-      ? `反事实独立通道 · S2 ${fmt(ms(e.stage_latencies?.s2_s), 0)} / S1 ${fmt(ms(e.stage_latencies?.s1_s), 0)} ms · ${e.fixed_delay == null ? "responsive" : `fixed d=${e.fixed_delay}`}`
-      : `${calibration(e)} · τ ${fmt(ms(e.calibration.applied_latency_s), 1)} ms`;
+  const timingLabel = D.timingLabel;
   const runLabel = ({ run, episode: e }) =>
     `${run.label} · ${timingLabel(e)} · ${streaming(e) ? "每步执行1" : `K${e.execution_prefix_steps ?? "?"}`}`;
   const name = (run) =>
@@ -148,7 +139,7 @@ window.DynamicReplayView = (() => {
       <select class="dynamic-run" data-index="${i}" aria-label="${esc(name(run))} 动态配置"></select><button class="dynamic-compare" data-index="${i}">${state.rows[i].comparison ? "移除对照列" : "添加同协议对照"}</button>
       <div class="media-stage"><span class="media-message">等待实际物理帧</span><div class="frame-meta"></div></div>
       <div class="card-status">${esc(result(e))}</div><p class="dynamic-language">${esc(e.language ?? "任务语言未记录")}</p>
-      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(timingLabel(e))} · ${esc(e.timing_rule ?? e.timing_domain ?? "未知")}${streaming(e) ? "<br>启动等待 " + fmt(ms(e.stage_latencies?.bootstrap_s), 0) + " ms；真实 GPU RPC 串行计算，逻辑通道独立服务。" : ""}<br>${esc(D.modelContract(e))}<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>
+      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(timingLabel(e))} · ${esc(e.timing_rule ?? e.timing_domain ?? "未知")}${streaming(e) ? "<br>启动等待 " + fmt(ms(e.startup_seconds ?? e.stage_latencies?.bootstrap_s), 1) + " ms；真实 GPU RPC 串行计算，逻辑通道独立服务。" : ""}<br>${esc(D.modelContract(e))}<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>
       <a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
         )
         .join("") || '<p class="loading">此条件没有记录。</p>';
@@ -280,10 +271,10 @@ window.DynamicReplayView = (() => {
         const stageMarkup = p.stages
           .map(
             (s, i) =>
-              `<div class="dynamic-wall-stage"><span>${esc(s.name)}${i === 1 && r.lane !== "s2" ? ` · ${r.server_audit?.forward_counts?.dit ?? "?"} NFE` : ""}</span><div class="dynamic-wall-rail">${finite(s.start_ms) && finite(s.end_ms) && p.end_ms > 0 ? `<span style="left:${(100 * s.start_ms) / p.end_ms}%;width:${(100 * (s.end_ms - s.start_ms)) / p.end_ms}%;background:${i ? "#766eab" : color(run.precision)}"></span>` : finite(s.duration_ms) ? "仅有实测时长；无绝对边界" : "未记录"}</div><strong>${fmt(s.duration_ms, 2)} ms</strong></div>`,
+              `<div class="dynamic-wall-stage"><span>${esc(s.name)}${D.stageNfe(r, s) !== null ? ` · ${D.stageNfe(r, s)} NFE` : ""}</span><div class="dynamic-wall-rail">${finite(s.start_ms) && finite(s.end_ms) && p.end_ms > 0 ? `<span style="left:${(100 * s.start_ms) / p.end_ms}%;width:${(100 * (s.end_ms - s.start_ms)) / p.end_ms}%;background:${i ? "#766eab" : color(run.precision)}"></span>` : finite(s.duration_ms) ? "仅有实测时长；无绝对边界" : "未记录"}</div><strong>${fmt(s.duration_ms, 2)} ms</strong></div>`,
           )
           .join("");
-        return `<section class="dynamic-wall" data-request-id="${esc(r.id)}"><h3>${esc(name(run))} · request ${r.request_sequence} · ${streaming(e) ? esc(r.lane.toUpperCase()) : "Fresh VLM → Flow DiT"}</h3><p>${esc(D.observationLabel(r))} · sim ${fmt(r.sim_time_s, 3)} s · RPC ${fmt(r.rpc_duration_ms, 2)} ms；${esc(timingLabel(e))}</p>${stageMarkup}${streaming(e) ? `<p>依赖 ${r.parent_request_id ? esc(e.requests.find((v) => v.id === r.parent_request_id)?.lane === "bootstrap" ? "Bootstrap feature 0" : `S2 feature ${r.feature_sequence}`) : "无上游请求"} · ${esc(r.normal_or_recovery ?? "")} · valid [${r.server_audit?.valid_start_tick ?? "—"}, ${r.server_audit?.valid_end_tick ?? "—"}) · 入队 ${r.publication?.installed_slots ?? "—"} / 过期 ${r.publication?.expired_slots ?? "—"} / 保护 ${r.publication?.protected_slots ?? "—"}<br>特征 AoI ${fmt(ms(r.feature_age_s), 1)} ms · 请求 delay ${r.delay_ticks ?? "—"} ticks；逻辑服务时长 ${fmt(ms(r.logical_duration_s), 1)} ms。RPC / server wall 与逻辑时钟分别记录。</p>` : ""}<p class="small-note">独立 wall 轴：0–${fmt(p.end_ms, 2)} ms；原点 monotonic ${fmt(p.origin_s, 6)} s。${esc(streaming(e) ? D.rpcScope(e) : (r.server_audit?.timing_scope ?? "测量边界未记录"))}</p><table><thead><tr><th>Stage</th><th>Wall start / s</th><th>Wall end / s</th></tr></thead><tbody>${p.stages.map((s) => `<tr><td>${esc(s.name)}</td><td>${fmt(s.wall_started_s, 6)}</td><td>${fmt(s.wall_completed_s, 6)}</td></tr>`).join("")}</tbody></table></section>`;
+        return `<section class="dynamic-wall" data-request-id="${esc(r.id)}"><h3>${esc(name(run))} · request ${r.request_sequence} · ${streaming(e) ? esc(r.lane.toUpperCase()) : "Fresh VLM → Flow DiT"}</h3><p>${esc(D.observationLabel(r))} · sim ${fmt(r.sim_time_s, 3)} s · RPC ${fmt(r.rpc_duration_ms, 2)} ms；${esc(timingLabel(e))}</p>${stageMarkup}${streaming(e) ? `<p>依赖 ${r.parent_request_id ? esc(e.requests.find((v) => v.id === r.parent_request_id)?.lane === "bootstrap" ? "Bootstrap feature 0" : `S2 feature ${r.feature_sequence}`) : "无上游请求"} · ${esc(r.normal_or_recovery ?? "")} · valid [${r.server_audit?.valid_start_tick ?? "—"}, ${r.server_audit?.valid_end_tick ?? "—"}) · 入队 ${r.publication?.installed_slots ?? "—"} / 过期 ${r.publication?.expired_slots ?? "—"} / 保护 ${r.publication?.protected_slots ?? "—"}<br>特征 AoI ${fmt(ms(r.feature_age_s), 1)} ms · 请求 delay ${r.delay_ticks ?? "—"} ticks；${e.timing_mode === "native" ? "本次完整调用实测" : "逻辑服务时长"} ${fmt(ms(r.logical_duration_s), 1)} ms。RPC / server wall 与逻辑时钟分别记录。</p>` : ""}<p class="small-note">独立 wall 轴：0–${fmt(p.end_ms, 2)} ms；原点 monotonic ${fmt(p.origin_s, 6)} s。${esc(streaming(e) ? D.rpcScope(e) : (r.server_audit?.timing_scope ?? "测量边界未记录"))}</p><table><thead><tr><th>Stage</th><th>Wall start / s</th><th>Wall end / s</th></tr></thead><tbody>${p.stages.map((s) => `<tr><td>${esc(s.name)}</td><td>${fmt(s.wall_started_s, 6)}</td><td>${fmt(s.wall_completed_s, 6)}</td></tr>`).join("")}</tbody></table></section>`;
       })
       .join("");
   }

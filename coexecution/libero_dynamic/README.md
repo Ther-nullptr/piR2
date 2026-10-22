@@ -112,18 +112,20 @@ python -m coexecution.libero_dynamic evaluate-pir2 \
   --suite libero_spatial --task-ids 0 3 --levels l1 --traj-indices 0 \
   --speed-mps 0.03 --action-port 19180 --vision-port 19182 \
   --expected-checkpoint "$LOCAL_PIR2_SPATIAL_CHECKPOINT" --precision bf16 \
-  --bootstrap-latency-seconds 0.20 --s1-latency-seconds 0.04 \
-  --s2-latency-seconds 0.15 --recovery-latency-seconds 0.20 \
-  --max-steps 600
+  --timing-mode native --max-steps 600
 ```
 
-上述四个延迟是显式的 **counterfactual 算法控制参数**，示例值不是硬件实测。S1、S2 在逻辑时间上有独立服务通道，真实 CUDA 请求与仿真在宿主控制线程依次执行；模型结果在所声明的逻辑完成时刻才发布。结果标记 `counterfactual_discrete_event`、`independent_stage_service` 和 `serialized_gpu_simulation`，实际 RPC/server wall 时间另存，不能据此宣称同卡并发部署延迟。
+`--timing-mode native` 是默认模式：每次bootstrap、S2、S1的完整适配器调用分别实测，包含输入准备、RPC和返回处理；该次耗时原值直接决定该请求的逻辑完成时间。两种精度各用自己的逐请求耗时与波动，不取共同常数或均值，不添加最低服务时长。`service_wall` 保存独立的monotonic起止时间、耗时及边界，原始RPC/server时间另存。结果标记 `measured_per_request` 与 `measured_request_discrete_event`。
 
-πR² 的量化对照仍加载同一已有πR² checkpoint。paired服务设置 `--inference-precision w8a8 --quantization-scope all`，评测设置 `--precision w8a8`，并使用独立输出目录。先保持BF16/W8A8的四个阶段延迟、承诺策略、场景和初态一致，比较量化后的动态控制质量；阶段速度收益需要分别校准，不能沿用默认Flow4的整轮延迟。RPC身份中的 `inference_optimization.coverage` 记录实际转换的VLM和动作侧模块。πR²可以使用分DiT CUDA Graph；整段 `--action-cuda-graph` 和 `--group-conditioning` 属于Flow路径，服务会拒绝将它们用于πR²。
+实际CUDA调用与物理计算仍分阶段串行，S1/S2具有独立逻辑服务通道；这是逐请求实测时长驱动的事件实验，资源模型为 `independent_stage_service`、计算方式为 `serialized_gpu_simulation`。它保留每次真实调用时长，但不等于同卡真实墙钟并发部署。50ms是LIBERO动作的物理步长，模型请求不会被拉长或缩短到50ms。
 
-初始化沿用同一任务、轨迹、速度、seed0/init0 和40个真实 pre-policy 步。默认每场景预热8轮；responsive 调度逐轮覆盖 d=1..5，`--fixed-delay d` 只预热该 d。每次预热执行真实 bootstrap→S2→S1，世界时间保持不变，记录均标为 warmup。`--warmup-requests 0` 可用于明确不预热的诊断。正式开始时重新 bootstrap/reset seed；启动的真实 VLM1/DiT4 对应 `bootstrap-latency-seconds`，只冻结机器人并推进移动世界，随后强制读取新状态。bootstrap 图像保留原 capture，不能将它改写为启动等待后的新时间。
+历史固定延迟控制仍通过显式 `--timing-mode fixed` 使用，并且必须给齐 `--bootstrap-latency-seconds`、`--s1-latency-seconds`、`--s2-latency-seconds`、`--recovery-latency-seconds`。该模式标记 `fixed_counterfactual` / `counterfactual_discrete_event`；native模式拒绝这些固定延迟参数。
 
-之后每50ms执行一个真实动作，物体持续运动；S1/S2 等待与这些物理步重叠，不再额外增加 hold。S1 使用已发布的 S2 特征和当前状态，正常1NFE，全 H40 缓冲失效时恢复5NFE；恢复使用独立的 `recovery-latency-seconds`。每次先承诺 `[r,r+d)` 前缀，输出只属于原始 `[r+d,r+2d)`；过期动作原位丢弃，已承诺动作受保护，队列耗尽执行零位移并保持夹爪的 fallback，仍推进真实物理。
+πR² 的量化对照仍加载同一已有πR² checkpoint。paired服务设置 `--inference-precision w8a8 --quantization-scope all`，评测设置 `--precision w8a8`，并使用独立输出目录。默认原生对照保持承诺策略、场景和初态一致，每种精度使用各自真实请求耗时；启动等待也各自实测，因此启动后世界状态可以不同，并会记录新的观测指纹。需要单独隔离动作数值变化时才显式采用fixed控制。不能沿用默认Flow4的整轮延迟代替πR²阶段耗时。RPC身份中的 `inference_optimization.coverage` 记录实际转换的VLM和动作侧模块。πR²可以使用分DiT CUDA Graph；整段 `--action-cuda-graph` 和 `--group-conditioning` 属于Flow路径，服务会拒绝将它们用于πR²。
+
+初始化沿用同一任务、轨迹、速度、seed0/init0 和40个真实 pre-policy 步。默认每场景预热8轮；responsive 调度逐轮覆盖 d=1..5，`--fixed-delay d` 只预热该 d。每次预热执行真实 bootstrap→S2→S1，世界时间保持不变，记录均标为 warmup。`--warmup-requests 0` 可用于明确不预热的诊断。正式开始时重新 bootstrap/reset seed；启动的真实 VLM1/DiT4 按该次实测耗时（fixed模式按指定参数）只冻结机器人并推进移动世界，随后强制读取新状态。bootstrap 图像保留原 capture，不能将它改写为启动等待后的新时间。
+
+之后每50ms执行一个真实动作，物体持续运动；S1/S2 等待与这些物理步重叠，不再额外增加 hold。S1 使用已发布的 S2 特征和当前状态，正常1NFE，全 H40 缓冲失效时恢复5NFE；native模式直接测量本次恢复调用，fixed模式才使用独立的 `recovery-latency-seconds`。每次先承诺 `[r,r+d)` 前缀，输出只属于原始 `[r+d,r+2d)`；过期动作原位丢弃，已承诺动作受保护，队列耗尽执行零位移并保持夹爪的 fallback，仍推进真实物理。
 
 S2 只有一个在途请求和一个可覆盖的 waiting frame。恰好在控制边界完成时，先发布缓存，再提供该边界的新图像并开始下次请求；例如150ms S2 在50ms控制周期下取 tick0、3、6。中途完成只能取之前已发布的历史帧，不能看宿主已计算但逻辑上尚未到达的下一帧。结束边界不会再启动新请求，未完成结果保留为 unapplied。
 
