@@ -406,3 +406,20 @@ def test_timeout_socket_replacement_closes_old_socket_before_losing_reference(
     assert not client.socket.closed
     client.close()
     assert client.socket.closed
+
+
+@pytest.mark.parametrize("prefix", [1, 2])
+def test_short_prefix_preserves_native_h16_and_full_flow4(prefix):
+    policy, clients, _ = create_policy(chunk_steps=prefix)
+    try:
+        result = policy.get_action_chunk({"frame": 11}, "pick cup")
+        assert result.shape == (prefix, 7)
+        record = policy.records[-1]
+        assert record["predicted_horizon"] == 40
+        assert record["decoded_horizon"] == 16
+        assert record["model_actions"].shape == (16, 7)
+        assert record["execution_prefix_steps"] == prefix
+        assert record["server_audit"]["forward_counts"] == {"vlm": 1, "dit": 4}
+        assert clients[0].calls[-1][0] == "synchronous_plan"
+    finally:
+        policy.close()
