@@ -1,5 +1,6 @@
 """Dynamic evaluation contracts; no simulator or neural model is constructed."""
 
+import argparse
 import copy
 import json
 import threading
@@ -732,7 +733,9 @@ class FakePolicy:
         self.calls.append(("close", threading.get_ident()))
 
 
-def fake_episode_inputs(tmp_path, *, fail=False, fixture=False):
+def fake_episode_inputs(
+    tmp_path, *, fail=False, fixture=False, native=False, chunk_steps=8, latencies=()
+):
     class Base:
         def __init__(self, item, args, worker_slot=0):
             self.item, self.args = item, args
@@ -751,14 +754,31 @@ def fake_episode_inputs(tmp_path, *, fail=False, fixture=False):
             )
 
         def _build_controller(self, policy, language):
+            remaining = iter(latencies)
+
+            def tick(packet, actions):
+                seconds = next(remaining)
+                policy.get_action_chunk(packet.obs, language)
+                return [
+                    SimpleNamespace(
+                        chunk_id=len(policy.records),
+                        obs_step_idx=packet.step_idx,
+                        policy_elapsed_s=seconds,
+                        metadata={"sim_latency_s": round(seconds, 6)},
+                    )
+                ]
+
             controller = SimpleNamespace(
                 executor=ThreadPoolExecutor(max_workers=1),
                 policy=policy,
                 future=None,
-                latency_sampler=SimpleNamespace(fixed_seconds=0, source="fixed"),
+                latency_sampler=SimpleNamespace(
+                    fixed_seconds=None if native else 0,
+                    source="measured_wallclock" if native else "fixed",
+                ),
                 reset=policy.reset,
                 snapshot_request_observation=lambda packet, actions: dict(packet.obs),
-                tick=lambda packet, actions: [],
+                tick=tick if latencies else lambda packet, actions: [],
             )
             return controller
 
@@ -795,15 +815,20 @@ def fake_episode_inputs(tmp_path, *, fail=False, fixture=False):
         calibration_requests=3,
         calibration_max_p95_ratio=1000,
         rpc_timeout_seconds=2,
-        timing_rule="paper_quantized_sync",
+        timing_rule="release_continuous_sync" if native else "paper_quantized_sync",
+        native_latency=native,
         calibrate=False,
         save_videos=True,
         video_fps=20,
     )
-    session = {"calibration": ev.counterfactual_latency(0.06), "binding": None}
+    session = {
+        "calibration": None if native else ev.counterfactual_latency(0.06),
+        "binding": None,
+    }
     item = {"item_id": "item0", "suite": "libero_spatial", "level": "l1"}
     args = SimpleNamespace(calibrated_latency_seconds=0)
     policy = FakePolicy(tmp_path, fail=fail)
+    policy.chunk_steps = chunk_steps
     episode = ev.make_episode_type(source, options, session)(item, args, policy=policy)
     env = SimpleNamespace(sim=SimpleNamespace(data=SimpleNamespace(time=3.0)))
     if fixture:
@@ -953,3 +978,162 @@ def test_fixture_episode_hold_and_action_use_real_clocks_and_correct_source_vide
     assert episode.rollout_sim_time_s == pytest.approx(latency + 0.10)
     assert len(episode.fixture_timing.records) == 1
     assert episode.latency_backend == "owned_fixture_exact_hold"
+
+
+def native_options(tmp_path, *extra):
+    parser = argparse.ArgumentParser()
+    ev.add_evaluate_arguments(parser)
+    return parser.parse_args(
+        [
+            "--upstream",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "out"),
+            "--suite",
+            "libero_spatial",
+            "--expected-checkpoint",
+            str(tmp_path),
+            "--precision",
+            "bf16",
+            "--model-port",
+            "19170",
+            "--speed-mps",
+            "0.06",
+            "--native-latency",
+            *extra,
+        ]
+    )
+
+
+def test_native_cli_selects_measured_source_without_fixed_or_calibration(tmp_path):
+    options = native_options(tmp_path)
+    ev._validate_options(options)
+    assert options.native_latency and not options.calibrate
+    assert options.calibration is None and options.latency_seconds is None
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir")
+    source = SimpleNamespace(
+        runner=SimpleNamespace(build_parser=lambda: parser),
+        legacy=SimpleNamespace(apply_reviewed_old_physics_profile=lambda args: None),
+    )
+    args = ev._source_arguments(source, options)
+    assert args.latency_source == "measured_wallclock"
+    assert args.calibrated_latency_seconds is None
+    assert args.control_mode == "sync_hold"
+
+
+@pytest.mark.parametrize(
+    "other",
+    [["--calibrate"], ["--calibration", "old.json"], ["--latency-seconds", "0.05"]],
+)
+def test_native_cli_rejects_fixed_or_calibrated_wait(tmp_path, other):
+    with pytest.raises(SystemExit):
+        native_options(tmp_path, *other)
+
+
+def test_native_cli_rejects_control_quantized_wait(tmp_path):
+    options = native_options(tmp_path, "--timing-rule", "paper_quantized_sync")
+    with pytest.raises(ValueError, match="native.*continuous|Native.*continuous"):
+        ev._validate_options(options)
+
+
+@pytest.mark.parametrize("chunk_steps", [1, 2, 8])
+def test_native_requests_apply_distinct_unrounded_holds_after_unpaid_warmup(
+    tmp_path, chunk_steps
+):
+    latencies = [0.03123456789, 0.08345678912]
+    episode, policy, session = fake_episode_inputs(
+        tmp_path,
+        fixture=True,
+        native=True,
+        chunk_steps=chunk_steps,
+        latencies=latencies,
+    )
+    initial_physics = episode.env.sim.data.time
+    controller = episode._build_controller(policy, "pick cup")
+    try:
+        assert session["calibration"] is None
+        assert not (tmp_path / "calibration.json").exists()
+        assert episode.applied_latency_s is None
+        assert controller.latency_sampler.fixed_seconds is None
+        assert [record["phase"] for record in policy.records] == ["warmup", "warmup"]
+        assert episode.rollout_sim_time_s == 0
+        assert episode.env.sim.data.time == initial_physics
+        controller.reset()
+        for index, duration in enumerate(latencies):
+            packet = SimpleNamespace(
+                step_idx=index * chunk_steps,
+                sim_time_s=episode.rollout_sim_time_s,
+                obs=episode.initial_observation,
+            )
+            ready = controller.tick(packet, None)
+            assert len(ready) == 1
+            metadata = ready[0].metadata
+            assert metadata["sim_latency_s"] == duration
+            assert metadata["applied_latency_s"] == duration
+            assert metadata["latency_kind"] == "measured_per_request"
+            assert metadata["raw_calibration_latency_s"] is None
+            assert metadata["physics_time_quantized_to_control_steps"] is False
+            assert policy.records[-1]["controller_policy_elapsed_s"] == duration
+            assert policy.records[-1]["phase"] == "scored"
+            episode._apply_sync_latency(episode.env, metadata["sim_latency_s"])
+            for _ in range(chunk_steps):
+                episode._step_env(episode.env, np.zeros(7))
+        assert episode.rollout_sim_time_s == pytest.approx(
+            sum(latencies) + 0.1 * chunk_steps
+        )
+        holds = [e for e in episode.motion_events if e["kind"] == "hold_completed"]
+        assert [h["applied_latency_s"] for h in holds] == pytest.approx(latencies)
+        assert holds[1]["rollout_sim_time_s"] == pytest.approx(
+            sum(latencies) + 0.05 * chunk_steps
+        )
+    finally:
+        controller.close()
+    assert policy.calls[-1][0] == "close"
+
+
+def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch):
+    options = native_options(tmp_path, "--no-save-videos")
+    conditions = [{"item_id": "item0", "condition_id": "condition0"}]
+    monkeypatch.setattr(
+        ev,
+        "prepare_conditions",
+        lambda opts: ({"upstream": {}, "phase_contract": {}}, conditions),
+    )
+    monkeypatch.setattr(ev, "_source_arguments", lambda source, opts: SimpleNamespace())
+    monkeypatch.setattr(ev, "_effective_items", lambda *args: conditions)
+
+    def summary(output, results):
+        ev._write_json(output / "summary.json", {"successes": len(results)})
+
+    monkeypatch.setattr(
+        ev,
+        "_load_runtime",
+        lambda upstream: SimpleNamespace(runner=SimpleNamespace(write_summary=summary)),
+    )
+
+    class Episode:
+        def __init__(self, item, args, *, policy):
+            pass
+
+        def run(self):
+            return {
+                "status": "ok",
+                "success": True,
+                "steps": 1,
+                "manifest": str(options.output / "item.json"),
+            }
+
+    monkeypatch.setattr(ev, "make_episode_type", lambda *args: Episode)
+    result = ev.evaluate_default(options)
+    assert result["latency_kind"] == "measured_per_request"
+    assert result["raw_calibration_latency_s"] is None
+    assert result["applied_latency_s"] is None
+    assert result["calibration_kind"] is None
+    assert not (options.output / "calibration.json").exists()
+    assert (
+        json.loads((options.output / "evaluation.json").read_text())[
+            "calibration_policy"
+        ]
+        is None
+    )

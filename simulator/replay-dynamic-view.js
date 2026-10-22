@@ -274,7 +274,7 @@ window.DynamicReplayView = (() => {
               `<div class="dynamic-wall-stage"><span>${esc(s.name)}${D.stageNfe(r, s) !== null ? ` · ${D.stageNfe(r, s)} NFE` : ""}</span><div class="dynamic-wall-rail">${finite(s.start_ms) && finite(s.end_ms) && p.end_ms > 0 ? `<span style="left:${(100 * s.start_ms) / p.end_ms}%;width:${(100 * (s.end_ms - s.start_ms)) / p.end_ms}%;background:${i ? "#766eab" : color(run.precision)}"></span>` : finite(s.duration_ms) ? "仅有实测时长；无绝对边界" : "未记录"}</div><strong>${fmt(s.duration_ms, 2)} ms</strong></div>`,
           )
           .join("");
-        return `<section class="dynamic-wall" data-request-id="${esc(r.id)}"><h3>${esc(name(run))} · request ${r.request_sequence} · ${streaming(e) ? esc(r.lane.toUpperCase()) : "Fresh VLM → Flow DiT"}</h3><p>${esc(D.observationLabel(r))} · sim ${fmt(r.sim_time_s, 3)} s · RPC ${fmt(r.rpc_duration_ms, 2)} ms；${esc(timingLabel(e))}</p>${stageMarkup}${streaming(e) ? `<p>依赖 ${r.parent_request_id ? esc(e.requests.find((v) => v.id === r.parent_request_id)?.lane === "bootstrap" ? "Bootstrap feature 0" : `S2 feature ${r.feature_sequence}`) : "无上游请求"} · ${esc(r.normal_or_recovery ?? "")} · valid [${r.server_audit?.valid_start_tick ?? "—"}, ${r.server_audit?.valid_end_tick ?? "—"}) · 入队 ${r.publication?.installed_slots ?? "—"} / 过期 ${r.publication?.expired_slots ?? "—"} / 保护 ${r.publication?.protected_slots ?? "—"}<br>特征 AoI ${fmt(ms(r.feature_age_s), 1)} ms · 请求 delay ${r.delay_ticks ?? "—"} ticks；${e.timing_mode === "native" ? "本次完整调用实测" : "逻辑服务时长"} ${fmt(ms(r.logical_duration_s), 1)} ms。RPC / server wall 与逻辑时钟分别记录。</p>` : ""}<p class="small-note">独立 wall 轴：0–${fmt(p.end_ms, 2)} ms；原点 monotonic ${fmt(p.origin_s, 6)} s。${esc(streaming(e) ? D.rpcScope(e) : (r.server_audit?.timing_scope ?? "测量边界未记录"))}</p><table><thead><tr><th>Stage</th><th>Wall start / s</th><th>Wall end / s</th></tr></thead><tbody>${p.stages.map((s) => `<tr><td>${esc(s.name)}</td><td>${fmt(s.wall_started_s, 6)}</td><td>${fmt(s.wall_completed_s, 6)}</td></tr>`).join("")}</tbody></table></section>`;
+        return `<section class="dynamic-wall" data-request-id="${esc(r.id)}"><h3>${esc(name(run))} · request ${r.request_sequence} · ${streaming(e) ? esc(r.lane.toUpperCase()) : "Fresh VLM → Flow DiT"}</h3><p>${esc(D.observationLabel(r))} · sim ${fmt(r.sim_time_s, 3)} s · RPC ${fmt(r.rpc_duration_ms, 2)} ms；${esc(timingLabel(e))}</p>${stageMarkup}${streaming(e) ? `<p>依赖 ${r.parent_request_id ? esc(e.requests.find((v) => v.id === r.parent_request_id)?.lane === "bootstrap" ? "Bootstrap feature 0" : `S2 feature ${r.feature_sequence}`) : "无上游请求"} · ${esc(r.normal_or_recovery ?? "")} · valid [${r.server_audit?.valid_start_tick ?? "—"}, ${r.server_audit?.valid_end_tick ?? "—"}) · 入队 ${r.publication?.installed_slots ?? "—"} / 过期 ${r.publication?.expired_slots ?? "—"} / 保护 ${r.publication?.protected_slots ?? "—"}<br>特征 AoI ${fmt(ms(r.feature_age_s), 1)} ms · 请求 delay ${r.delay_ticks ?? "—"} ticks；${e.timing_mode === "native" ? "本次完整调用实测" : "逻辑服务时长"} ${fmt(ms(r.logical_duration_s), 1)} ms。RPC / server wall 与逻辑时钟分别记录。</p>` : ""}<p class="small-note">独立 wall 轴：0–${fmt(p.end_ms, 2)} ms；原点 monotonic ${fmt(p.origin_s, 6)} s。${esc(streaming(e) || e.timing_mode === "native" ? D.rpcScope(e) : (r.server_audit?.timing_scope ?? "测量边界未记录"))}</p><table><thead><tr><th>Stage</th><th>Wall start / s</th><th>Wall end / s</th></tr></thead><tbody>${p.stages.map((s) => `<tr><td>${esc(s.name)}</td><td>${fmt(s.wall_started_s, 6)}</td><td>${fmt(s.wall_completed_s, 6)}</td></tr>`).join("")}</tbody></table></section>`;
       })
       .join("");
   }
@@ -411,7 +411,7 @@ window.DynamicReplayView = (() => {
       "image",
     );
     $("evidence-note").textContent =
-      "LIBERO-Dynamic：主时间轴采用物理仿真时间，包含推理等待期间目标物体的运动。模型使用本项目已有 GR00T 权重。Flow4 与 πR² 分列；πR² 的独立 S2/S1 通道采用反事实延迟，真实 GPU RPC 串行计算。实测耗时在独立 wall 轴展示。";
+      "LIBERO-Dynamic：主时间轴采用物理仿真时间，包含推理等待期间目标物体的运动。模型使用本项目已有 GR00T 权重。各配置注明逐请求实测或固定延迟；Flow4 每次等待后执行 K 步，πR² 按 S2/S1 逻辑通道调度。实际 GPU RPC 串行计算，测量边界在独立 wall 面板展示。";
     $("timeline-note").textContent =
       "Hold 是应用到物理世界的 τ；执行动作按真实物理边界显示。视频逐帧依照 sample_sim_time_s 映射，60 fps 视频与 20 Hz 控制分别计数。πR² 首次启动等待付费，随后动作每步推进；点击 S1 关联 S2，点击动作关联实际生产请求；高亮只表示记录中的依赖。";
     document.querySelector(".timeline-section h2").textContent =
@@ -419,7 +419,7 @@ window.DynamicReplayView = (() => {
     $("curve-title").textContent = "真实 VLM → DiT · 独立 Wall 时间";
     $("projection-title").textContent = "移动目标 · 实测物理位姿";
     $("curve-note").textContent =
-      "RPC 为实际客户端往返；server 区间按记录边界展示，未提供绝对边界时只显示时长。实际模型耗时与逻辑场景 τ 分开，不按比例映射。";
+      "RPC 为实际客户端往返；server 区间按记录边界展示，未提供绝对边界时只显示时长。原生 Flow4 的完整策略调用含结果规范化，其逐请求耗时直接决定该次 Hold；固定延迟配置另行标注，绝对 wall 时间不与物理时间混算。";
     for (const id of ["sample", "precision"])
       $(id).addEventListener("change", configure);
     for (const id of ["camera", "window"])

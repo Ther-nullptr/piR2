@@ -145,6 +145,8 @@
         : `观测 action step ${r.source_tick ?? "—"}`;
   }
   function rpcScope(e) {
+    if (e.protocol !== "pir2_dynamic" && e.timing_mode === "native")
+      return "完整策略调用包含输入准备、RPC、输出处理及 NumPy 结果规范化；完整调用只有实测时长，RPC/server 使用各自绝对边界";
     return e.protocol === "pir2_dynamic"
       ? "RPC端点调用 / 含序列化，不含客户端预处理"
       : "RPC与server计时以记录边界为准";
@@ -153,10 +155,21 @@
     const horizon = `decoded ${e.decoded_horizon ?? "—"} / predicted ${e.predicted_horizon ?? "—"}`;
     if (e.protocol === "pir2_dynamic")
       return `每步执行 1 · 承诺 d=${e.delay_ticks_observed?.join(", ") || "—"} · ${horizon} · 预热 ${e.episode_warmup_requests ?? "—"} 轮 / ${e.episode_warmup_recorded ?? "—"} 组 (${e.warmup_rpc_recorded ?? "—"} 次 RPC)`;
+    if (e.timing_mode === "native")
+      return `K ${e.execution_prefix_steps ?? "—"} / ${horizon} · 每回合热身 ${e.episode_warmup_recorded ?? "—"} / 配置 ${e.episode_warmup_requests ?? "—"} 次 · 每次完整 Flow4 调用独立计时`;
     return `K ${e.execution_prefix_steps ?? "—"} / ${horizon} · 校准保留 ${e.calibration.retained_requests ?? "—"} 次 / 校准热身 ${e.calibration.warmup_requests ?? "—"} 次 · 每回合热身 ${e.episode_warmup_recorded ?? "—"} / 配置 ${e.episode_warmup_requests ?? "—"} 次`;
   }
   function timingLabel(e) {
     if (e.protocol !== "pir2_dynamic") {
+      if (e.timing_mode === "native") {
+        const values = (e.requests ?? [])
+          .map((r) => r.service_duration_ms)
+          .filter(finite);
+        const range = values.length
+          ? `${Math.min(...values).toFixed(1)}–${Math.max(...values).toFixed(1)}`
+          : "—";
+        return `逐请求实测延迟 · 完整 Flow4 ${range} ms · K ${e.execution_prefix_steps ?? "—"}`;
+      }
       const kind =
         e.calibration.kind === "measured"
           ? "实测校准延迟"

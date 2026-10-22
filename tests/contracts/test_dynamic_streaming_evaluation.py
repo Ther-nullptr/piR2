@@ -755,3 +755,67 @@ def test_native_failure_before_receipt_does_not_invent_paid_startup(
     assert audit["streaming"]["stage_latencies"] is None
     assert audit["rpc_records"][-1]["status"] == "error"
     assert audit["cleanup_errors"] == []
+
+
+@pytest.mark.parametrize("timing_mode", ["native", "fixed"])
+def test_streaming_cli_remains_compatible_with_shared_source_arguments(
+    tmp_path, timing_mode
+):
+    import argparse
+    import copy
+
+    from coexecution.libero_dynamic.evaluation import _source_arguments
+    from coexecution.libero_dynamic.streaming_evaluation import (
+        add_streaming_arguments,
+        validate_options,
+    )
+
+    parser = argparse.ArgumentParser()
+    add_streaming_arguments(parser)
+    argv = [
+        "--upstream",
+        str(tmp_path),
+        "--output",
+        str(tmp_path / "out"),
+        "--expected-checkpoint",
+        str(tmp_path),
+        "--suite",
+        "libero_spatial",
+        "--precision",
+        "bf16",
+        "--action-port",
+        "1001",
+        "--vision-port",
+        "1002",
+        "--speed-mps",
+        "0.06",
+        "--timing-mode",
+        timing_mode,
+    ]
+    if timing_mode == "fixed":
+        for stage, seconds in [
+            ("bootstrap", "0.2"),
+            ("s1", "0.04"),
+            ("s2", "0.15"),
+            ("recovery", "0.2"),
+        ]:
+            argv.extend([f"--{stage}-latency-seconds", seconds])
+    options = parser.parse_args(argv)
+    validate_options(options)
+    assert not hasattr(options, "native_latency")
+    source_options = copy.copy(options)
+    source_options.chunk_steps = 1  # Same adapter used by evaluate_streaming.
+    source_parser = argparse.ArgumentParser()
+    source_parser.add_argument("--output-dir")
+    source = SimpleNamespace(
+        runner=SimpleNamespace(build_parser=lambda: source_parser),
+        legacy=SimpleNamespace(apply_reviewed_old_physics_profile=lambda args: None),
+    )
+    runtime_args = _source_arguments(source, source_options)
+    assert runtime_args.replan_steps == 1
+    # StreamingController owns per-stage timing; the shared upstream setup has
+    # no Flow request sampler to activate, regardless of native/fixed piR2 mode.
+    assert runtime_args.latency_source == "fixed"
+    assert runtime_args.calibrated_latency_seconds == 0
+    assert options.timing_mode == timing_mode
+    assert not hasattr(options, "native_latency")
