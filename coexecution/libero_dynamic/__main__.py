@@ -27,8 +27,25 @@ def main(argv=None):
     from .evaluation import add_evaluate_arguments
 
     add_evaluate_arguments(evaluate)
+    streaming = commands.add_parser(
+        "evaluate-pir2",
+        help="Run existing πR² policies in real moving worlds",
+        description=(
+            "Evaluate moving-world πR² with fixed counterfactual latencies and "
+            "independent logical S1/S2 lanes. All real RPCs execute serially; "
+            "this is not measured same-GPU concurrent deployment."
+        ),
+    )
+    from .streaming_evaluation import add_streaming_arguments
+
+    add_streaming_arguments(streaming)
     args = parser.parse_args(argv)
     try:
+        if args.command == "evaluate-pir2":
+            from .streaming_evaluation import evaluate_streaming
+
+            print(json.dumps(evaluate_streaming(args)))
+            return
         if args.command == "evaluate":
             from .evaluation import evaluate_default
 

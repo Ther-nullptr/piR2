@@ -144,3 +144,163 @@ test("missing evidence and failed episodes never claim executing actions", () =>
     "等待中 · 目标移动",
   );
 });
+
+test("same precision Flow and piR2 stay in independent columns with optional same-protocol comparison", () => {
+  const runs = [
+    {
+      id: "flow",
+      kind: "dynamic",
+      precision: "bf16",
+      protocol: "default_vla_flow4",
+      episodes: [episode],
+    },
+    {
+      id: "p1",
+      kind: "dynamic",
+      precision: "bf16",
+      protocol: "pir2_dynamic",
+      episodes: [episode],
+    },
+    {
+      id: "p2",
+      kind: "dynamic",
+      precision: "bf16",
+      protocol: "pir2_dynamic",
+      episodes: [episode],
+    },
+  ];
+  const key = D.conditionKey(episode);
+  assert.deepEqual(
+    D.rows(runs, key, "all", {}).map((r) => r.run.id),
+    ["flow", "p1"],
+  );
+  const group = D.groupKey(runs[1]);
+  const rows = D.rows(runs, key, "all", {}, [group]);
+  assert.deepEqual(
+    rows.map((r) => r.run.id),
+    ["flow", "p1", "p2"],
+  );
+  assert.notEqual(rows[1].columnKey, rows[2].columnKey);
+  assert.equal(D.candidates(runs, key, "bf16", "pir2_dynamic").length, 2);
+});
+
+test("streaming playback follows physics instead of the concurrent S2 lane and honors each camera map", () => {
+  const e = {
+    ...episode,
+    protocol: "pir2_dynamic",
+    events: [
+      { id: "s2", kind: "s2", start_s: 0, end_s: 0.2, request_id: "v" },
+      {
+        id: "a",
+        kind: "action",
+        start_s: 0,
+        end_s: 0.05,
+        request_id: "s",
+        source: { feature_age_s: 0.3 },
+      },
+    ],
+    requests: [
+      { id: "v", lane: "s2" },
+      { id: "s", lane: "s1", parent_request_id: "v" },
+    ],
+    frames_by_camera: {
+      image: episode.frames,
+      wrist_image: [episode.frames[0]],
+    },
+  };
+  assert.equal(D.at(e, 0.04).event.id, "a");
+  assert.equal(D.at(e, 0.04, "wrist_image").frame.frame_id, "f0");
+  assert.deepEqual(D.lineage(e, "s"), ["s", "v"]);
+  assert.deepEqual(D.lineage(e, null), []);
+  assert.equal(
+    D.phaseLabel({ event: { kind: "bootstrap_hold" } }, e),
+    "启动等待 · 目标移动",
+  );
+  assert.equal(
+    D.phaseLabel(
+      { event: { kind: "action", fallback: true } },
+      { ...e, status: "ok" },
+    ),
+    "Fallback · 动作执行",
+  );
+});
+
+test("streaming metadata distinguishes physical steps, committed delay and warmup groups", () => {
+  const e = {
+    protocol: "pir2_dynamic",
+    decoded_horizon: 40,
+    predicted_horizon: 40,
+    delay_ticks_observed: [1, 2],
+    episode_warmup_requests: 8,
+    episode_warmup_recorded: 40,
+    warmup_rpc_recorded: 120,
+  };
+  const label = D.modelContract(e);
+  assert.match(label, /每步执行 1/);
+  assert.match(label, /承诺 d=1, 2/);
+  assert.match(label, /预热 8 轮 \/ 40 组 \(120 次 RPC\)/);
+  assert.ok(!label.includes("校准"));
+});
+
+test("S1 state tick and S2 image tick have distinct labels and RPC boundary", () => {
+  assert.equal(
+    D.observationLabel({ lane: "s1", request_tick: 9, feature_source_tick: 3 }),
+    "状态 tick 9",
+  );
+  assert.equal(
+    D.observationLabel({ lane: "s2", source_tick: 3 }),
+    "图像 tick 3",
+  );
+  assert.match(D.rpcScope({ protocol: "pir2_dynamic" }), /不含客户端预处理/);
+});
+
+test("canonical streaming events resolve their request and legacy inline events remain readable", () => {
+  const request = { id: "s1", lane: "s1", feature_sequence: 7 };
+  const e = { requests: [request] };
+  const canonical = { kind: "s1", request_id: "s1", id: "event" };
+  assert.equal(D.resolveEvent(e, canonical).source, request);
+  assert.equal(canonical.source, undefined);
+  assert.equal(
+    D.resolveEvent(e, { ...canonical, source: { feature_sequence: 7 } }).source,
+    request,
+  );
+  const action = { kind: "action", source: { tick: 3 } };
+  assert.equal(D.resolveEvent(e, action), action);
+});
+
+test("camera mappings prefer canonical image frames while retaining old duplicate layout support", () => {
+  const image = [{ frame_id: "image" }],
+    wrist = [{ frame_id: "wrist" }];
+  assert.equal(
+    D.cameraFrames(
+      { frames: image, frames_by_camera: { wrist_image: wrist } },
+      "image",
+    ),
+    image,
+  );
+  assert.equal(
+    D.cameraFrames(
+      { frames: image, frames_by_camera: { image, wrist_image: wrist } },
+      "image",
+    ),
+    image,
+  );
+  assert.equal(
+    D.cameraFrames(
+      { frames_by_camera: { image, wrist_image: wrist } },
+      "image",
+    ),
+    image,
+  );
+  assert.equal(
+    D.cameraFrames(
+      { frames: image, frames_by_camera: { wrist_image: wrist } },
+      "wrist_image",
+    ),
+    wrist,
+  );
+  assert.deepEqual(
+    D.cameraFrames({ frames: image, frames_by_camera: {} }, "wrist_image"),
+    [],
+  );
+});

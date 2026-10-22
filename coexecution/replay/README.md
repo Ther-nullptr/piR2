@@ -184,3 +184,29 @@ Async RPC 在 worker 输入准备后开始，同步完整调用包含准备；�
 | [media.py](media.py)、[http.py](http.py)                                                         | 媒体身份、清单和只读交付                        |
 
 公共合同检查按 [CONTRIBUTING](../../CONTRIBUTING.md)；桌面播放和 SSE 检查见 [前端说明](../../simulator/README.md)。模型验证与真实 LIBERO 结果分别由 CUDA 测量和闭环评估产生。模型、原始实验、视频、profile 和生成目录均留在忽略的本地路径。
+
+### πR² 动态回放
+
+`build --dynamic-evaluation` 同样接受 `evaluate-pir2` 生成的
+`pir2.libero_dynamic.streaming_evaluation.v1` 目录。默认 Flow4 与 πR² 即使
+精度相同也各占一列；每列可以切换配置，使用“添加同协议对照”同时查看另一个
+已记录配置。场景、速度、轨迹、seed 和初态必须相同才会配对。
+
+πR² 时间线有 S2、S1、动作三轨。点击 S1 高亮其实际采用的 S2 特征，点击动作
+追溯实际生产请求；特征序号 0 属于 bootstrap，fallback 动作没有虚构的模型来源。
+S1 面板展示 normal1/recovery5、有效动作窗口、接纳/过期/保护槽数及特征 AoI。
+控制器事件、原始请求和物理位姿保留在 Run JSON 中。
+
+主轴是实际物理仿真秒数，包含启动时物体继续运动的 bootstrap hold。
+逻辑推理时间只减去记录中的 `logical_epoch_s`。独立通道的反事实延迟不会冒充
+同一 GPU 上的并发实测；实际 RPC 串行执行的 host monotonic 时间展示在独立 wall
+面板。只有时长而没有绝对边界的 server 记录不绘制虚构位置。
+
+视频仍使用同一媒体播放器和无损 VP9 派生文件，按解码后的真实 PTS 定位。新录制
+支持逐相机 frame map；录制异常时只保留明确写入成功的帧，缺失的腕部帧不会用
+另一相机的帧数补齐。原始视频和时间戳不修改。
+
+πR² 规范化数据保留单份证据：控制器事件在 `episode.trace`，S1/S2 时间线通过
+`request_id` 引用 `episode.requests`，主相机帧在 `episode.frames`，腕部等其它
+映射在 `frames_by_camera`。前端同时兼容旧的内联 request 与重复主相机映射。
+入队槽数表示发布时写入队列的数量，已执行动作只统计实际物理动作记录。

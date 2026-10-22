@@ -402,7 +402,13 @@ def dynamic_run(path, media):
     root = Path(path).resolve()
     evaluation_path, manifest_path = root / "evaluation.json", root / "manifest.jsonl"
     evaluation = read_json(evaluation_path)
-    if evaluation.get("schema") != "pir2.libero_dynamic.default.v1":
+    is_streaming = (
+        evaluation.get("schema") == "pir2.libero_dynamic.streaming_evaluation.v1"
+    )
+    if (
+        not is_streaming
+        and evaluation.get("schema") != "pir2.libero_dynamic.default.v1"
+    ):
         raise ValueError("Unsupported dynamic evaluation schema")
     manifests = read_jsonl(manifest_path)
     if not manifests or len({m["item_id"] for m in manifests}) != len(manifests):
@@ -413,7 +419,14 @@ def dynamic_run(path, media):
     provenance = [source(evaluation_path), source(manifest_path)]
     run_id = "dynamic-" + digest(provenance)[:24]
     config = evaluation.get("configuration", {})
-    episodes = [_episode(root, m, config, media, run_id) for m in manifests]
+    if is_streaming:
+        from .dynamic_streaming import streaming_episode
+
+        episodes = [
+            streaming_episode(root, m, config, media, run_id) for m in manifests
+        ]
+    else:
+        episodes = [_episode(root, m, config, media, run_id) for m in manifests]
     return {
         "schema": "pir2.replay.run",
         "version": VERSION,
@@ -422,7 +435,7 @@ def dynamic_run(path, media):
         "label": root.name,
         "precision": precisions.pop(),
         "mode": "libero_dynamic",
-        "protocol": evaluation.get("protocol"),
+        "protocol": "pir2_dynamic" if is_streaming else evaluation.get("protocol"),
         "configuration": config,
         "upstream": evaluation.get("upstream"),
         "episodes": episodes,
@@ -431,7 +444,9 @@ def dynamic_run(path, media):
             f"{e['item_id']}: {warning}" for e in episodes for warning in e["warnings"]
         ],
         "time_contract": {
-            "timeline": "rollout simulation seconds, including physical inference holds",
+            "timeline": "rollout simulation seconds; streaming logical timestamps subtract logical_epoch_s only"
+            if is_streaming
+            else "rollout simulation seconds, including physical inference holds",
             "wall_panel": "measured request/server monotonic time; never scaled onto simulation time",
             "video": "exact video_samples sample_sim_time_s to media_time_s mapping",
             "source_tick": "executed action count, excluding inference hold substeps",
