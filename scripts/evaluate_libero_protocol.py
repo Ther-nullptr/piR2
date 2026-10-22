@@ -200,6 +200,8 @@ def algorithm_episode(env, observation, client, args, seed, trace):
 
 
 def save_summary(output, records, config):
+    from coexecution.libero.experiments import SUITE_SCOPES
+
     task_ids = config.get("task_ids", list(range(10)))
     expected = {
         (task, episode)
@@ -217,7 +219,7 @@ def save_summary(output, records, config):
         else None,
         "expected_episodes": len(expected),
         "complete": completed == expected and len(records) == len(expected),
-        "evaluation_scope": "full_spatial_suite"
+        "evaluation_scope": SUITE_SCOPES[config.get("suite", "libero_spatial")]
         if sorted(task_ids) == list(range(10))
         else "selected_task_subset",
         "per_task": [],
@@ -272,6 +274,7 @@ def save_summary(output, records, config):
 
 
 def build_parser():
+    from coexecution.libero.experiments import SUITE_SCOPES
     from coexecution.libero.features import add_feature_arguments
 
     parser = argparse.ArgumentParser()
@@ -279,6 +282,9 @@ def build_parser():
         "--protocol", choices=["algorithm", "deployment"], required=True
     )
     parser.add_argument("--variant", choices=["pir2", "flow"], required=True)
+    parser.add_argument(
+        "--suite", choices=tuple(SUITE_SCOPES), default="libero_spatial"
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=5570)
     parser.add_argument("--slow-port", type=int, default=5572)
@@ -490,7 +496,6 @@ def main():
         k: v for k, v in vars(args).items() if k not in ["output", "port", "slow_port"]
     }
     config["checkpoint"] = identity
-    config["suite"] = "libero_spatial"
     config["initial_state_indices"] = list(range(args.episodes_per_task))
     config["version"] = 10
     config["measurement_mode"] = "success_terminated_closed_loop"
@@ -718,7 +723,7 @@ def main():
         else []
     )
     completed = {(x["task_id"], x["episode_id"]) for x in records}
-    suite = benchmark.get_benchmark_dict()["libero_spatial"]()
+    suite = benchmark.get_benchmark_dict()[args.suite]()
     for task_id in args.task_ids:
         task = suite.get_task(task_id)
         states = suite.get_task_init_states(task_id)

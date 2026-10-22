@@ -32,6 +32,16 @@ FIXTURE_FIELDS = (
     "initial_rgb_sha256",
 )
 
+SUITE_NAMES = {
+    "libero_spatial": "Spatial",
+    "libero_object": "Object",
+    "libero_goal": "Goal",
+    "libero_10": "Long",
+}
+SUITE_SCOPES = {
+    suite: f"full_{name.lower()}_suite" for suite, name in SUITE_NAMES.items()
+}
+
 
 def validate_plan(plan):
     from coexecution.optimization.config import (
@@ -55,6 +65,8 @@ def validate_plan(plan):
     )
     if any(key not in plan for key in required):
         raise ValueError("Experiment plan is missing required fields")
+    if plan.get("suite", "libero_spatial") not in SUITE_SCOPES:
+        raise ValueError("Select a supported LIBERO suite")
     if any(
         type(plan[key]) is not int or plan[key] < 1
         for key in ("episodes_per_task", "max_steps")
@@ -335,6 +347,7 @@ def build_commands(plan, case, protocol, output):
         protocol,
         "--variant",
         case["variant"],
+        *(["--suite", plan["suite"]] if "suite" in plan else []),
         "--output",
         str(output / protocol),
         "--port",
@@ -670,12 +683,13 @@ def deployment_report(plan, output, *, report_output=None):
                             f"Unknown or invalid executed observation age: {directory}/{field}"
                         )
         conditions.append(condition)
+    suite_name = SUITE_NAMES[plan.get("suite", "libero_spatial")]
     report = {
         "schema_version": 2,
         "scope": (
-            "Full Spatial suite"
+            f"Full {suite_name} suite"
             if set(plan.get("task_ids", range(10))) == set(range(10))
-            else "Spatial task subset"
+            else f"{suite_name} task subset"
         )
         + ", paired declared initial states; actual executed image/state ages",
         "task_ids": list(plan.get("task_ids", range(10))),
@@ -784,7 +798,9 @@ def run(plan, output):
                         (evaluation_output / "summary.json").read_text()
                     )
                     if not summary["complete"]:
-                        raise RuntimeError("Full Spatial evaluation is incomplete")
+                        raise RuntimeError(
+                            f"{SUITE_NAMES[plan.get('suite', 'libero_spatial')]} evaluation is incomplete"
+                        )
                     results[case["name"] + "/" + protocol] = summary
                     records[protocol][case["name"]] = [
                         json.loads(row)
