@@ -2,6 +2,38 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const D = require("./replay-dynamic.js");
 
+test("NFE stays on the model stage when full adapter timing is present", () => {
+  const request = { server_audit: { forward_counts: { dit: 5 } } };
+  assert.equal(D.stageNfe(request, { name: "RPC" }), null);
+  assert.equal(D.stageNfe(request, { name: "Full adapter call" }), null);
+  assert.equal(D.stageNfe(request, { name: "DiT server plan" }), 5);
+  assert.equal(D.stageNfe(request, { name: "Bootstrap VLM + Flow4" }), 5);
+});
+
+test("native timing labels preserve separate per-request S2/S1 ranges", () => {
+  const label = D.timingLabel({
+    protocol: "pir2_dynamic",
+    timing_mode: "native",
+    stage_latencies: null,
+    requests: [
+      { lane: "s2", service_duration_ms: 31.2 },
+      { lane: "s2", service_duration_ms: 39.8 },
+      { lane: "s1", service_duration_ms: 12.4 },
+      { lane: "s1", service_duration_ms: 17.3 },
+    ],
+  });
+  assert.ok(label.includes("逐请求实测"));
+  assert.ok(label.includes("31.2–39.8"));
+  assert.ok(label.includes("12.4–17.3"));
+  assert.ok(!label.includes("反事实"));
+  assert.ok(
+    D.timingLabel({
+      protocol: "pir2_dynamic",
+      stage_latencies: { s2_s: 0.15, s1_s: 0.04 },
+    }).includes("150 / S1 40"),
+  );
+});
+
 const episode = {
   id: "episode-a",
   suite: "libero_spatial",

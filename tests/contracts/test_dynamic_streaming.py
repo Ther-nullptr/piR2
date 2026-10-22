@@ -613,3 +613,152 @@ def test_terminal_boundary_s2_completion_does_not_start_unneeded_work(tmp_path):
     assert [data["source_tick"] for data in visions] == [0]
     assert not any(record["lane"] == "s2" for record in result["inflight_at_end"])
     assert any(event["kind"] == "camera_dropped" for event in result["events"])
+
+
+class ServiceClock:
+    """A controllable full-adapter clock; RPC records use their own real clock."""
+
+    def __init__(self):
+        self.now = 20000.0
+
+    def __call__(self):
+        return self.now
+
+
+def native_setup(tmp_path, *, s1=(0.023,), s2=(0.071,), bootstrap=0.137, fixed=None):
+    _, rpc, endpoints, _, _, _ = setup(tmp_path)
+    _, Step, Controller, _ = api()
+    clock = ServiceClock()
+    for name, values in (("bootstrap", (bootstrap,)), ("vision", s2), ("plan", s1)):
+        method = getattr(rpc, name)
+        durations = iter(values)
+        last = values[-1]
+
+        def measured(*args, _method=method, _durations=durations, _last=last, **kwargs):
+            duration = next(_durations, _last)
+            # Include adapter preprocessing and return handling, independently
+            # from the RPC's narrower raw wall receipt.
+            clock.now += duration / 3
+            result = _method(*args, **kwargs)
+            clock.now += duration * 2 / 3
+            return result
+
+        setattr(rpc, name, measured)
+    controller = Controller(rpc, timing_mode="native", clock=clock, fixed_delay=fixed)
+    receipt = controller.bootstrap({"frame": -1, "state": {}}, "pick cup", seed=1)
+
+    def run(n):
+        return controller.run(
+            receipt,
+            initial_observation={"frame": 0, "state": {}},
+            initial_capture_s=receipt["logical_completed_s"],
+            language="pick cup",
+            step_fn=lambda action, tick: Step({"frame": tick + 1, "state": {}}),
+            max_steps=n,
+        )
+
+    return controller, rpc, endpoints, receipt, clock, run
+
+
+def test_native_uses_every_complete_adapter_duration_without_alignment(tmp_path):
+    _, _, _, receipt, _, run = native_setup(
+        tmp_path, s1=(0.023, 0.039, 0.017), s2=(0.071, 0.083, 0.056)
+    )
+    result = run(8)
+    assert receipt["logical_duration_s"] == pytest.approx(0.137)
+    assert result["timing_mode"] == "native"
+    assert result["timing_domain"] == "measured_request_discrete_event"
+    assert result["latency_provenance"] == "measured_per_request"
+    assert result["resource_model"] == "independent_stage_service"
+    assert result["compute_coupling"] == "serialized_gpu_simulation"
+    assert result["stage_latencies"] is None
+    assert result["config"]["stage_latencies"] is None
+    assert result["config"]["initial_delay_ticks"] == 1
+    assert result["startup_seconds"] == receipt["logical_duration_s"]
+    assert result["physical_seconds"] == pytest.approx(0.537)
+    assert [r["logical_duration_s"] for r in requests(result, "s1")][
+        :3
+    ] == pytest.approx([0.023, 0.039, 0.017])
+    assert [r["logical_duration_s"] for r in requests(result, "s2")][
+        :3
+    ] == pytest.approx([0.071, 0.083, 0.056])
+    for row in [receipt, *result["requests"]]:
+        service = row["service_wall"]
+        assert service["clock"] == "host_monotonic"
+        assert service["boundary"] == "full_adapter_call"
+        assert service["duration_s"] == service["completed_s"] - service["started_s"]
+        assert row["logical_duration_s"] == service["duration_s"]
+        assert row["logical_completed_s"] - row.get(
+            "logical_started_s", 1000
+        ) == pytest.approx(service["duration_s"])
+    assert requests(result, "s1")[0]["wall_duration_s"] != pytest.approx(0.023)
+
+
+def test_native_adapts_only_after_past_completion_and_expires_late_actions(tmp_path):
+    _, _, _, _, _, run = native_setup(tmp_path, s1=(0.08, 0.08, 0.03))
+    result = run(8)
+    plans = requests(result, "s1")
+    assert plans[0]["delay_ticks"] == 1
+    assert plans[0]["publication"]["expired_slots"] == 1
+    assert plans[0]["budget_decision"]["deadline_miss"] is True
+    assert plans[1]["delay_ticks"] == 2
+    assert plans[1]["publication"]["installed_slots"] == 2
+
+
+def test_native_recovery_uses_its_actual_call_duration(tmp_path):
+    _, _, _, _, _, run = native_setup(tmp_path, s1=(2.2, 0.327, 0.021), fixed=1)
+    result = run(55)
+    plans = requests(result, "s1")
+    assert plans[1]["normal_or_recovery"] == "recovery5"
+    assert plans[1]["server_audit"]["forward_counts"] == {"vlm": 0, "dit": 5}
+    assert plans[1]["logical_duration_s"] == pytest.approx(0.327)
+    assert plans[1]["logical_duration_s"] == plans[1]["service_wall"]["duration_s"]
+    assert result["actions"][40]["fallback"] is True
+
+
+@pytest.mark.parametrize("duration", [-0.01, float("nan"), float("inf")])
+def test_native_rejects_invalid_measured_duration(tmp_path, duration):
+    _, rpc, _, _, _, _ = setup(tmp_path)
+    _, _, Controller, _ = api()
+    readings = iter([100.0, 100.0 + duration])
+    controller = Controller(rpc, timing_mode="native", clock=lambda: next(readings))
+    with pytest.raises(ValueError, match="monotonic.*finite|finite.*monotonic"):
+        controller.bootstrap({"frame": -1, "state": {}}, "pick cup", seed=1)
+    assert controller._receipt is None
+
+
+def test_native_rejects_fixed_stage_latencies(tmp_path):
+    _, rpc, _, _, _, _ = setup(tmp_path)
+    Latencies, _, Controller, _ = api()
+    with pytest.raises(ValueError, match="native.*fixed|Native.*fixed"):
+        Controller(rpc, timing_mode="native", latencies=Latencies(0.1, 0.1, 0.1, 0.1))
+
+
+def test_native_completion_does_not_see_host_computed_future_images(tmp_path):
+    _, _, endpoints, _, _, run = native_setup(tmp_path, s2=(0.12,))
+    result = run(6)
+    visions = [d for name, d in endpoints[1002].calls if name == "vision"]
+    assert [d["source_tick"] for d in visions][:3] == [0, 2, 4]
+    assert [d["observation"]["frame"] for d in visions][:3] == [0, 2, 4]
+    assert any(e["kind"] == "camera_replaced" for e in result["events"])
+
+
+@pytest.mark.parametrize("stage", ["vision", "plan"])
+def test_native_invalid_clock_during_steady_service_retains_completed_evidence(
+    tmp_path, stage
+):
+    controller, rpc, _, receipt, clock, run = native_setup(tmp_path)
+    original = getattr(rpc, stage)
+
+    def backwards(*args, **kwargs):
+        result = original(*args, **kwargs)
+        clock.now -= 1
+        return result
+
+    setattr(rpc, stage, backwards)
+    with pytest.raises(ValueError, match="Measured monotonic"):
+        run(3)
+    assert controller._receipt["logical_duration_s"] == receipt["logical_duration_s"]
+    assert rpc.records[-1]["status"] == "complete"
+    assert len(controller.requests) == (1 if stage == "plan" else 0)
+    assert controller.actions == []

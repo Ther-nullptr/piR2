@@ -248,6 +248,82 @@ def build(root, tmp_path):
     return json.loads((output / catalog["runs"][0]["path"]).read_text())
 
 
+def native_evidence(evidence):
+    root, manifest, audit = evidence
+    stream = audit["streaming"]
+    mode = {
+        "timing_mode": "native",
+        "timing_domain": "measured_request_discrete_event",
+        "latency_provenance": "measured_per_request",
+    }
+    manifest.update(**mode, stage_latencies=None, startup_seconds=0.2)
+    stream.update(mode)
+    stream["config"]["stage_latencies"] = None
+    bootstrap, (s2, s1) = stream["bootstrap"], stream["requests"]
+    s2.update(
+        logical_completed_s=1000.21, logical_duration_s=0.01, wall_completed_s=5001.005
+    )
+    # S2 is not ready at the S1 admission, so S1 uses the bootstrap feature.
+    s1.update(feature_sequence=0, feature_capture_s=1000.0, feature_age_s=0.2)
+    s1["server_audit"]["cache"].update(
+        capture_s=1000.0, frame_hashes={"image": "bootstrap"}
+    )
+    stream["actions"][1].update(feature_capture_s=1000.0, feature_age_s=0.25)
+    for request, start, duration in [
+        (bootstrap, 5000.0, 0.2),
+        (s2, 5001.0, 0.01),
+        (s1, 5001.1, 0.04),
+    ]:
+        request["service_wall"] = {
+            "clock": "host_monotonic",
+            "started_s": start,
+            "completed_s": start + duration,
+            "duration_s": duration,
+            "boundary": "full_adapter_call",
+        }
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    return root, manifest, audit
+
+
+def test_native_replay_preserves_each_measured_call_and_separate_rpc_boundary(
+    streaming_evidence, tmp_path
+):
+    root, _, _ = native_evidence(streaming_evidence)
+    episode = build(root, tmp_path)["episodes"][0]
+    assert episode["calibration"]["kind"] == "measured_per_request"
+    assert episode["stage_latencies"] is None
+    requests = {r["lane"]: r for r in episode["requests"]}
+    assert requests["s2"]["end_s"] - requests["s2"]["start_s"] == pytest.approx(0.01)
+    assert requests["s1"]["end_s"] - requests["s1"]["start_s"] == pytest.approx(0.04)
+    assert requests["s2"]["rpc_duration_ms"] == pytest.approx(5)
+    assert requests["s2"]["service_duration_ms"] == pytest.approx(10)
+    assert requests["s1"]["parent_request_id"] == requests["bootstrap"]["id"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda m, s: s["requests"][0]["service_wall"].update(duration_s=0.15),
+        lambda m, s: s["requests"][1]["service_wall"].update(completed_s=5001.13),
+        lambda m, s: s["bootstrap"].pop("service_wall"),
+        lambda m, s: m.update(stage_latencies={"s1_s": 0.04}),
+        lambda m, s: s.update(stage_latencies={"s1_s": 0.04}),
+        lambda m, s: s["requests"][0].update(wall_completed_s=5001.05),
+        lambda m, s: m.update(latency_provenance="fixed_counterfactual"),
+    ],
+)
+def test_native_replay_rejects_aligned_or_inconsistent_service_evidence(
+    streaming_evidence, tmp_path, mutation
+):
+    root, manifest, audit = native_evidence(streaming_evidence)
+    mutation(manifest, audit["streaming"])
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    with pytest.raises(ValueError):
+        build(root, tmp_path)
+
+
 def test_streaming_import_preserves_independent_clocks_and_dependency_chain(
     streaming_evidence, tmp_path
 ):
@@ -449,11 +525,14 @@ def test_real_runner_partial_result_retains_top_level_bootstrap(
 ):
     from types import SimpleNamespace
 
+    from coexecution.libero_dynamic.streaming import StageLatencies
     from coexecution.libero_dynamic.streaming_evaluation import _partial_streaming
 
     root, manifest, audit = streaming_evidence
     full = audit["streaming"]
     controller = SimpleNamespace(
+        timing_mode="fixed",
+        latencies=StageLatencies(bootstrap_s=0.2, s1_s=0.04, s2_s=0, recovery_s=0.2),
         logical_time_s=1000.3,
         requests=full["requests"],
         actions=full["actions"],
