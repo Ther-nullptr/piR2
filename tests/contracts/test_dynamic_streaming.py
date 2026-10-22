@@ -277,7 +277,10 @@ def test_success_ends_without_advancing_inflight_or_executing_future_slots(tmp_p
         {"inference_optimization": {"config": {"precision": "w8a8"}}},
     ],
 )
-def test_prepare_rejects_incompatible_real_endpoint_identity(tmp_path, mutation):
+@pytest.mark.parametrize("operation", ["prepare", "bootstrap", "vision"])
+def test_first_rpc_use_rejects_incompatible_real_endpoint_identity(
+    tmp_path, mutation, operation
+):
     _, _, _, RPC = api()
     checkpoint = tmp_path
     endpoints = {1: Endpoint("action", checkpoint), 2: Endpoint("vlm", checkpoint)}
@@ -288,9 +291,124 @@ def test_prepare_rejects_incompatible_real_endpoint_identity(tmp_path, mutation)
         expected_checkpoint=checkpoint,
         precision="bf16",
         client_factory=lambda **kw: endpoints[kw["port"]],
+        preprocessor=lambda obs, language: obs,
     )
     with pytest.raises(ValueError):
-        rpc.prepare()
+        if operation == "prepare":
+            rpc.prepare()
+        elif operation == "bootstrap":
+            rpc.bootstrap(
+                {"frame": 0, "state": {}},
+                "pick cup",
+                capture_s=1000,
+                delay_ticks=1,
+                seed=1,
+            )
+        else:
+            rpc.vision(
+                {"frame": 0, "state": {}},
+                "pick cup",
+                capture_s=1000,
+                source_tick=0,
+            )
+    assert rpc.identities is None
+    assert not rpc.records
+    assert all(
+        name == "identity" for client in endpoints.values() for name, _ in client.calls
+    )
+    rpc.close()
+
+
+def test_prepare_returns_detached_identities_on_first_and_cached_calls(tmp_path):
+    _, _, _, RPC = api()
+    endpoints = {1: Endpoint("action", tmp_path), 2: Endpoint("vlm", tmp_path)}
+    rpc = RPC(
+        action_port=1,
+        vision_port=2,
+        expected_checkpoint=tmp_path,
+        precision="bf16",
+        client_factory=lambda **kw: endpoints[kw["port"]],
+    )
+    expected = {client.role: deepcopy(client.identity) for client in endpoints.values()}
+    first = rpc.prepare()
+    first["action"]["sha256"].clear()
+    first["vlm"]["feature_rpc_modes"].append("changed")
+    assert rpc.identities == expected
+    second = rpc.prepare()
+    assert second == expected
+    second["vlm"]["execution_endpoints"].clear()
+    endpoints[1].identity["sha256"].clear()
+    assert rpc.prepare() == expected
+    assert rpc.identities == expected
+    assert all(len(client.calls) == 1 for client in endpoints.values())
+    rpc.close()
+
+
+def test_cached_model_requests_do_not_copy_identity_metadata(tmp_path):
+    _, rpc, endpoints, _, _, run = setup(tmp_path)
+    copied_roles = []
+
+    class IdentityMetadata(dict):
+        def __deepcopy__(self, memo):
+            copied_roles.append(self["role"])
+            return dict(self)
+
+    for role, identity in rpc.identities.items():
+        identity["metadata"] = IdentityMetadata(role=role)
+    result = run(3)
+    assert result["action_steps"] == 3
+    rpc.bootstrap(
+        {"frame": 0, "state": {}},
+        "pick cup",
+        capture_s=1000,
+        delay_ticks=1,
+        seed=2,
+    )
+    assert copied_roles == []
+    assert {record["endpoint"] for record in rpc.records} == {
+        "bootstrap",
+        "vision",
+        "plan",
+    }
+    assert all(
+        sum(name == "identity" for name, _ in client.calls) == 1
+        for client in endpoints.values()
+    )
+    rpc.close()
+
+
+@pytest.mark.parametrize("invalid_state", ["wrong_thread", "closed"])
+def test_cached_vision_request_retains_ownership_and_closed_checks(
+    tmp_path, invalid_state
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    _, rpc, endpoints, _, _, _ = setup(tmp_path)
+    calls_before = [len(client.calls) for client in endpoints.values()]
+    records_before = len(rpc.records)
+
+    def vision():
+        return rpc.vision(
+            {"frame": 0, "state": {}},
+            "pick cup",
+            capture_s=1000.1,
+            source_tick=0,
+        )
+
+    if invalid_state == "wrong_thread":
+        with (
+            ThreadPoolExecutor(max_workers=1) as pool,
+            pytest.raises(RuntimeError, match="owning thread"),
+        ):
+            pool.submit(vision).result()
+    else:
+        rpc.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            vision()
+    assert [len(client.calls) for client in endpoints.values()] == calls_before
+    assert len(rpc.records) == records_before
+    if invalid_state == "wrong_thread":
+        assert vision()["meta"]["capture_s"] == 1000.1
     rpc.close()
 
 
