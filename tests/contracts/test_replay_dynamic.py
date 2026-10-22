@@ -157,6 +157,17 @@ def build(root, tmp_path):
     return catalog, run, output
 
 
+def test_custom_speed_scope_survives_flow_normalization(evidence, tmp_path):
+    root, manifest, _ = evidence
+    manifest.update(
+        speed_mps=0.015, speed_scope="custom", template_condition_id="official-template"
+    )
+    write(root / "manifest.jsonl", manifest)
+    _, run, _ = build(root, tmp_path)
+    assert run["episodes"][0]["speed_scope"] == "custom"
+    assert run["episodes"][0]["template_condition_id"] == "official-template"
+
+
 def test_dynamic_catalog_uses_recorded_sim_phases_and_independent_wall_stages(
     evidence, tmp_path
 ):

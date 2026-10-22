@@ -53,6 +53,11 @@ class StreamingResult(TypedDict):
     logical_epoch_s: float
     control_origin_s: float
     startup_seconds: float
+    requested_startup_release_seconds: float | None
+    bootstrap_service_seconds: float
+    startup_barrier_seconds: float
+    startup_alignment_met: bool | None
+    startup_policy: str
     steady_seconds: float
     physical_seconds: float
     action_steps: int
@@ -81,6 +86,33 @@ def timing_metadata(mode, latencies):
     }
 
 
+def startup_configuration(release_seconds):
+    """Validate an optional common physical release, separate from model timing."""
+    if release_seconds is not None and (
+        type(release_seconds) not in (int, float)
+        or not math.isfinite(release_seconds)
+        or release_seconds <= 0
+    ):
+        raise ValueError("Common startup release must be finite positive seconds")
+    return {
+        "requested_startup_release_seconds": None
+        if release_seconds is None
+        else float(release_seconds),
+        "startup_policy": "paid_moving_world_hold"
+        if release_seconds is None
+        else "common_startup_release_moving_world_hold",
+    }
+
+
+STARTUP_MEASUREMENTS = (
+    "bootstrap_service_seconds",
+    "startup_barrier_seconds",
+    "startup_seconds",
+    "control_origin_s",
+    "startup_alignment_met",
+)
+
+
 @dataclass(frozen=True)
 class _Frame:
     observation: Any
@@ -92,7 +124,7 @@ class StreamingController:
     """Reuse command ownership/mailbox rules without wall-clock cross arithmetic.
 
     Call ``bootstrap`` on the scored initial observation. Then the runner must
-    advance the real moving world for the receipt's ``logical_duration_s`` holding the
+    advance the real moving world for the receipt's ``startup_seconds`` holding the
     robot and recapture state. Pass that observation and its separate logical
     capture to ``run``. During ``run`` only step_fn advances the world; each call
     consumes exactly one 50 ms action, including real fallback commands.
@@ -113,6 +145,7 @@ class StreamingController:
         epoch_s=1000.0,
         timing_mode="fixed",
         clock=None,
+        startup_release_seconds=None,
     ):
         if timing_mode not in ("native", "fixed"):
             raise ValueError("Timing mode must be native or fixed")
@@ -131,6 +164,7 @@ class StreamingController:
         ):
             raise ValueError("Fixed delay must be an integer in 1..5")
         self.rpc, self.latencies = rpc, latencies
+        self._startup_configuration = startup_configuration(startup_release_seconds)
         self.timing_mode = timing_mode
         self.clock = time.monotonic if clock is None else clock
         self.fixed_delay, self.epoch_s = fixed_delay, float(epoch_s)
@@ -144,6 +178,18 @@ class StreamingController:
         self._receipt = None
         self._ran = False
         self._generation = 0
+
+    @property
+    def bootstrap_evidence(self):
+        """Detached successful receipt; callers cannot mutate private timing."""
+        return deepcopy(self._receipt)
+
+    def startup_metadata(self):
+        receipt = self._receipt or {}
+        return {
+            **self._startup_configuration,
+            **{key: receipt.get(key) for key in STARTUP_MEASUREMENTS},
+        }
 
     def _call(self, method, *args, **kwargs):
         if self.timing_mode == "fixed":
@@ -175,6 +221,10 @@ class StreamingController:
         self._ran = True
         self._generation += 1
         self.logical_time_s = self.epoch_s
+        # A failed or late new bootstrap must not export the prior episode's
+        # completed actions or pending requests as evidence for this attempt.
+        self.trace = self.timeline = self.s1 = self.s2 = None
+        self.requests, self.actions, self.by_tick = [], [], {}
         receipt, service_wall = self._call(
             self.rpc.bootstrap,
             raw_observation,
@@ -190,11 +240,18 @@ class StreamingController:
         )
         if service_wall is not None:
             receipt["service_wall"] = service_wall
+        release = self._startup_configuration["requested_startup_release_seconds"]
+        startup_seconds = duration if release is None else max(release, duration)
         receipt.update(
             logical_duration_s=duration,
             logical_completed_s=self.epoch_s + duration,
             timing_domain="logical_simulation",
-            startup_policy="paid_moving_world_hold",
+            **self._startup_configuration,
+            bootstrap_service_seconds=duration,
+            startup_barrier_seconds=startup_seconds - duration,
+            startup_seconds=startup_seconds,
+            control_origin_s=self.epoch_s + startup_seconds,
+            startup_alignment_met=None if release is None else duration <= release,
             generation=self._generation,
             receipt_id=uuid.uuid4().hex,
             language=language,
@@ -393,8 +450,8 @@ class StreamingController:
             raise RuntimeError("Run requires a fresh bootstrap receipt")
         if type(max_steps) is not int or max_steps < 1:
             raise ValueError("max_steps counts positive actual physical actions")
-        startup_seconds = self._receipt["logical_duration_s"]
-        expected = self._receipt["logical_completed_s"]
+        startup_seconds = self._receipt["startup_seconds"]
+        expected = self._receipt["control_origin_s"]
         if not math.isclose(initial_capture_s, expected, rel_tol=0, abs_tol=1e-10):
             raise ValueError(
                 "Post-startup state capture must follow the paid startup hold"
@@ -418,6 +475,14 @@ class StreamingController:
         self.logical_time_s = expected
         self.control_origin_s, self.language = expected, language
         self.trace = QueueTrace(clock=lambda: self.logical_time_s)
+        if bootstrap["startup_alignment_met"] is False:
+            self._emit("startup_alignment_failed", **self.startup_metadata())
+            raise RuntimeError(
+                f"Bootstrap service {bootstrap['bootstrap_service_seconds']:.9g}s "
+                f"exceeded requested startup release "
+                f"{bootstrap['requested_startup_release_seconds']:.9g}s; "
+                "actual hold preserved and no scored action admitted"
+            )
         self.timeline = CommandTimeline(bootstrap["actions"])
         self.mailbox = LatestFrameMailbox(self.trace)
         self.mailbox.latest = {
@@ -435,7 +500,7 @@ class StreamingController:
             "control_started",
             startup_capture_s=bootstrap["capture_s"],
             state_capture_s=initial_capture_s,
-            startup_seconds=startup_seconds,
+            **self.startup_metadata(),
             action_buffer=self.timeline.snapshot(),
         )
         for tick in range(max_steps):
@@ -535,8 +600,7 @@ class StreamingController:
             "resource_model": "independent_stage_service",
             "compute_coupling": "serialized_gpu_simulation",
             "logical_epoch_s": self.epoch_s,
-            "control_origin_s": self.control_origin_s,
-            "startup_seconds": startup_seconds,
+            **self.startup_metadata(),
             "steady_seconds": steady,
             "physical_seconds": startup_seconds + steady,
             "action_steps": len(self.actions),
@@ -556,7 +620,7 @@ class StreamingController:
                 "fixed_delay": self.fixed_delay,
                 "initial_delay_ticks": self.initial_delay,
                 "initial_over_training_budget": self.over_training_budget,
-                "startup_policy": "paid_moving_world_hold",
+                **self.startup_metadata(),
                 "boundary_order": "completion_then_offer_then_submit_then_execute",
                 "equal_completion_order": "s2_then_s1",
             },

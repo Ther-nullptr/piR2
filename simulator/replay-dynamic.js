@@ -87,7 +87,12 @@
         .filter((f) => f.relative_s <= time)
         .at(-1) ?? null;
     const physics = (episode.events ?? []).filter((e) =>
-      ["action", "bootstrap_hold", "inference_hold"].includes(e.kind),
+      [
+        "action",
+        "bootstrap_hold",
+        "startup_barrier",
+        "inference_hold",
+      ].includes(e.kind),
     );
     const active = physics.find(
       (e) => e.start_s <= time && (!finite(e.end_s) || time < e.end_s),
@@ -202,6 +207,22 @@
   function timelineAxis(start, end) {
     return `<div class="task-axis"><span>物理仿真时间 / s</span><div class="task-scale">${Array.from({ length: 6 }, (_, i) => `<span style="left:${i * 20}%">${(start + ((end - start) * i) / 5).toFixed(3)} s</span>`).join("")}</div></div>`;
   }
+  function startupLabel(e) {
+    const ms = (v) => (finite(v) ? (v * 1000).toFixed(1) : "—");
+    if (!finite(e.requested_startup_release_seconds))
+      return `启动等待 ${ms(e.startup_seconds ?? e.stage_latencies?.bootstrap_s)} ms · 未设置共同起点`;
+    const result =
+      e.startup_alignment_met === true
+        ? finite(e.startup_seconds_applied) &&
+          e.startup_seconds_applied >=
+            e.requested_startup_release_seconds - 1e-8
+          ? "启动对齐已达标"
+          : "启动对齐尚未完成"
+        : e.startup_alignment_met === false
+          ? "启动对齐未达标"
+          : "启动对齐结果未知";
+    return `共同起点 ${ms(e.requested_startup_release_seconds)} ms · bootstrap 调用 ${ms(e.bootstrap_service_seconds)} ms + 额外等待 ${ms(e.startup_barrier_seconds)} ms · ${result}（实际已推进 ${ms(e.startup_seconds_applied)} ms）`;
+  }
   function stageNfe(request, stage) {
     const count = request.server_audit?.forward_counts?.dit;
     return ["DiT server plan", "Bootstrap VLM + Flow4", "Flow DiT"].includes(
@@ -215,6 +236,7 @@
     if (!now.event) return "无已记录阶段";
     if (now.ended) return "已结束";
     if (now.event.kind === "bootstrap_hold") return "启动等待 · 目标移动";
+    if (now.event.kind === "startup_barrier") return "共同起点等待 · 目标移动";
     if (now.event.kind === "action" && now.event.fallback)
       return "Fallback · 动作执行";
     if (now.event.kind === "inference_hold") return "等待中 · 目标移动";
@@ -236,6 +258,7 @@
     timelineAxis,
     modelContract,
     timingLabel,
+    startupLabel,
     stageNfe,
     observationLabel,
     rpcScope,

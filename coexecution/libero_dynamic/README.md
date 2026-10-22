@@ -123,6 +123,10 @@ python -m coexecution.libero_dynamic evaluate-pir2 \
 
 实际CUDA调用与物理计算仍分阶段串行，S1/S2具有独立逻辑服务通道；这是逐请求实测时长驱动的事件实验，资源模型为 `independent_stage_service`、计算方式为 `serialized_gpu_simulation`。它保留每次真实调用时长，但不等于同卡真实墙钟并发部署。50ms是LIBERO动作的物理步长，模型请求不会被拉长或缩短到50ms。
 
+配对录像可加 `--startup-release-seconds 0.4`，将两种精度的控制起点共同设为首次观测后的400ms。bootstrap的真实调用耗时仍单独保留，差额记为 `startup_barrier_seconds`；物体在整段等待期间持续运动，物理层只推进一次总等待，避免两种调用时长改变子步切分。若实际bootstrap超过指定起点，该回合保留耗时和物理证据并在执行动作前报错；不会截短调用或声称对齐。S1/S2后续请求保持各自实测时长。验收配对时同时检查初始与启动后观测指纹，不能只看两个总等待数值相等。前端分别显示 Bootstrap hold 与 Startup barrier，实际视频帧时间保持原值。
+
+较慢物体的示例使用 `--speed-mps 0.015 --custom-speed` 或 `--speed-mps 0.01 --custom-speed`。这是实际物体运动速度，不是网页播放倍速；所有目标的速度配置在副本中覆盖。自定义条件标记 `speed_scope=custom`，使用独立条件ID，并保留官方模板来源；不计入官方0.03/0.06/0.09m/s的1800项评测清单。零速度不是静态开关。相同场景、速度和起点下的BF16/W8A8录像用于检查动态响应，完整套件成功率仍须单独统计。
+
 历史固定延迟控制仍通过显式 `--timing-mode fixed` 使用，并且必须给齐 `--bootstrap-latency-seconds`、`--s1-latency-seconds`、`--s2-latency-seconds`、`--recovery-latency-seconds`。该模式标记 `fixed_counterfactual` / `counterfactual_discrete_event`；native模式拒绝这些固定延迟参数。
 
 πR² 的量化对照仍加载同一已有πR² checkpoint。paired服务设置 `--inference-precision w8a8 --quantization-scope all`，评测设置 `--precision w8a8`，并使用独立输出目录。默认原生对照保持承诺策略、场景和初态一致，每种精度使用各自真实请求耗时；启动等待也各自实测，因此启动后世界状态可以不同，并会记录新的观测指纹。需要单独隔离动作数值变化时才显式采用fixed控制。不能沿用默认Flow4的整轮延迟代替πR²阶段耗时。RPC身份中的 `inference_optimization.coverage` 记录实际转换的VLM和动作侧模块。πR²可以使用分DiT CUDA Graph；整段 `--action-cuda-graph` 和 `--group-conditioning` 属于Flow路径，服务会拒绝将它们用于πR²。

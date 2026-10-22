@@ -68,6 +68,59 @@ def test_speed_rejects_false_static_or_nonbenchmark_values(speed):
         ev.override_motion_speed({"alpha_mps": 0.06}, speed)
 
 
+@pytest.mark.parametrize("speed", [0, -0.1, float("nan"), float("inf"), True])
+def test_custom_speed_still_rejects_false_static_and_invalid_values(speed):
+    with pytest.raises(ValueError):
+        ev.override_motion_speed({"alpha_mps": 0.06}, speed, custom_speed=True)
+
+
+def test_custom_speed_requires_opt_in_and_copies_official_template_without_collision():
+    rows = [
+        {
+            "suite": "libero_spatial",
+            "task_id": 0,
+            "level": "l1",
+            "traj_index": 0,
+            "item_id": "task0-l1-traj0",
+            "condition_id": f"task0-l1-traj0__s{round(speed * 100):03d}",
+            "speed_mps": speed,
+            "motion": {"alpha_mps": 0.055, "alpha_yaw": 0.2},
+        }
+        for speed in (0.03, 0.06, 0.09)
+    ]
+    inventory = {"conditions": rows}
+    before = copy.deepcopy(inventory)
+    selection = {
+        "suite": "libero_spatial",
+        "task_ids": [0],
+        "levels": ["l1"],
+        "traj_indices": [0],
+    }
+    with pytest.raises(ValueError):
+        ev.select_conditions(inventory, **selection, speed_mps=0.015)
+    selected = [
+        ev.select_conditions(
+            inventory, **selection, speed_mps=speed, custom_speed=True
+        )[0]
+        for speed in (0.01, 0.015, np.nextafter(0.015, 1.0).item())
+    ]
+    assert len({row["condition_id"] for row in selected}) == 3
+    assert [row["speed_mps"] for row in selected][:2] == [0.01, 0.015]
+    assert all(row["speed_scope"] == "custom" for row in selected)
+    assert all(
+        row["template_condition_id"] == rows[0]["condition_id"] for row in selected
+    )
+    changed, edits = ev.override_motion_speed(
+        selected[1]["motion"], 0.015, custom_speed=True
+    )
+    assert changed == {"alpha_mps": 0.015, "alpha_yaw": 0.2}
+    assert edits == [{"path": ["alpha_mps"], "before": 0.055, "after": 0.015}]
+    selected[0]["motion"]["alpha_yaw"] = 99
+    assert inventory == before
+    official = ev.select_conditions(inventory, **selection, speed_mps=0.03)[0]
+    assert official["condition_id"] == rows[0]["condition_id"]
+
+
 def test_condition_selection_rejects_missing_and_duplicate_requested_conditions():
     conditions = [
         {
@@ -659,7 +712,10 @@ def test_cli_requires_explicit_latency_choice_without_importing_simulator(
     assert "--calibrate" in capsys.readouterr().err
 
 
-def test_effective_items_read_overridden_copy_not_original_yaml(tmp_path):
+@pytest.mark.parametrize("speed,custom_speed", [(0.09, False), (0.015, True)])
+def test_effective_items_read_overridden_copy_not_original_yaml(
+    tmp_path, speed, custom_speed
+):
     import yaml
 
     upstream = tmp_path / "source"
@@ -680,7 +736,7 @@ def test_effective_items_read_overridden_copy_not_original_yaml(tmp_path):
     def build(config, levels, traj_indices, **kwargs):
         assert config != config_dir
         assert yaml.safe_load((config / original.name).read_text())["motion"] == {
-            "alpha_mps": 0.09,
+            "alpha_mps": speed,
             "alpha_yaw": 0.2,
         }
         return [{"item_id": "selected"}, {"item_id": "other"}]
@@ -694,11 +750,15 @@ def test_effective_items_read_overridden_copy_not_original_yaml(tmp_path):
         keep_static_support_contact=True,
         static_support_clearance_m=0.001,
     )
-    options = SimpleNamespace(upstream=upstream, output=output, speed_mps=0.09)
+    options = SimpleNamespace(
+        upstream=upstream, output=output, speed_mps=speed, custom_speed=custom_speed
+    )
     assert ev._effective_items(source, args, options, [{"item_id": "selected"}]) == [
         {"item_id": "selected"}
     ]
     assert original.read_bytes() == before
+    speed_evidence = json.loads((output / "speed-override.json").read_text())
+    assert speed_evidence["speed_scope"] == ("custom" if custom_speed else "official")
 
 
 class FakePolicy:
@@ -1005,8 +1065,13 @@ def native_options(tmp_path, *extra):
     )
 
 
-def test_native_cli_selects_measured_source_without_fixed_or_calibration(tmp_path):
-    options = native_options(tmp_path)
+@pytest.mark.parametrize("custom_speed", [False, True])
+def test_native_cli_selects_measured_source_without_fixed_or_calibration(
+    tmp_path, custom_speed
+):
+    options = native_options(
+        tmp_path, *(["--speed-mps", ".015", "--custom-speed"] if custom_speed else [])
+    )
     ev._validate_options(options)
     assert options.native_latency and not options.calibrate
     assert options.calibration is None and options.latency_seconds is None
@@ -1020,6 +1085,12 @@ def test_native_cli_selects_measured_source_without_fixed_or_calibration(tmp_pat
     assert args.latency_source == "measured_wallclock"
     assert args.calibrated_latency_seconds is None
     assert args.control_mode == "sync_hold"
+
+
+def test_custom_speed_without_flag_is_rejected_before_loading_conditions(tmp_path):
+    options = native_options(tmp_path, "--speed-mps", ".015")
+    with pytest.raises(ValueError, match="speed"):
+        ev._validate_options(options)
 
 
 @pytest.mark.parametrize(
