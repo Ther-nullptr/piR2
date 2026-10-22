@@ -342,6 +342,50 @@ class Backend:
             ),
         }
 
+    def synchronous_plan(self, observation, capture_s, source_tick):
+        """Fresh real VLM followed by clean Flow4; RNG resets belong to episodes."""
+        if self.variant != "flow" or self.role != "action" or self.paired:
+            raise ValueError(
+                "Synchronous planning requires a single Flow action worker"
+            )
+        validate_feature_meta({"capture_s": capture_s, "source_tick": source_tick})
+        before = dict(self.counts)
+        graph_before = self._action_graph_evidence()
+        execution_before = self.graph_counters()
+        self.stream.synchronize()
+        vlm_started = time.monotonic()
+        visual = self.vision(observation, capture_s, source_tick, return_features=False)
+        vlm_completed = time.monotonic()
+        action_started = time.monotonic()
+        actions, _ = self.core.get_action_chunk_cached(
+            {"state": observation["state"]},
+            options={"num_inference_timesteps": 4},
+            t_state_capture=capture_s,
+            period_ms=50.0,
+        )
+        raw = self.raw(actions)
+        self.stream.synchronize()
+        action_completed = time.monotonic()
+        return {
+            "actions": raw,
+            "audit": {
+                "source_tick": source_tick,
+                "capture_s": capture_s,
+                "frame_hashes": visual["meta"]["frame_hashes"],
+                "vlm_started_s": vlm_started,
+                "vlm_completed_s": vlm_completed,
+                "action_started_s": action_started,
+                "action_completed_s": action_completed,
+                "decoded_horizon": len(raw),
+                "timing_scope": "stream-complete server stages including preparation and decode; not kernel-only time",
+                "vlm_graph_execution": visual["meta"].get("graph_execution"),
+                "graph_execution": self.graph_execution(execution_before),
+                **action_execution_counts(
+                    before, self.counts, graph_before, self._action_graph_evidence()
+                ),
+            },
+        }
+
     def plan(
         self,
         observation,

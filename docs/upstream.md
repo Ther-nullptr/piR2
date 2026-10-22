@@ -1,68 +1,38 @@
-# Upstream relationship / 与作者代码的关系
+# 源码关系与版本追踪
 
-`Ther-nullptr/piR2` is an independent experiment repository, not the paper authors' official repository and not a GitHub fork. The runtime directory `upstream/` is a clone of [the official parent repository](https://github.com/pi-r2-flow/pi-r2-flow), whose `learning/Isaac-GR00T` submodule supplies the actual πR²/Flow implementation.
+本仓库把作者的 πR²/Flow 实现、NVIDIA 任务权重和本地量化/调度工具连接为 LIBERO 实验流程。算法来源、任务权重和实验工程分别追踪，便于复刻同一配置或替换其中一层。
 
-The parent is pinned to `3af52ca400a6ec7d141416879aa531a6f62f697a`, and the GR00T fork to `2a39d591a3af24c42bb1d1c9cd708a2dddac0600`. Our repository owns the experiment entrypoints, LIBERO adaptation, timing/evaluation tooling and explicitly recorded corrections. It does not present the algorithm as newly invented here.
+## 各层来源
 
-Source locations and commits live in [sources.lock.json](../sources.lock.json). Model and simulation dependencies are downloaded into ignored working directories. The operator implementations used at runtime are owned under `coexecution/kernels/`, with explicit origin revisions, file hashes and retained notices. CUTLASS has an official Git submodule as its reproducible default; compatible environment installations are also supported. GR00T corrections remain patches against its pinned model source; kernel updates modify the owned implementation directly.
+| 层次                     | 来源与固定版本                                                                                                                                                                   | 在本项目中的位置                                                |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| πR² 发布仓库             | [pi-r2-flow/pi-r2-flow](https://github.com/pi-r2-flow/pi-r2-flow)，`3af52ca400a6ec7d141416879aa531a6f62f697a`                                                                    | 本地 `upstream/`                                                |
+| πR² / Flow 模型实现      | 作者 GR00T fork，`2a39d591a3af24c42bb1d1c9cd708a2dddac0600`                                                                                                                      | `upstream/learning/Isaac-GR00T`                                 |
+| LIBERO 任务权重          | [NVIDIA GR00T-N1.7-LIBERO](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO)，版本见[模型清单](../configs/libero/model-family.json)                                               | 本地 `models/`                                                  |
+| 整数及 Thor 浮点算子参考 | [The Speedup Paradox](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/tree/239b4a3ef2268048571c9f508ad5700f98398c2f)，`239b4a3ef2268048571c9f508ad5700f98398c2f` | [仓库内算子](../coexecution/kernels/)及其修改                   |
+| CUTLASS 通用依赖         | [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass)，默认 `982748aa7356fa838c2ea4994ddcb0b2a4b4cefa`                                                                             | Git submodule 或 `CUTLASS_ROOT`                                 |
+| 实验工程                 | 本仓库维护                                                                                                                                                                       | LIBERO 适配、模型服务、融合与量化适配、时序评测、回放及修正补丁 |
 
-The official release focuses on xArm6 + XHand deployment and GR00T training. Our LIBERO experiments and reconstructed Leap data therefore require separate validation; they are not the authors' original experiment assets.
+`Ther-nullptr/piR2` 是独立维护的实验仓库，与作者仓库之间通过固定源码和补丁建立关系；GitHub 上没有 fork 关系。作者发布面向 xArm6 + XHand 部署及 GR00T 训练，本仓库的 LIBERO 适配和 Leap 数据重建使用各自的任务资产与评测协议。
 
-## Low-bit backend reference / 低比特量化参考实现
+<a id="low-bit-backend-reference--低比特量化参考实现"></a>
 
-The `robotics-kernels` origin is [Speedup Paradox](https://github.com/thu-ee-acts-lab/robotics-the-speedup-paradox/tree/239b4a3ef2268048571c9f508ad5700f98398c2f)
-at `239b4a3ef2268048571c9f508ad5700f98398c2f`. The selected integer/common
-runtime, CUDA GEMMs and Thor FP8/FP4 kernels now live in
-[coexecution/kernels](../coexecution/kernels/). Their source manifest distinguishes
-original upstream bytes from repository adaptations and records the default
-CUTLASS dependency. The preparation command
-`python tools/prepare_sources.py --component robotics-kernels` verifies these
-owned files and records the actual selected CUTLASS source; it does not fetch an
-external runtime checkout, initialize the submodule, or apply patches.
+## 修改放在哪里
 
-CUTLASS defaults to [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) at
-`982748aa7356fa838c2ea4994ddcb0b2a4b4cefa`, the same revision previously recorded
-for the copied headers. piR2 tracks this default Git link at
-`coexecution/kernels/vendor/cutlass`, together with dependency metadata, rather
-than tracking each upstream header as a piR2 file. The original
-[CUTLASS license](https://github.com/NVIDIA/cutlass/blob/982748aa7356fa838c2ea4994ddcb0b2a4b4cefa/LICENSE.txt)
-and file-specific notices remain with the submodule. Actual piR2 CUDA operators
-remain local files outside that submodule.
+- **模型修正**：以 [GR00T 补丁](../patches/groot-reproduction-fixes.patch)追踪，应用于固定作者版本。
+- **CUDA 算子**：直接维护在 [coexecution/kernels](../coexecution/kernels/)。[源码清单](../coexecution/kernels/SOURCE_MANIFEST.json)记录参考版本、原文件与仓库修改。
+- **模型适配与 Triton producer**：维护在 [coexecution/optimization](../coexecution/optimization/)，负责算子选择、张量契约、图捕获和模型接入。
+- **依赖与许可**：[sources.lock.json](../sources.lock.json)记录源码固定版本；[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)及随附许可保留各组件条款。
 
-Initialize the default checkout with
-`git submodule update --init --recursive coexecution/kernels/vendor/cutlass`.
-Authors can alternatively set `CUTLASS_ROOT=/path/to/cutlass` for a compatible
-Git checkout or complete header installation, or select a compatible local
-submodule revision. Required `include/` and `tools/util/include/` structure and
-kernel/toolchain APIs must be available; arbitrary versions are not guaranteed
-to work. Actual Git revisions are recorded when available, and a different SHA
-alone is not rejected. Existing Git clones can also be used as optional download
-caches through `--reference` and `--dissociate`.
+例如，FP4 的两种带 bias、M=41 的 Swap-AB 配置已进入仓库内 CUDA 实现；`--fp4-swap-ab` 与 `floating_gemm=swap_ab` 选择该分支，其他形状按原有路径处理。更新实现后重编译对应 backend 即可，使用方无需另行应用外部仓库补丁。
 
-After pulling or switching piR2 branches, use the update command when selecting
-that branch's recorded default. Preserve intentional local version choices;
-routine default setup does not need `--remote`. Keep personal submodule version
-changes out of unrelated commits. Changing the project's default CUTLASS pin
-remains a separate reviewed change. See the
-[setup choices](environment.md#cutlass-submodule).
+## 准备源码与复现实验
 
-[PR #21](https://github.com/Ther-nullptr/piR2/pull/21)'s two biased M=41 FP4
-Swap-AB configurations are implemented directly in the owned FP4 CUDA source.
-The `--fp4-swap-ab` flag and exact-shape fallback remain available; the unified
-operator profile also accepts `floating_gemm=swap_ab`. No external repository
-patch or prebuilt-library path is needed. This relocation does not establish new
-hardware performance or closed-loop quality.
+```bash
+python3 tools/prepare_sources.py --component groot
+python3 tools/prepare_sources.py --component robotics-kernels
+```
 
-The model adapters and floating Triton producers remain in
-`coexecution/optimization/`, separate from hardware kernels. Integer and floating
-formats retain distinct contracts. Source revisions and notices are recorded in
-[sources.lock.json](../sources.lock.json) and
-[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). See
-[integer setup](environment.md#optional-gr00t-fusion-and-integer-inference) and
-[Thor setup](environment.md#optional-thor-floating-inference) for toolchain and
-hardware requirements.
+第一条准备固定模型源码和本地补丁。第二条核验仓库内算子文件，并记录实际选择的 CUTLASS；运行前需按[环境指南](environment.md#cutlass-submodule)准备默认 submodule 或兼容头文件安装。核验过程保留现有源码和依赖选择。
 
-这里复用参考实现的量化计算路径，不把它描述为新量化算法，也不将参考项目的任务成功率
-视为 GR00T 或 πR² 的质量结论。当前接入范围为标准 Flow 及串行 πR²；真实动作头的
-随机权重滚动测试不等于训练后检查点或 LIBERO 闭环已验证。性能和质量报告必须注明真实模型、检查点、
-输入、执行路径与测量范围。
+复现实验时，记录源码/补丁哈希、checkpoint、输入或数据集、执行配置、实际 CUTLASS 版本和硬件环境。整数 W8A8/W4A4 与 Thor FP8/FP4 使用各自的数据格式和适配契约；可用接口及验证步骤见[算子参考](../coexecution/README.md)和[平台交接](platform-handoff.md)。任务质量由对应 checkpoint 的 LIBERO 闭环结果给出，算子参考项目和辅助回放保留各自的结果归属。

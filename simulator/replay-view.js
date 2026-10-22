@@ -19,6 +19,8 @@
     layout_copy: "#8c86ac",
     transfer: "#6e9ca7",
     unknown: "#a4aba5",
+    inference_phase: "#766eab",
+    execution_phase: "#3c8e72",
   };
   const state = {
     catalog: null,
@@ -26,6 +28,15 @@
     runs: [],
     kind: "model",
     executionClock: "paced",
+    executionCoupling: "asynchronous",
+    schedule: null,
+    // Undefined only while resolving a new load. Null is a bound unknown
+    // schedule, as for the cached-worker protocol; it is not a wildcard.
+    cohortSchedule: undefined,
+    // Null is a bound unknown policy, never permission to mix policy variants.
+    cohortPolicy: undefined,
+    controllerPolicy: null,
+    cohortController: undefined,
     type: "clean",
     scope: "prepared_model",
     precision: "all",
@@ -73,9 +84,130 @@
   };
   const color = (p) => colors[p] ?? "#78669d";
   const cadenceLabels = {
-    paced: "固定 20 Hz 墙钟节拍",
+    paced: "20 Hz 目标节拍（50 ms / 步）",
     ready: "就绪即接纳（StreamingVLA式调度，GR00T）",
   };
+  const couplingLabels = {
+    asynchronous: "Asynchronous · 动作与推理重叠",
+    synchronous: "Synchronous · 推理完成后执行动作段",
+    one_step_async: "One-step async · 提前推理下一步 / 当前步执行",
+    chunked_async: "Chunked async · 动作前缀 K / 提前 D 步推理",
+  };
+  function cadenceLabel(mode) {
+    if (state.executionCoupling === "chunked_async")
+      return "分块异步 · 执行承诺前缀 / 边界未就绪则等待";
+    if (state.executionCoupling === "one_step_async")
+      return "单步异步 · 无墙钟节拍等待 / 未就绪则等待结果";
+    if (state.executionCoupling === "synchronous")
+      return mode === "paced"
+        ? "执行段 20 Hz · 推理期间暂停仿真"
+        : "执行段无额外等待 · 推理期间暂停仿真";
+    return cadenceLabels[mode] ?? mode;
+  }
+  const catalogRuns = () =>
+    state.descriptors.length ? state.descriptors : state.runs;
+  const episodeKey = (episode) =>
+    [episode.task_id, episode.episode_id, episode.seed].join("/");
+  function configureCouplings(preferred = state.executionCoupling) {
+    const couplings = [
+      ...new Set(
+        catalogRuns()
+          .filter((run) => run.kind === "deployment")
+          .map(R.deploymentCoupling),
+      ),
+    ];
+    options(
+      $("execution-coupling"),
+      couplings.map((mode) => [mode, couplingLabels[mode] ?? mode]),
+      preferred,
+    );
+    state.executionCoupling = $("execution-coupling").value || "asynchronous";
+  }
+  function configureCadences(preferred = state.executionClock) {
+    const cadences = [
+      ...new Set(
+        catalogRuns()
+          .filter(
+            (run) =>
+              run.kind === "deployment" &&
+              R.deploymentCoupling(run) === state.executionCoupling,
+          )
+          .map(R.deploymentCadence),
+      ),
+    ];
+    options(
+      $("execution-clock"),
+      cadences.map((mode) => [mode, cadenceLabel(mode)]),
+      preferred,
+    );
+    state.executionClock = $("execution-clock").value || "paced";
+  }
+  function configureControllers(
+    preferred = state.controllerPolicy,
+    preserve = false,
+  ) {
+    const choices = [
+      ...new Set(
+        R.replayDescriptors(
+          catalogRuns(),
+          "deployment",
+          state.executionClock,
+          state.executionCoupling,
+        ).map(R.controllerPolicy),
+      ),
+    ].filter((v) => v !== "invalid");
+    if (preserve && !choices.includes(preferred)) choices.unshift(preferred);
+    const selected = choices.includes(preferred)
+      ? preferred
+      : choices.includes("conservative")
+        ? "conservative"
+        : (choices[0] ?? null);
+    options(
+      $("controller-policy"),
+      choices.map((v) => [v ?? "unknown", R.controllerLabel(v)]),
+      selected ?? "unknown",
+    );
+    state.controllerPolicy =
+      $("controller-policy").value === "unknown"
+        ? null
+        : $("controller-policy").value || null;
+  }
+  function configureSchedules(preferred = state.schedule) {
+    const choices = R.scheduleChoices(
+      catalogRuns(),
+      state.executionClock,
+      state.executionCoupling,
+    );
+    state.schedule = R.selectSchedule(choices, preferred);
+    const ks = [...new Set(choices.map((s) => s.k))];
+    options(
+      $("execution-prefix-steps"),
+      ks.length
+        ? ks.map((k) => [k, `K = ${k} actions`])
+        : [["", "未记录固定前缀"]],
+      state.schedule?.k,
+    );
+    const ds = choices.filter((s) => s.k === state.schedule?.k).map((s) => s.d);
+    options(
+      $("async-overlap-steps"),
+      ds.length
+        ? ds.map((d) => [d, `D = ${d} steps`])
+        : [["", "不适用 / 未记录"]],
+      state.schedule?.d,
+    );
+    $("execution-prefix-steps").disabled = state.loading || !ks.length;
+    $("async-overlap-steps").disabled = state.loading || !ds.length;
+  }
+  function selectedDescriptors(descriptors = state.descriptors) {
+    return R.replayDescriptors(
+      descriptors,
+      state.kind,
+      state.executionClock,
+      state.executionCoupling,
+      state.schedule,
+      state.controllerPolicy,
+    );
+  }
   const notice = (value, bad = false) => {
     $("data-status").textContent = value;
     $("data-status").dataset.state = bad ? "error" : "ready";
@@ -111,6 +243,25 @@
     return (state.catalog?.streams ?? []).some((entry) => entry.run_id === id);
   }
   function normalizeRun(run, descriptor) {
+    if (
+      descriptor &&
+      !R.matchesDescriptor(
+        run,
+        descriptor,
+        state.cohortSchedule,
+        state.cohortPolicy,
+        state.cohortController,
+      )
+    )
+      return {
+        ...descriptor,
+        descriptor,
+        error:
+          "Run / stream changed the selected precision, K/D schedule, model or controller policy",
+        episodes: [],
+        clean_requests: [],
+        profile_requests: [],
+      };
     return {
       ...run,
       descriptor,
@@ -253,18 +404,16 @@
     for (const element of document.querySelectorAll(".run-select")) {
       const run = state.rows[Number(element.dataset.index)]?.run;
       if (!run) continue;
-      const descriptors = R.replayDescriptors(
-        state.descriptors,
-        state.kind,
-        state.executionClock,
-      ).filter((descriptor) => descriptor.precision === run.precision);
+      const descriptors = selectedDescriptors().filter(
+        (descriptor) => descriptor.precision === run.precision,
+      );
       if (!descriptors.some((descriptor) => descriptor.id === run.id))
         descriptors.unshift(run.descriptor ?? run);
       options(
         element,
         descriptors.map((descriptor) => [
           descriptor.id,
-          descriptor.mode ?? descriptor.label ?? descriptor.id,
+          descriptor.label ?? descriptor.mode ?? descriptor.id,
         ]),
         run.id,
       );
@@ -295,25 +444,29 @@
         state.catalog = catalog;
         state.descriptors = catalog.runs ?? [];
         showCatalogMetadata();
-        if (
-          !state.runs.length &&
-          R.replayDescriptors(
-            state.descriptors,
-            state.kind,
-            state.executionClock,
-          ).length
-        ) {
-          await loadRuns();
+        configureCouplings();
+        configureCadences();
+        configureControllers(state.controllerPolicy, true);
+        configureSchedules();
+        const selected = selectedDescriptors();
+        const changedSchedule =
+          state.descriptors.length > 0 &&
+          state.runs.some(
+            (run) => !selected.some((d) => R.matchesDescriptor(run, d)),
+          );
+        const addedPrecision = selected.some(
+          (d) => !state.runs.some((r) => r.precision === d.precision),
+        );
+        if (changedSchedule || addedPrecision) {
+          await reloadCohort();
           return;
         }
         updateRunOptions();
         const precisions = [
           ...new Set(
-            R.replayDescriptors(
-              [...state.descriptors, ...state.runs],
-              state.kind,
-              state.executionClock,
-            ).map((run) => run.precision),
+            selectedDescriptors([...state.descriptors, ...state.runs]).map(
+              (run) => run.precision,
+            ),
           ),
         ];
         options(
@@ -323,19 +476,6 @@
             ...precisions.map((precision) => [precision, label(precision)]),
           ],
           state.precision,
-        );
-        const cadences = [
-          ...new Set([
-            ...[...state.descriptors, ...state.runs]
-              .filter((run) => run.kind === "deployment")
-              .map(R.deploymentCadence),
-            ...($("execution-clock").value ? [$("execution-clock").value] : []),
-          ]),
-        ];
-        options(
-          $("execution-clock"),
-          cadences.map((mode) => [mode, cadenceLabels[mode] ?? mode]),
-          state.executionClock,
         );
         for (const [id, entry] of state.streams) {
           if (declaredStream(id)) continue;
@@ -355,6 +495,10 @@
   const secondaryControls = [
     "record-type",
     "execution-clock",
+    "execution-coupling",
+    "controller-policy",
+    "execution-prefix-steps",
+    "async-overlap-steps",
     "scope",
     "sample",
     "precision",
@@ -373,11 +517,22 @@
   function loadingControls(loading) {
     state.loading = loading;
     for (const id of secondaryControls) $(id).disabled = loading;
+    if (!loading) configureSchedules();
     for (const kind of ["model", "deployment"])
       $("mode-" + kind).setAttribute(
         "aria-pressed",
         String(kind === state.kind),
       );
+  }
+  function reloadCohort() {
+    state.clock = 0;
+    state.sample = null;
+    return loadRuns();
+  }
+  function setView(kind) {
+    state.kind = kind;
+    $("speed").value = kind === "model" ? "0.01" : "1";
+    return reloadCohort();
   }
   async function loadRuns() {
     stop();
@@ -386,6 +541,9 @@
     state.mediaEpoch++;
     state.rows = [];
     state.runs = [];
+    state.cohortSchedule = undefined;
+    state.cohortPolicy = undefined;
+    state.cohortController = undefined;
     loadingControls(true);
     state.events = [];
     state.selected = null;
@@ -398,11 +556,22 @@
     $("data-status").textContent = "加载记录…";
     $("data-status").dataset.state = "loading";
     const kind = state.kind;
-    const descriptors = R.replayDescriptors(
-        state.descriptors,
-        kind,
-        state.executionClock,
-      ),
+    const url = new URL(location.href);
+    url.searchParams.set("view", kind);
+    for (const [key, value] of Object.entries({
+      execution_clock: kind === "deployment" ? state.executionClock : null,
+      execution_coupling:
+        kind === "deployment" ? state.executionCoupling : null,
+      execution_prefix_steps: kind === "deployment" ? state.schedule?.k : null,
+      async_overlap_steps: kind === "deployment" ? state.schedule?.d : null,
+      deployment_scheduling_policy:
+        kind === "deployment" ? (state.controllerPolicy ?? "unknown") : null,
+    })) {
+      if (value == null) url.searchParams.delete(key);
+      else url.searchParams.set(key, value);
+    }
+    history.replaceState(null, "", url);
+    const descriptors = selectedDescriptors(),
       precisions = [...new Set(descriptors.map((d) => d.precision))].sort(
         (a, b) =>
           ["bf16", "w8a8", "w4a4"].indexOf(a) -
@@ -410,8 +579,10 @@
       );
     const selected = precisions.map(
       (p) =>
-        descriptors.find((d) => d.id === state.selection.get(kind + ":" + p)) ??
-        descriptors.find((d) => d.precision === p),
+        descriptors.find(
+          (d) =>
+            d.precision === p && d.id === state.selection.get(kind + ":" + p),
+        ) ?? descriptors.find((d) => d.precision === p),
     );
     const result = await loader.load(() =>
       Promise.all(
@@ -455,6 +626,25 @@
         run.descriptor ?? selected.find((d) => d.id === run.id),
       );
     });
+    // Bind actual legacy dimensions once per load. Every later SSE projection
+    // must retain this binding, even when all stream descriptors omit K/D.
+    // Only an explicit cohort reload may resolve another actual schedule.
+    if (kind === "deployment") {
+      state.cohortSchedule =
+        state.schedule ??
+        state.runs
+          .filter((run) => !run.error)
+          .map(R.deploymentSchedule)
+          .find((schedule) => schedule != null) ??
+        null;
+      state.cohortController = R.controllerPolicy(
+        state.runs.find((run) => !run.error) ?? {},
+      );
+      state.cohortPolicy = R.policyVariant(
+        state.runs.find((run) => !run.error) ?? {},
+      );
+      state.runs = state.runs.map((run) => normalizeRun(run, run.descriptor));
+    }
     loadingControls(false);
     state.runs.forEach((r) =>
       state.selection.set(kind + ":" + r.precision, r.id),
@@ -532,9 +722,7 @@
       const unique = new Map();
       for (const run of runs)
         for (const episode of run.episodes ?? []) {
-          const key = [episode.task_id, episode.episode_id, episode.seed].join(
-            "/",
-          );
+          const key = episodeKey(episode);
           if (!unique.has(key)) unique.set(key, episode);
         }
       samples = [...unique.entries()];
@@ -544,26 +732,25 @@
           key,
           `Task ${e.task_id} · episode ${e.episode_id} · seed ${e.seed}`,
         ]),
-        previous?.task_id != null
-          ? [previous.task_id, previous.episode_id, previous.seed].join("/")
-          : null,
+        previous?.task_id != null ? episodeKey(previous) : null,
       );
       if (preserve && state.followLatest) {
         const latest = runs
           .find((run) => run.id === state.latestStreamRun)
           ?.episodes?.at(-1);
-        if (latest)
-          $("sample").value = [
-            latest.task_id,
-            latest.episode_id,
-            latest.seed,
-          ].join("/");
+        if (latest) $("sample").value = episodeKey(latest);
       }
       state.sample = unique.get($("sample").value) ?? null;
     }
     $("record-label").hidden = state.kind !== "model";
     $("scope-label").hidden = state.kind !== "model";
     $("execution-clock-label").hidden = state.kind !== "deployment";
+    $("execution-coupling-label").hidden = state.kind !== "deployment";
+    $("controller-policy-label").hidden = state.kind !== "deployment";
+    $("execution-prefix-label").hidden =
+      state.kind !== "deployment" || state.executionCoupling === "asynchronous";
+    $("async-overlap-label").hidden =
+      state.kind !== "deployment" || state.executionCoupling === "asynchronous";
     $("sample-label").textContent =
       state.kind === "model" ? "输入 / 随机种子" : "任务 / 回合";
     const modelChannels = [
@@ -629,8 +816,7 @@
         run,
         episode:
           (run.episodes ?? []).find(
-            (e) =>
-              [e.task_id, e.episode_id, e.seed].join("/") === $("sample").value,
+            (e) => episodeKey(e) === $("sample").value,
           ) ?? null,
       }));
       state.end = Math.max(
@@ -641,10 +827,18 @@
         (r) => r.episode && R.pairedEpisode(state.rows[0].episode, r.episode),
       );
       $("evidence-note").textContent =
-        `${cadenceLabels[state.executionClock]} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
-        (state.executionClock === "ready"
-          ? " 每次 env.step 仍推进 0.05 s 仿真时间；上一步结束即接纳已完成计划，不额外等待 50 ms。实际墙钟执行率与实时倍率分别显示。沿用 GR00T Flow4 / H40 / 解码16，无 StreamingVLA AFM/AEO 权重；视频按原始帧时间映射，不加速伪装。"
-          : " 控制目标为每 50 ms 执行一步，实际时序单独验证。") +
+        `${couplingLabels[state.executionCoupling]} · ${cadenceLabel(state.executionClock)} · ${R.controllerLabel(state.cohortController)} · 真实闭环 · ${paired ? "已验证相同初始场景" : "初始场景配对未验证"}。不同精度使用各自观测、动作与机器人轨迹，以实际控制墙钟对齐。` +
+        (state.cohortPolicy === "pir2"
+          ? ` ${R.policyNote(runs.find((run) => !run.error) ?? {})} 墙钟目标是 t₀ + k×50 ms 执行第 k 步；提前完成的推理等到执行时刻，迟到则保留实测时间。Action execution 画出实际 env.step，Between steps 包含节拍等待和控制开销；50 ms 仿真推进量不等于 env.step 墙钟耗时。`
+          : state.executionCoupling === "synchronous"
+            ? " 每个周期先完成实际 VLM + Flow4，再执行记录中的动作段；推理与执行阶段互斥。20 Hz 仅适用于 paced 的执行段，全局固定频率有效性不适用。视频停帧按真实采集时间映射，墙钟继续推进而 physics clock 暂停。"
+            : state.executionCoupling === "chunked_async"
+              ? ` 配置 K=${state.schedule?.k ?? "?"} / D=${state.schedule?.d ?? "?"}：在当前前缀剩余 D 步时捕获观测、提交下一完整 VLM + Flow4；到边界才接纳，未就绪则等待，不增执行旧动作。实际滞后为 bootstrap 的 offset，其余 D+offset。墙钟摊销 = 控制总时长 / 实际动作数；块内动作间隔 P50 不能代表吞吐。终止后的未用推理完整保留。`
+              : state.executionCoupling === "one_step_async"
+                ? " 当前动作执行前捕获观测并提前推理下一步；每份结果只执行第 1 个动作，未完成则显式等待。首次 bootstrap 使用当前观测，其余动作滞后 1 个物理步；墙钟 AoI 独立报告。末次未使用推理保留至排空完成，机器人停在真实末帧。实际 RPC 从 worker 输入准备之后计时，不能直接与同步完整调用边界作速度比。"
+                : state.executionClock === "ready"
+                  ? " 每次 env.step 仍推进 0.05 s 仿真时间；上一步结束即接纳已完成计划，不额外等待 50 ms。实际墙钟执行率与实时倍率分别显示。模型身份以各运行的 worker 与 checkpoint 证据为准；视频按原始帧时间映射，不加速伪装。"
+                  : " 控制目标为每 50 ms 执行一步，实际时序单独验证。") +
         " 当前为调试示例，不是套件成功率；记录相机拷贝会带来开销。";
     }
     const canPlay =
@@ -707,19 +901,40 @@
             name: `${R.scopeInfo(state.scope).label} · ${record.clean_wall === true ? "Clean wall" : "Recorded wall（插桩未验证）"} · 无内核时间线`,
           });
       } else if (episode) {
-        for (const request of episode.queue?.requests ?? [])
+        for (const phase of episode.phases ?? [])
+          out.push({
+            id: phase.id,
+            precision: run.precision,
+            run,
+            episode,
+            phase,
+            kind: "phase",
+            time: phase.start_s,
+            end: phase.end_s,
+            stage: "phase",
+            category: phase.phase + "_phase",
+            name: `Request ${phase.request_id ?? phase.cycle} · ${phase.phase}${phase.simulation_paused ? " / simulation paused" : ""}`,
+          });
+        for (const request of R.timelineQueue(episode)?.requests ?? [])
           out.push({
             id: request.id,
             precision: run.precision,
             run,
             episode,
             request,
-            kind: "rpc",
+            kind: request.timing_scope?.startsWith("server_")
+              ? "server_stage"
+              : "rpc",
             time: request.start_s,
             end: request.end_s ?? request.completed_s ?? request.start_s,
             stage: request.role === "S2" ? "vlm" : "action",
-            name: `${request.role} request ${request.request_tick ?? request.source_tick ?? request.feature_source_tick ?? "?"}`,
+            name: `${request.role} ${request.timing_scope?.startsWith("server_") ? "stage" : "request"} ${request.request_tick ?? request.source_tick ?? request.feature_source_tick ?? "?"}`,
           });
+        const control = new Map(
+          R.controlIntervals(episode)
+            .filter((p) => p.kind === "execution")
+            .map((p) => [p.id, p]),
+        );
         for (const tick of episode.ticks ?? [])
           out.push({
             id: tick.id,
@@ -729,7 +944,8 @@
             tick,
             kind: "command",
             time: tick.relative_s,
-            end: tick.relative_s,
+            end: control.get(tick.id)?.end_s ?? null,
+            control_interval: control.get(tick.id) ?? null,
             stage: "control",
             name: `执行动作 · tick ${tick.tick}`,
           });
@@ -740,30 +956,19 @@
     );
   }
   function renderCards() {
-    $("precision-cards").style.gridTemplateColumns =
-      state.rows.length === 1 ? "minmax(0,1fr)" : "";
+    $("precision-cards").style.setProperty(
+      "--precision-count",
+      state.rows.length || 1,
+    );
     $("precision-cards").innerHTML =
       state.rows
         .map(
           ({ run }, i) =>
-            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2><select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置">${state.descriptors
-              .filter(
-                (d) =>
-                  d.kind === state.kind &&
-                  d.precision === run.precision &&
-                  (state.kind !== "deployment" ||
-                    R.deploymentCadence(d) === state.executionClock),
-              )
-              .map(
-                (d) =>
-                  `<option value="${esc(d.id)}" ${d.id === run.id ? "selected" : ""}>${esc(d.label ?? d.mode ?? d.id)}</option>`,
-              )
-              .join(
-                "",
-              )}</select></div><div class="media-stage"><span class="media-message">等待实际观测</span><div class="frame-meta"></div></div><div class="card-status"></div><div class="metrics"></div><p class="card-details"></p><button class="card-action" data-index="${i}">检查当前动作来源</button><a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
+            `<article class="precision-card" data-precision="${esc(run.precision)}" data-boundary="${esc(state.kind === "model" ? state.scope : "deployment")}" style="--precision:${color(run.precision)}"><div class="card-heading"><h2>${esc(label(run.precision))}</h2>${state.kind === "deployment" ? `<span class="coupling-badge">${R.policyVariant(run) === "pir2" ? "πR² · cached VLM / rolling DiT" : R.deploymentCoupling(run) === "synchronous" ? "Synchronous" : R.deploymentCoupling(run) === "one_step_async" ? "One-step async" : R.deploymentCoupling(run) === "chunked_async" ? "Chunked async" : "Asynchronous"}</span>` : ""}<select class="run-select" data-index="${i}" aria-label="${esc(label(run.precision))} 运行配置"></select></div><div class="media-stage"><span class="media-message">等待实际观测</span><div class="frame-meta"></div></div><div class="card-status"></div><div class="metrics"></div><p class="card-details"></p><button class="card-action" data-index="${i}">检查当前动作来源</button><a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
         )
         .join("") ||
       '<p class="loading">此证据类型没有记录。已配置的其他视图仍可使用。</p>';
+    updateRunOptions();
     for (const el of document.querySelectorAll(".run-select"))
       el.addEventListener("change", () => {
         const row = state.rows[Number(el.dataset.index)];
@@ -818,6 +1023,8 @@
         status.textContent = run.error;
         status.dataset.status = "bad";
         details.textContent = run.id;
+        metrics.replaceChildren();
+        syncMedia(card, null, null, "记录不可用；不沿用旧帧或旧指标");
         return;
       }
       if (state.kind === "model") {
@@ -887,6 +1094,17 @@
         }
         const at = R.robotAt(episode, state.clock, $("camera").value),
           meta = episode?.metadata ?? {},
+          synchronous = R.deploymentCoupling(run) === "synchronous",
+          lookahead = R.isFullPolicyAsync(run),
+          schedule = R.deploymentSchedule(run),
+          prefix = R.currentPrefix(episode, at.tick),
+          pir2 = R.policyVariant(run) === "pir2",
+          policy = run.policy_identity ?? {},
+          counts = episode.policy_evidence ?? {},
+          waits = R.waitStats(episode),
+          fullPolicy = synchronous || lookahead,
+          timing = episode.queue?.metrics ?? {},
+          phase = R.phaseAt(episode, state.clock),
           queue = episode?.queue
             ? Q.stateAt(
                 episode.queue,
@@ -901,7 +1119,7 @@
               : "结果未知";
         status.textContent = !episode
           ? "该任务没有回合记录"
-          : `${at.ended ? "已结束" : "正在回放"} · 回合最终结果：${verdict} · ${R.deploymentCadence(run) === "ready" ? "固定频率有效性不适用" : meta.control_rate_valid === false ? "时序无效" : meta.control_rate_valid === true ? "控制时序有效" : "控制时序未知"} · ${meta.termination_reason ?? "原因未知"}${episode.robot?.error ? " · " + episode.robot.error : ""}`;
+          : `${lookahead ? R.asyncStatus(episode, state.clock) : at.ended ? "已结束" : synchronous ? (phase?.phase === "inference" ? "Inference / simulation paused" : phase?.phase === "execution" ? "Executing" : "Cycle transition") : "正在回放"} · 回合最终结果：${verdict} · ${synchronous || R.deploymentCadence(run) === "ready" ? "固定频率有效性不适用" : meta.control_rate_valid === false ? "时序无效" : meta.control_rate_valid === true ? "控制时序有效" : "控制时序未知"} · ${meta.termination_reason ?? "原因未知"}${episode.robot?.error ? " · " + episode.robot.error : ""}`;
         status.dataset.status =
           meta.success === false || meta.control_rate_valid === false
             ? "bad"
@@ -923,8 +1141,158 @@
           },
         );
         metrics.innerHTML = metricsHTML([
-          ["S1 RPC P50", meta.action_rpc_seconds?.p50 * 1000, "ms"],
-          ["S1 RPC P95", meta.action_rpc_seconds?.p95 * 1000, "ms"],
+          ["Policy", R.policyLabel(run), ""],
+          ...(pir2
+            ? [
+                [
+                  "Predicted / native decoded horizon",
+                  `${policy.predicted_horizon ?? "?"} / ${policy.decoded_horizon ?? "?"}`,
+                  "steps",
+                ],
+                [
+                  "S1 normal / recovery requests",
+                  `${counts.s1?.normal_requests ?? "?"} / ${counts.s1?.recovery_requests ?? "?"}`,
+                  "1 / 5 DiT NFE",
+                ],
+                [
+                  "S1 total DiT calls (incl. final unused)",
+                  counts.s1?.dit_forward_calls ?? null,
+                  "calls",
+                ],
+                [
+                  "S1 unknown count records",
+                  counts.s1?.unknown_requests ?? null,
+                  "requests",
+                ],
+                [
+                  "Bootstrap VLM / DiT calls",
+                  `${counts.bootstrap?.forward_counts?.vlm ?? "?"} / ${counts.bootstrap?.forward_counts?.dit ?? "?"}`,
+                  "before control",
+                ],
+                [
+                  "S2 completed RPCs",
+                  counts.s2?.requests ?? null,
+                  "incl. final drain",
+                ],
+                [
+                  "S2 verified VLM calls / unknown",
+                  `${counts.s2?.verified_vlm_forward_calls ?? "?"} / ${counts.s2?.unknown_requests ?? "?"}`,
+                  "exact-source audit",
+                ],
+                [
+                  "Consumed visual / request state tick",
+                  `${queue?.executedRequest?.feature_source_tick ?? "?"} / ${queue?.executedRequest?.state_tick ?? "?"}`,
+                  "tick",
+                ],
+              ]
+            : []),
+          ...(fullPolicy
+            ? [
+                [
+                  "Configured prefix / overlap",
+                  schedule ? `K=${schedule.k} / D=${schedule.d}` : "未知",
+                  "steps",
+                ],
+                [
+                  "Control wall / actual actions",
+                  R.scaleMetric(timing.amortized_wall_seconds_per_action, 1000),
+                  "ms/action",
+                ],
+                ["Effective execution rate", timing.actual_control_hz, "Hz"],
+                [
+                  "Prefix boundary gap P95",
+                  R.scaleMetric(timing.boundary_gap_seconds?.p95, 1000),
+                  "ms",
+                ],
+                [
+                  "Adjacent action gap P95",
+                  R.scaleMetric(timing.adjacent_action_gap_seconds?.p95, 1000),
+                  "ms",
+                ],
+                ["Actual actions", episode.ticks?.length ?? null, "steps"],
+              ]
+            : []),
+          [
+            fullPolicy ? "DiT stage P50" : "S1 RPC P50",
+            R.scaleMetric(
+              (fullPolicy ? meta.action_stage_seconds : meta.action_rpc_seconds)
+                ?.p50,
+              1000,
+            ),
+            "ms",
+          ],
+          [
+            fullPolicy ? "DiT stage P95" : "S1 RPC P95",
+            R.scaleMetric(
+              (fullPolicy ? meta.action_stage_seconds : meta.action_rpc_seconds)
+                ?.p95,
+              1000,
+            ),
+            "ms",
+          ],
+          ...(fullPolicy
+            ? [
+                [
+                  lookahead
+                    ? "Policy RPC P50 (after prepare)"
+                    : "Full policy call P50 (incl. prepare)",
+                  R.scaleMetric(meta.inference_wall_seconds?.p50, 1000),
+                  "ms",
+                ],
+                [
+                  lookahead ? "Boundary wait total" : "Inference wait",
+                  lookahead
+                    ? R.scaleMetric(waits.total, 1000)
+                    : R.scaleMetric(meta.inference_wait_fraction, 100),
+                  lookahead ? "ms" : "%",
+                ],
+              ]
+            : []),
+          ...(lookahead
+            ? [
+                [
+                  "Submission → response P50",
+                  R.scaleMetric(meta.inference_request_seconds?.p50, 1000),
+                  "ms",
+                ],
+                [
+                  "Inference/execution overlap",
+                  R.scaleMetric(
+                    meta.measured_inference_execution_overlap_seconds,
+                    1000,
+                  ),
+                  "ms",
+                ],
+                ["Unused final requests", meta.unused_policy_calls, ""],
+                [
+                  "Terminal drain",
+                  R.scaleMetric(meta.terminal_drain_seconds, 1000),
+                  "ms",
+                ],
+                ["Boundary waits", waits.count, "count"],
+                ["Boundary wait P95", R.scaleMetric(waits.p95, 1000), "ms"],
+                [
+                  "Full work clock",
+                  Math.min(state.clock, R.episodeEnd(episode) ?? state.clock),
+                  "s",
+                ],
+              ]
+            : []),
+          ...(fullPolicy
+            ? [
+                ["Observation lag", prefix?.lag ?? null, "physics steps"],
+                ["Native decoded steps", prefix?.native ?? null, "steps"],
+                ["Accepted prefix", prefix?.accepted ?? null, "steps"],
+                ["Actually executed prefix", prefix?.executed ?? null, "steps"],
+                ["Current native offset", prefix?.offset ?? null, "offset"],
+              ]
+            : []),
+          [
+            "Control wall clock",
+            Math.min(state.clock, at.end ?? state.clock),
+            "s",
+          ],
+          ["Physics clock", R.physicsAt(episode, state.clock), "s"],
           ["实际墙钟执行率", meta.actual_control_hz, "Hz"],
           ["S1 请求率", meta.action_request_hz, "Hz"],
           ["有效计划更新率", meta.effective_plan_update_hz, "Hz"],
@@ -948,8 +1316,8 @@
           ["控制动作", at.tick ? String(at.tick.tick) : "—", "tick"],
         ]);
         metrics.title =
-          "当前动作的信息年龄 = 当前控制墙钟游标 − 该已执行命令实际来源的采集时刻；不是执行瞬间的汇总 AoI。回合结束后固定在终止时刻，不虚构后续执行。";
-        details.textContent = `位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · ${R.deploymentCadence(run) === "ready" ? "承诺步数" : "d"} ${queue?.delay ?? "未知"} · 仿真 ${fmt(meta.simulated_elapsed_seconds)} s / 墙钟 ${fmt(meta.controlled_wall_seconds)} s · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
+          "实际执行前缀显示该前缀最终计数。当前动作的信息年龄 = 当前控制墙钟游标 − 该已执行命令实际来源的采集时刻；不是执行瞬间的汇总 AoI。回合结束后固定在终止时刻，不虚构后续执行。";
+        details.textContent = `${R.controllerLabel(R.controllerPolicy(run))} · 位置 [m] ${at.robotState?.position_xyz_m?.map((v) => fmt(v, 4)).join(", ") ?? "未知"} · 缓存 AoI ${fmt(queue?.cacheAgeMs)} ms · ${lookahead ? `K=${schedule?.k ?? "?"} / D=${schedule?.d ?? "?"} · 来源 obs ${at.tick?.source_tick ?? "未知"} → plan ${at.tick?.target_tick ?? "未知"} · offset ${at.tick?.executed_offset ?? "未知"}` : synchronous ? "每段至多 " + meta.synchronous_chunk_steps + " 步" : (R.deploymentCadence(run) === "ready" ? "承诺步数" : "d") + " " + (queue?.delay ?? "未知")} · 仿真 ${fmt(meta.simulated_elapsed_seconds)} s / 墙钟 ${fmt(meta.controlled_wall_seconds)} s · ${episode?.robot?.recorded_frames ?? 0} 帧 / 丢弃 ${episode?.robot?.dropped_frames ?? 0}`;
         action.textContent = at.tick
           ? `检查动作 ${at.tick.tick} · ${at.tick.action?.map((v) => fmt(v, 3)).join(", ")}`
           : "游标前没有已执行命令";
@@ -965,6 +1333,37 @@
   }
   function taskViewport() {
     const mode = $("window").value;
+    const synchronous =
+      state.kind === "deployment" && state.executionCoupling === "synchronous";
+    $("window").title = synchronous
+      ? "自动窗口约两个已记录完整周期，并保留当前执行段的实际推理来源；缺少阶段时使用 0.3 s 窗口。窗口宽度不是推理耗时。"
+      : "按真实记录跟随时间游标";
+    if (
+      mode === "auto" &&
+      state.kind === "deployment" &&
+      state.executionCoupling === "asynchronous"
+    )
+      return window.ReplayTimeline.controlViewport(
+        state.taskTracks ?? [],
+        state.clock,
+        state.end,
+      );
+    if (
+      mode === "auto" &&
+      state.kind === "deployment" &&
+      ["one_step_async", "chunked_async"].includes(state.executionCoupling)
+    )
+      return window.ReplayTimeline.oneStepViewport(
+        state.rows,
+        state.clock,
+        state.end,
+      );
+    if (mode === "auto" && synchronous)
+      return window.ReplayTimeline.synchronousViewport(
+        state.rows,
+        state.clock,
+        state.end,
+      );
     const span =
       mode === "all"
         ? state.end
@@ -1000,6 +1399,19 @@
         output: event.record.output,
         source: event.run.provenance,
       };
+    else if (event.phase)
+      data = {
+        precision: event.precision,
+        phase: event.phase,
+        source: event.run.provenance,
+      };
+    else if (event.control_interval?.kind === "gap")
+      data = {
+        precision: event.precision,
+        control_interval: event.control_interval,
+        note: "No env.step in this recorded interval; pacing and controller overhead are not separately timed.",
+        source: event.run.provenance,
+      };
     else if (event.tick) {
       const q = event.episode.queue
         ? Q.stateAt(event.episode.queue, event.tick.relative_s)
@@ -1007,7 +1419,22 @@
       data = {
         precision: event.precision,
         tick: event.tick.tick,
+        policy_identity: event.run.policy_identity ?? null,
+        controller_identity: event.run.controller_identity ?? null,
         control_wall_s: event.tick.relative_s,
+        execution_interval: event.control_interval ?? null,
+        env_step_wall_ms: R.finite(event.control_interval?.end_s)
+          ? (event.control_interval.end_s - event.control_interval.start_s) *
+            1000
+          : null,
+        simulation_advance_ms: R.scaleMetric(
+          event.tick.physics_step_seconds,
+          1000,
+        ),
+        scheduled_wall_s: R.finite(event.tick.scheduled_s)
+          ? event.tick.scheduled_s - event.episode.controlled_start_s
+          : null,
+        lateness_ms: R.scaleMetric(event.tick.lateness_s, 1000),
         command_units: event.episode.robot?.command_units,
         command: event.tick.action,
         robot_response: event.tick.robot_response,
@@ -1018,6 +1445,9 @@
         state_aoi_ms: q?.stateAgeMs,
         cache_aoi_ms: q?.cacheAgeMs,
         slot: event.tick.executed_slot,
+        action_buffer: q?.actionBuffer ?? null,
+        action_buffer_recorded_s: q?.actionBufferTime ?? null,
+        action_buffer_phase: q?.actionBufferPhase ?? null,
         initial_feature:
           event.tick.executed_slot?.producer_kind === "bootstrap"
             ? event.episode.queue?.initial_feature
@@ -1026,6 +1456,8 @@
     } else if (event.request)
       data = {
         precision: event.precision,
+        policy_identity: event.run.policy_identity ?? null,
+        controller_identity: event.run.controller_identity ?? null,
         request: event.request,
         source: event.run.provenance,
       };
@@ -1047,6 +1479,8 @@
         status: run.status,
         error: run.error,
         mode: run.mode,
+        policy_identity: run.policy_identity ?? null,
+        controller_identity: run.controller_identity ?? null,
         configuration: run.configuration,
         checkpoint: run.checkpoint,
         device: run.device,
@@ -1064,6 +1498,7 @@
               id: episode.id,
               status: episode.status,
               metadata: episode.metadata,
+              policy_evidence: episode.policy_evidence ?? null,
               robot: {
                 status: episode.robot?.status,
                 error: episode.robot?.error,
@@ -1074,6 +1509,24 @@
             }
           : null,
       }));
+    if (event.id && !Array.isArray(data)) {
+      const T = window.ReplayTimeline;
+      const block = state.taskTracks
+        ?.flatMap((track) => track.blocks)
+        .find((candidate) => candidate.id === event.id);
+      if (block) {
+        data.timing_basis = T.basisLabel(block.basis);
+        data.clock_id = block.clockId ?? null;
+        data.source_tasks = T.sourceBlocks(state.taskTracks, block.id).map(
+          (source) => ({
+            id: source.id,
+            label: source.label,
+            timing_basis: T.basisLabel(source.basis),
+            request: source.event.request ?? null,
+          }),
+        );
+      }
+    }
     $("inspector").textContent = JSON.stringify(data, null, 2);
     renderEventList();
     renderTimeline();
@@ -1086,6 +1539,11 @@
     const view = taskViewport();
     const tracks = (state.taskTracks ?? []).filter(
       (track) => $("stage").value === "all" || track.stage === $("stage").value,
+    );
+    const sourceIds = new Set(
+      T.sourceBlocks(state.taskTracks ?? [], state.selected).map(
+        (block) => block.id,
+      ),
     );
     const key = JSON.stringify([
       state.mediaEpoch,
@@ -1101,6 +1559,7 @@
         lane.className = "task-lane";
         lane.dataset.precision = track.precision;
         lane.dataset.stage = track.stage;
+        lane.dataset.clock = track.clockId ?? "unknown";
         lane.style.setProperty("--precision", color(track.precision));
         lane.innerHTML = `<header class="task-lane-label"><strong>${esc(label(track.precision))} <span>${esc(track.title)}</span></strong><span class="task-phase"></span></header><div class="task-rail"><div class="task-blocks"></div><div class="task-playhead" aria-hidden="true"></div><p class="task-unavailable"></p></div>`;
         $("timeline").appendChild(lane);
@@ -1149,7 +1608,10 @@
           button.type = "button";
           button.className = "task-block";
           button.dataset.block = block.id;
-          button.innerHTML = `<strong>${esc(block.label)}</strong><span>${esc(block.sourceLabel ? "← " + block.sourceLabel : block.stage === "vlm" ? "视觉特征" : "来源未记录")}</span><small></small>`;
+          button.dataset.basis = block.basis;
+          if (block.phaseKind) button.dataset.phaseKind = block.phaseKind;
+          if (block.sourceId) button.dataset.source = block.sourceId;
+          button.innerHTML = `<strong>${esc(block.label)}</strong><span>${esc(block.sourceLabel ? "← " + block.sourceLabel + (block.description ? " · " + block.description : "") : (block.description ?? (block.stage === "vlm" ? "视觉特征" : "来源未记录")))}</span><small></small>`;
           button.addEventListener("click", () =>
             inspect({
               ...block.event,
@@ -1167,6 +1629,7 @@
           : "结束待记录";
         button.classList.toggle("open-ended", geometry.open);
         button.classList.toggle("selected", state.selected === block.id);
+        button.classList.toggle("source-selected", sourceIds.has(block.id));
         button.style.transform = `translate3d(${(geometry.left / 100) * width}px,0,0)`;
         button.style.width = Math.max(8, (geometry.width / 100) * width) + "px";
         button.dataset.wide = String((geometry.width / 100) * width >= 155);
@@ -1174,15 +1637,8 @@
           "--elapsed",
           (status.progress ?? 0) * 100 + "%",
         );
-        const basis =
-          {
-            rpc: "完整请求区间（含准备/通信）",
-            gpu_span: "实际 CUDA 首末事件跨度（含间隙）",
-            host_submit: "主机提交区间",
-            host_observed_cuda_completion: "主机观察 CUDA 完成",
-            cuda_event: "CUDA event 区间",
-          }[block.basis] ?? "已记录区间";
-        button.title = `${label(track.precision)} · ${block.label}\n${status.label} · ${fmt(block.start, 3)} → ${R.finite(block.end) ? fmt(block.end, 3) : "结束未知"} ${unit}\n${basis}${block.sourceLabel ? "\n实际使用 " + block.sourceLabel : ""}`;
+        const basis = T.basisLabel(block.basis);
+        button.title = `${label(track.precision)} · ${block.label}\n${status.label} · ${fmt(block.start, 3)} → ${R.finite(block.end) ? fmt(block.end, 3) : "结束未知"} ${unit}\n${basis}${block.description ? "\n" + block.description : ""}${block.sourceLabel ? "\n实际使用 " + block.sourceLabel : ""}`;
         button.setAttribute("aria-label", button.title.replaceAll("\n", "；"));
       }
       for (const [id, button] of item.buttons)
@@ -1193,7 +1649,16 @@
     }
     $("timeline-note").textContent =
       state.kind === "deployment"
-        ? "任务块为完整请求区间；S1[xx].k 实际使用 S2-xx 的特征。播放时向左流动，点击检查。"
+        ? (state.executionCoupling === "synchronous"
+            ? "控制墙钟：VLM / DiT 为同一次同步 RPC 内的服务端分段，非独立 RPC 或 GPU kernel 时间。Inference / Execution 显示真实互斥阶段；执行段包含节拍等待。"
+            : state.executionCoupling === "chunked_async"
+              ? `控制墙钟 · K=${state.schedule?.k ?? "?"} / D=${state.schedule?.d ?? "?"}：Policy RPC 与每个实际物理步分轨；Execute 显示 plan / tick / native offset，同一前缀共享精确 DiT→VLM 来源。Wait/Drain 不推进物理；unused final 保留全部服务端工作。`
+              : state.executionCoupling === "one_step_async"
+                ? "控制墙钟：VLM / DiT 是真实服务端分段；Policy RPC 与 Execute/Wait/Drain 分轨显示实际重叠。Obs k → action k+1 表示 1 步观测滞后，首次 bootstrap 除外；unused final 计算仍展示。"
+                : state.cohortPolicy === "pir2"
+                  ? "πR² 控制墙钟：独立 S2 VLM RPC 更新缓存；S1 RPC 滚动去噪（常态 1 NFE / 恢复 5 NFE）。Action execution 是实测 env.step；Between steps 包含节拍等待与控制开销，每步仿真推进量另列。bootstrap 动作有明确标签，推理仅有聚合计数。"
+                  : "控制墙钟：VLM / DiT 为完整请求区间；Action execution 是实测 env.step，间隔不计入动作执行耗时。") +
+          " S1[xx].k 实际使用 S2-xx 的特征；点击高亮已记录来源，随游标向左流动。"
         : tracks.some((track) => track.blocks.length)
           ? "按该次真实模块时间移动；CUDA 跨度含内核间隙。点击任务块或展开算子明细。"
           : "这次记录只有完整调用耗时，没有 VLM / DiT 分段时间；切换 Profile 查看实际轨道。";
@@ -1216,7 +1681,16 @@
         for (const stage of [
           "vlm",
           "action",
-          ...(state.kind === "deployment" ? ["control"] : []),
+          ...(state.kind === "deployment"
+            ? [
+                "control",
+                ...(["synchronous", "one_step_async", "chunked_async"].includes(
+                  R.deploymentCoupling(row.run),
+                )
+                  ? ["phase"]
+                  : []),
+              ]
+            : []),
         ])
           lanes.push({
             p,
@@ -1224,9 +1698,12 @@
             name:
               label(p) +
               " · " +
-              { vlm: "VLM / S2", action: "Action / S1", control: "Control" }[
-                stage
-              ],
+              {
+                vlm: "VLM / S2",
+                action: "Action / S1",
+                control: "Control",
+                phase: "Phase",
+              }[stage],
           });
     }
     const H = lanes.length * rowH + 45,
@@ -1260,14 +1737,15 @@
     });
     state.hits = [];
     for (const event of events) {
-      if (event.end < a || event.time > b) continue;
+      const eventEnd = R.finite(event.end) ? event.end : event.time;
+      if (eventEnd < a || event.time > b) continue;
       const lane = lanes.findIndex(
         (l) => l.p === event.precision && l.stage === event.stage,
       );
       if (lane < 0) continue;
       const index = state.hits.push(event) - 1,
         xx = x(Math.max(a, event.time)),
-        width = Math.max(1.5, x(Math.min(b, event.end)) - xx),
+        width = Math.max(1.5, x(Math.min(b, eventEnd)) - xx),
         fill = event.category
           ? (categories[event.category] ?? "#9b8eab")
           : color(event.precision);
@@ -1278,7 +1756,13 @@
       `<svg viewBox="0 0 ${W} ${Math.max(85, H)}" role="img" aria-label="实际请求与组件时间线">${svg}</svg>`;
     $("kernel-note").textContent =
       state.kind === "deployment"
-        ? "S1 / S2 显示完整 RPC 区间；Control 是实际命令时刻。它们不是 GPU kernel 时间。"
+        ? state.executionCoupling === "synchronous"
+          ? "Synchronous：VLM / DiT 为实际服务端分段；Phase 为完整推理 RPC 与动作执行段。Control 是实测 env.step 墙钟，缺少结束时间时仅显示命令时刻；均非 GPU kernel timeline。"
+          : ["one_step_async", "chunked_async"].includes(
+                state.executionCoupling,
+              )
+            ? "Full-policy async：完整 policy RPC、服务端 VLM/DiT、物理执行和等待分别计时；含终止后未执行计算。非 GPU kernel timeline。"
+            : "S1 / S2 显示完整 RPC 区间；Control 是实测 env.step 墙钟，缺少结束时间时仅显示命令时刻。它们不是 GPU kernel 时间。"
         : state.type === "profile"
           ? "实际 CUDA 设备事件；同一行内的多 stream 可能重叠，点击查看。"
           : `${R.scopeInfo(state.scope).label} · 仅有请求 wall；本 Clean 调用未采集 GPU timeline。`;
@@ -1450,7 +1934,7 @@
       slice
         .map(
           (e, i) =>
-            `<button class="event-row ${e.id === state.selected ? "selected" : ""}" data-list-index="${i}" style="--precision:${color(e.precision)}"><span class="precision">${esc(label(e.precision))}</span><span>${fmt(e.time, state.kind === "model" ? 3 : 2)} ${state.kind === "model" ? "ms" : "s"}</span><span title="${esc(e.name)}">${esc(e.name)}</span><span>${fmt((e.end - e.time) * (state.kind === "model" ? 1 : 1000), 3)} ms</span></button>`,
+            `<button class="event-row ${e.id === state.selected ? "selected" : ""}" data-list-index="${i}" style="--precision:${color(e.precision)}"><span class="precision">${esc(label(e.precision))}</span><span>${fmt(e.time, state.kind === "model" ? 3 : 2)} ${state.kind === "model" ? "ms" : "s"}</span><span title="${esc(e.name)}">${esc(e.name)}</span><span>${fmt(R.finite(e.end) ? (e.end - e.time) * (state.kind === "model" ? 1 : 1000) : null, 3)} ms</span></button>`,
         )
         .join("") || '<p class="small-note">此窗口没有相应事件。</p>';
     for (const button of $("event-list").querySelectorAll("button"))
@@ -1483,7 +1967,9 @@
       ...new Set([
         0,
         state.end,
-        ...filteredEvents().flatMap((e) => [e.time, e.end]),
+        ...filteredEvents()
+          .flatMap((e) => [e.time, e.end])
+          .filter(R.finite),
       ]),
     ].sort((a, b) => a - b);
     setClock(
@@ -1542,27 +2028,39 @@
     });
     $("kernel-details").addEventListener("toggle", renderKernelTimeline);
     for (const kind of ["model", "deployment"])
-      $("mode-" + kind).addEventListener("click", () => {
-        $("evidence-mode").value = kind;
-        $("evidence-mode").dispatchEvent(new Event("change"));
-      });
-    $("evidence-mode").addEventListener("change", () => {
-      state.kind = $("evidence-mode").value;
-      state.clock = 0;
-      state.sample = null;
-      $("speed").value = state.kind === "model" ? "0.01" : "1";
-      loadRuns();
-    });
+      $("mode-" + kind).addEventListener("click", () => setView(kind));
     $("scope").addEventListener("change", () => {
       state.scope = $("scope").value;
       configureSamples();
     });
     $("execution-clock").addEventListener("change", () => {
       state.executionClock = $("execution-clock").value;
-      state.clock = 0;
-      state.sample = null;
-      loadRuns();
+      configureControllers();
+      configureSchedules();
+      reloadCohort();
     });
+    $("execution-coupling").addEventListener("change", () => {
+      state.executionCoupling = $("execution-coupling").value;
+      configureCadences();
+      configureControllers();
+      configureSchedules();
+      reloadCohort();
+    });
+    $("controller-policy").addEventListener("change", () => {
+      state.controllerPolicy =
+        $("controller-policy").value === "unknown"
+          ? null
+          : $("controller-policy").value;
+      reloadCohort();
+    });
+    for (const id of ["execution-prefix-steps", "async-overlap-steps"])
+      $(id).addEventListener("change", () => {
+        configureSchedules({
+          k: Number($("execution-prefix-steps").value),
+          d: Number($("async-overlap-steps").value),
+        });
+        reloadCohort();
+      });
     $("record-type").addEventListener("change", () => {
       state.type = $("record-type").value;
       configureSamples();
@@ -1574,11 +2072,7 @@
     });
     $("precision").addEventListener("change", () => {
       state.precision = $("precision").value;
-      const descriptors = R.replayDescriptors(
-        state.descriptors,
-        state.kind,
-        state.executionClock,
-      );
+      const descriptors = selectedDescriptors();
       const missing = descriptors.some(
         (descriptor) =>
           (state.precision === "all" ||
@@ -1621,6 +2115,13 @@
         kind: state.kind,
         execution_clock:
           state.kind === "deployment" ? state.executionClock : null,
+        execution_coupling:
+          state.kind === "deployment" ? state.executionCoupling : null,
+        execution_prefix_steps:
+          state.kind === "deployment" ? (state.schedule?.k ?? null) : null,
+        async_overlap_steps:
+          state.kind === "deployment" ? (state.schedule?.d ?? null) : null,
+        deployment_scheduling_policy: state.cohortController,
         record_type: state.type,
         cursor: state.clock,
         cursor_unit: state.kind === "model" ? "ms" : "control_wall_s",
@@ -1687,21 +2188,37 @@
         state.type = requestedType;
         $("record-type").value = requestedType;
       }
-      const cadences = [
-        ...new Set(
-          state.descriptors
-            .filter((run) => run.kind === "deployment")
-            .map(R.deploymentCadence),
-        ),
-      ];
-      options(
-        $("execution-clock"),
-        cadences.map((mode) => [mode, cadenceLabels[mode] ?? mode]),
+      configureCouplings(
+        query.get("execution_coupling") ??
+          catalog.default_execution_coupling ??
+          "asynchronous",
+      );
+      configureCadences(
         query.get("execution_clock") ??
           catalog.default_execution_clock ??
           "paced",
       );
-      state.executionClock = $("execution-clock").value || "paced";
+      configureControllers(
+        query.get("deployment_scheduling_policy") === "unknown"
+          ? null
+          : (query.get("deployment_scheduling_policy") ??
+              catalog.default_deployment_scheduling_policy ??
+              "conservative"),
+      );
+      const queryInteger = (name, fallback) => {
+        const value = query.get(name);
+        return value != null && /^\d+$/.test(value) ? Number(value) : fallback;
+      };
+      configureSchedules({
+        k: queryInteger(
+          "execution_prefix_steps",
+          catalog.default_execution_prefix_steps,
+        ),
+        d: queryInteger(
+          "async_overlap_steps",
+          catalog.default_async_overlap_steps,
+        ),
+      });
       state.kind =
         requestedView === "model"
           ? "model"
@@ -1712,7 +2229,6 @@
               )
             ? "deployment"
             : "model";
-      $("evidence-mode").value = state.kind;
       $("speed").value = state.kind === "model" ? "0.01" : "1";
       showCatalogMetadata();
       await loadRuns();

@@ -92,6 +92,10 @@
 .task-lane[data-stage="action"] {
   background: #f7f9f6;
 }
+.task-lane[data-stage="phase"],
+.task-lane[data-stage="control"] {
+  background: #faf8f3;
+}
 .task-lane-label {
   padding: 12px 14px;
   border-right: 1px solid var(--line);
@@ -239,6 +243,14 @@
   outline: 2px solid #172e23;
   outline-offset: 1px;
   z-index: 4;
+}
+.task-block.source-selected {
+  outline: 2px dashed var(--precision);
+  outline-offset: 2px;
+  z-index: 3;
+}
+.task-block[data-phase-kind="inference"] {
+  border-style: dashed;
 }
 .task-playhead {
   position: absolute;
@@ -418,7 +430,7 @@ select {
 }
 .precision-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--precision-count, 1), minmax(0, 1fr));
   gap: 16px;
   padding: 18px 20px;
 }
@@ -587,6 +599,7 @@ select {
 }
 .inline-controls {
   display: flex;
+  flex-shrink: 0;
   gap: 10px;
 }
 .inline-controls label {
@@ -874,4 +887,30 @@ footer {
   background: #263e33;
   color: white;
   border-color: #263e33;
+}
+
+.coupling-badge {
+  font-size: 10px;
+  padding: 3px 6px;
+  border: 1px solid #d6ddd6;
+  border-radius: 4px;
+  color: #40564a;
+  white-space: nowrap;
+}
+.task-block[data-phase-kind="wait"],
+.task-block[data-phase-kind="drain"] {
+  background: #f5e8c9;
+  border-style: dotted;
+}
+.task-block[data-phase-kind="gap"] {
+  background: #f1f2ee;
+  border-style: dotted;
+}
+.task-block[data-phase-kind="gap"][data-phase="running"] {
+  color: var(--ink);
+  box-shadow: inset 0 -3px var(--precision);
+}
+.task-block[data-phase="unused"] {
+  border-style: dashed;
+  opacity: 0.72;
 }

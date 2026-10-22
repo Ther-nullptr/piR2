@@ -174,7 +174,23 @@ def summarize_episode(events, metadata):
     execution_clock = begin.get(
         "execution_clock", metadata.get("execution_clock", "paced")
     )
-    paced = execution_clock == "paced"
+    execution_coupling = begin.get(
+        "execution_coupling", metadata.get("execution_coupling", "asynchronous")
+    )
+    paced = execution_clock == "paced" and execution_coupling == "asynchronous"
+    full_policy = execution_coupling in (
+        "synchronous",
+        "one_step_async",
+        "chunked_async",
+    )
+    work_end = stop
+    work_requests = []
+    if execution_coupling in ("one_step_async", "chunked_async"):
+        from coexecution.async_evidence import validate_async_work
+
+        evidence = validate_async_work(events, metadata=metadata)
+        work_end = evidence["work_end_s"]
+        work_requests = evidence["work_requests"]
     inside = [r for r in events if start <= r["t_s"] <= stop]
     ticks = [r for r in inside if r["kind"] == "control_tick"]
     by_kind = defaultdict(list)
@@ -203,7 +219,12 @@ def summarize_episode(events, metadata):
     # Join an RPC to its publication by the recorded capture identity and exact
     # completion timestamp, never by proximity or unrelated counters.
     publications = {
-        (r.get("source_tick"), r.get("capture_s"), r.get("rpc_completed_s")): r
+        (
+            r.get("request_id"),
+            r.get("source_tick"),
+            r.get("capture_s"),
+            r.get("rpc_completed_s"),
+        ): r
         for r in by_kind["feature_published"]
     }
     adoption = {
@@ -235,7 +256,16 @@ def summarize_episode(events, metadata):
         requests.append(
             {
                 "role": "S1",
+                "timing_scope": row.get("timing_scope", "client_rpc"),
                 "request_tick": k,
+                "request_id": row.get("request_id"),
+                "source_tick": row.get("source_tick"),
+                "target_tick": row.get("target_tick"),
+                "policy_submitted_s": relative(timing.get("policy_submitted_s")),
+                "policy_rpc_started_s": relative(timing.get("policy_rpc_started_s")),
+                "policy_rpc_completed_s": relative(
+                    timing.get("policy_rpc_completed_s")
+                ),
                 "start_s": row["t_s"] - start,
                 "worker_start_s": started.get(k, row)["t_s"] - start,
                 "end_s": min(finish if finish is not None else stop, stop) - start,
@@ -254,7 +284,23 @@ def summarize_episode(events, metadata):
                 "use_s": relative(use_time),
                 "use_boundary": use_boundary,
                 "timing_version": actual.get("timing_version", 1),
-                "plan_rpc_started_s": relative(timing.get("plan_rpc_started_s")),
+                "plan_rpc_started_s": relative(timing.get("plan_rpc_started_s"))
+                if execution_coupling == "asynchronous"
+                else None,
+                "synchronous_rpc_started_s": relative(
+                    timing.get(
+                        "synchronous_rpc_started_s", timing.get("plan_rpc_started_s")
+                    )
+                )
+                if execution_coupling == "synchronous"
+                else None,
+                "synchronous_rpc_completed_s": relative(
+                    timing.get(
+                        "synchronous_rpc_completed_s", consumed.get(k, {}).get("t_s")
+                    )
+                )
+                if execution_coupling == "synchronous"
+                else None,
                 "server_install_started_s": relative(
                     actual.get("server_install_started_s")
                 ),
@@ -274,11 +320,14 @@ def summarize_episode(events, metadata):
         if not censored:
             vision_durations.append(1000 * row["rpc_seconds"])
         publication = publications.get(
-            (row.get("source_tick"), row.get("capture_s"), b), {}
+            (row.get("request_id"), row.get("source_tick"), row.get("capture_s"), b), {}
         )
         requests.append(
             {
                 "role": "S2",
+                "request_id": row.get("request_id"),
+                "target_tick": row.get("target_tick"),
+                "timing_scope": row.get("timing_scope", "client_rpc"),
                 "source_tick": row.get("source_tick"),
                 "capture_s": relative(row.get("capture_s")),
                 "feature_sequence": publication.get("feature_sequence"),
@@ -349,6 +398,20 @@ def summarize_episode(events, metadata):
                 if state_capture is not None
                 else None,
                 "tick": row["tick"],
+                **(
+                    {
+                        key: row[key]
+                        for key in (
+                            "request_id",
+                            "target_tick",
+                            "source_tick",
+                            "executed_offset",
+                            "observation_lag_ticks",
+                        )
+                    }
+                    if execution_coupling == "chunked_async"
+                    else {}
+                ),
                 "d": row.get("action_delay_budget_ticks", row.get("d")),
                 "clean_slots": sum(not s.get("fallback", False) for s in slots),
                 "fresh_slots": sum(
@@ -421,6 +484,7 @@ def summarize_episode(events, metadata):
         delay = after
     metrics = {
         "execution_clock": execution_clock,
+        "execution_coupling": execution_coupling,
         "fixed_rate_timing_applicable": paced,
         "physics_step_seconds": begin.get(
             "physics_step_seconds", begin.get("period_s", 0.05)
@@ -431,8 +495,14 @@ def summarize_episode(events, metadata):
         "ticks": len(ticks),
         "success": metadata.get("success"),
         "termination_reason": end.get("reason"),
-        "action_rpc_ms": summary(action_durations),
-        "vision_rpc_ms": summary(vision_durations),
+        "action_rpc_ms": summary(
+            action_durations if execution_coupling == "asynchronous" else []
+        ),
+        "vision_rpc_ms": summary(
+            vision_durations if execution_coupling == "asynchronous" else []
+        ),
+        "action_stage_ms": summary(action_durations if full_policy else []),
+        "vision_stage_ms": summary(vision_durations if full_policy else []),
         "cache_age_ms": summary(r["age_ms"] for r in cache_samples),
         "clean_slots": summary(r["clean_slots"] for r in tick_rows),
         "fresh_slots": summary(r["fresh_slots"] for r in tick_rows),
@@ -461,6 +531,27 @@ def summarize_episode(events, metadata):
         "executed_state_age_ms",
     ]:
         metrics[key] = summary(r[key] for r in tick_rows)
+    if full_policy:
+        adjacent = [b["applied_s"] - a["applied_s"] for a, b in pairwise(ticks)]
+        boundaries = [
+            b["applied_s"] - a["next_observation_computed_s"]
+            for a, b in pairwise(ticks)
+            if b.get("first_application_of_request")
+        ]
+        metrics.update(
+            execution_prefix_steps=begin.get(
+                "execution_prefix_steps", begin.get("synchronous_chunk_steps")
+            ),
+            async_overlap_steps=begin.get(
+                "async_overlap_steps", 0 if execution_coupling == "synchronous" else 1
+            ),
+            actual_control_hz=fraction(len(ticks), stop - start),
+            amortized_wall_seconds_per_action=fraction(stop - start, len(ticks)),
+            adjacent_action_gap_seconds=summary(adjacent),
+            total_adjacent_action_gap_seconds=sum(adjacent),
+            boundary_gap_seconds=summary(boundaries),
+            total_boundary_gap_seconds=sum(boundaries),
+        )
     queue_events = [
         {"t": r["t_s"] - start, "kind": r["kind"], "camera_queue": r["camera_queue"]}
         for r in inside
@@ -468,6 +559,10 @@ def summarize_episode(events, metadata):
     ]
     provenance_fields = [
         "execution_clock",
+        "execution_coupling",
+        "execution_prefix_steps",
+        "async_overlap_steps",
+        "protocol_version",
         "actual_control_hz",
         "action_request_hz",
         "effective_plan_update_hz",
@@ -485,9 +580,26 @@ def summarize_episode(events, metadata):
     ]
     return {
         "execution_clock": execution_clock,
+        "execution_coupling": execution_coupling,
+        "execution_prefix_steps": begin.get(
+            "execution_prefix_steps", begin.get("synchronous_chunk_steps")
+        ),
+        "async_overlap_steps": begin.get(
+            "async_overlap_steps",
+            0
+            if execution_coupling == "synchronous"
+            else 1
+            if execution_coupling == "one_step_async"
+            else None,
+        ),
+        "protocol_version": begin.get("protocol_version"),
         "start_s": start,
         "end_s": stop,
         "duration_s": stop - start,
+        "work_end_s": work_end,
+        "work_duration_s": work_end - start,
+        "terminal_drain_s": work_end - stop,
+        "work_requests": work_requests,
         "period_s": begin.get("period_s", 0.05),
         "metrics": metrics,
         "initial_delay": begin.get("initial_delay_ticks"),
@@ -549,6 +661,7 @@ def condition_report(directory):
     duration = sum(m["controlled_seconds"] for m in metrics)
     flat = {
         "execution_clock": episodes[0]["execution_clock"],
+        "execution_coupling": episodes[0]["execution_coupling"],
         "layout": hardware.get("layout", directory.parent.name),
         "condition": hardware.get("condition", directory.name),
         "episodes": len(episodes),
@@ -576,7 +689,7 @@ def condition_report(directory):
         "control_rate_valid_episodes": sum(
             e["metadata"].get("control_rate_valid") is True for e in episodes
         )
-        if all(e["execution_clock"] == "paced" for e in episodes)
+        if all(e["metrics"]["fixed_rate_timing_applicable"] for e in episodes)
         else None,
     }
     role_gpus = hardware.get("role_gpus") or {
@@ -599,11 +712,23 @@ def condition_report(directory):
             for r in e["requests"]
             if r["role"] == role and not r["censored"]
         ]
-        stats = summary(values)
+        synchronous = flat["execution_coupling"] in (
+            "synchronous",
+            "one_step_async",
+            "chunked_async",
+        )
+        stats = summary([] if synchronous else values)
         for p in ["count", "mean", "p50", "p95"]:
             flat[
                 f"{name}_rpc_{p}_ms" if p != "count" else f"{name}_complete_requests"
             ] = stats[p]
+        if synchronous:
+            for p, value in summary(values).items():
+                flat[
+                    f"{name}_stage_{p}_ms"
+                    if p != "count"
+                    else f"{name}_complete_stage_requests"
+                ] = value
         flat[f"{name}_censored_requests"] = sum(
             r["censored"] for e in episodes for r in e["requests"] if r["role"] == role
         )

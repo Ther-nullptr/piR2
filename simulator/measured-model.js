@@ -81,8 +81,14 @@
       }
     }
     const transition = latest(episode.delay_transitions ?? [], time);
+    const publication = latest(episode.publication_snapshots ?? [], time);
+    const buffer =
+      publication && (!tick || publication.t >= tick.t) ? publication : tick;
     return {
       tick,
+      actionBuffer: buffer?.action_buffer ?? null,
+      actionBufferTime: buffer?.t ?? null,
+      actionBufferPhase: buffer?.phase ?? "recorded_tick",
       feature,
       camera,
       executedRequest,
@@ -98,7 +104,13 @@
         (r) =>
           r.completed_s != null &&
           r.completed_s <= time &&
-          (r.adopted_s == null || r.adopted_s > time),
+          ((r.publication?.processed_s ?? r.adopted_s) == null ||
+            (r.publication?.processed_s ?? r.adopted_s) > time) &&
+          !(
+            r.publication?.status === "unused_final" &&
+            r.publication.unused_at_s != null &&
+            r.publication.unused_at_s <= time
+          ),
       ),
     };
   }

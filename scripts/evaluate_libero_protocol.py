@@ -230,8 +230,10 @@ def save_summary(output, records, config):
 
         summary["timing"] = {
             "execution_clock": config.get("execution_clock", "paced"),
+            "execution_coupling": config.get("execution_coupling", "asynchronous"),
             "fixed_rate_timing_applicable": config.get("execution_clock", "paced")
-            == "paced",
+            == "paced"
+            and config.get("execution_coupling", "asynchronous") == "asynchronous",
             "strict_valid_episodes": timing_count("control_rate_valid"),
             "mean_rate_valid_episodes": timing_count("mean_control_rate_valid"),
             "deadline_valid_episodes": timing_count("control_deadline_valid"),
@@ -253,7 +255,7 @@ def save_summary(output, records, config):
                     if row.get("real_time_factor") is not None
                 ]
             ),
-            "note": "All trials remain included. Ready execution has no fixed wall-rate deadline; its null validity is not a timing pass or failure.",
+            "note": "All trials remain included. Ready or synchronous execution has no fixed global wall-rate deadline; null validity is not a timing pass or failure.",
         }
     for task_id in task_ids:
         rows = [x for x in records if x["task_id"] == task_id]
@@ -296,6 +298,31 @@ def build_parser():
     parser.add_argument("--max-steps", type=int, default=720)
     parser.add_argument("--control-hz", type=float, default=20)
     parser.add_argument(
+        "--execution-coupling",
+        choices=("asynchronous", "synchronous", "one_step_async", "chunked_async"),
+        default="asynchronous",
+        help="Flow: synchronous alternates inference/execution; chunked_async prefetches D steps before a K-step boundary; one_step_async preserves K1/D1",
+    )
+    parser.add_argument(
+        "--synchronous-chunk-steps",
+        "--execution-prefix-steps",
+        dest="synchronous_chunk_steps",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--async-overlap-steps",
+        type=int,
+        default=None,
+        help="Chunked async prefetch depth D, 1<=D<=K; synchronous accepts D0",
+    )
+    parser.add_argument(
+        "--synchronous-warmup-timeout-seconds",
+        type=int,
+        default=900,
+        help="Synchronous cold-JIT warmup socket timeout; scored RPC timeout is unchanged",
+    )
+    parser.add_argument(
         "--execution-clock",
         choices=("paced", "ready"),
         default="paced",
@@ -325,6 +352,12 @@ def build_parser():
         help="Deployment: cap scored VLM admissions; zero keeps unlimited admission",
     )
     parser.add_argument(
+        "--deployment-scheduling-policy",
+        choices=("conservative", "responsive"),
+        default="conservative",
+        help="Deployment piR2: opt into bounded delay recovery and prompt result publication",
+    )
+    parser.add_argument(
         "--deployment-fixed-delay",
         type=int,
         choices=range(1, 6),
@@ -338,10 +371,21 @@ def validate_deployment_controls(args):
 
     from coexecution.libero.features import validate_feature_options
     from coexecution.libero.scheduling import (
+        validate_deployment_scheduling_policy,
         validate_execution_clock,
         validate_vision_max_hz,
     )
+    from coexecution.libero.synchronous import validate_synchronous_controls
 
+    validate_deployment_scheduling_policy(
+        getattr(args, "deployment_scheduling_policy", "conservative"),
+        protocol=args.protocol,
+        variant=args.variant,
+        execution_coupling=getattr(args, "execution_coupling", "asynchronous"),
+        execution_clock=getattr(args, "execution_clock", "paced"),
+        fixed_delay=args.deployment_fixed_delay,
+    )
+    validate_synchronous_controls(args)
     validate_execution_clock(
         getattr(args, "execution_clock", "paced"),
         protocol=args.protocol,
@@ -448,7 +492,7 @@ def main():
     config["checkpoint"] = identity
     config["suite"] = "libero_spatial"
     config["initial_state_indices"] = list(range(args.episodes_per_task))
-    config["version"] = 9
+    config["version"] = 10
     config["measurement_mode"] = "success_terminated_closed_loop"
     config["input_dependencies"] = {
         "camera": "physical observation released at each control tick; latest waiting frame replaces older waiting frames",
@@ -485,6 +529,8 @@ def main():
         "coexecution/libero/scheduling.py",
         "coexecution/libero/features.py",
         "coexecution/libero/resident.py",
+        "coexecution/libero/synchronous.py",
+        "coexecution/libero/one_step_async.py",
         "coexecution/optimization/execution/submission.py",
         "scripts/libero_streaming_client.py",
         "scripts/libero_observations.py",
@@ -495,7 +541,73 @@ def main():
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
         for name in implementation_files
     }
-    if args.protocol == "deployment":
+    if args.protocol == "deployment" and args.execution_coupling in (
+        "synchronous",
+        "one_step_async",
+        "chunked_async",
+    ):
+        from coexecution.libero.synchronous import validate_synchronous_identity
+
+        validate_synchronous_identity(identity, args.synchronous_chunk_steps)
+        config.pop("visual_delay")
+        config.pop("action_delay")
+        config["input_dependencies"].update(
+            camera="one current physical observation before each inference cycle; simulator does not advance during inference",
+            vlm="fresh real VLM on the same single policy endpoint before every Flow4 plan",
+            action="native decoded clean Flow4 prefix; no inference during execution and no committed stale prefix",
+            bootstrap="task-specific full-plan warmup before one episode RNG reset; no scored bootstrap",
+        )
+        config.update(
+            deployment_contract={
+                "execution_coupling": "synchronous",
+                "execution_clock": args.execution_clock,
+                "physics_step_seconds": 0.05,
+                "nominal_physics_hz": 20,
+                "target_wall_hz": None,
+                "phase_target_hz": 20 if args.execution_clock == "paced" else None,
+                "fixed_rate_timing_applicable": False,
+                "strict_timing_validity": None,
+                "execution_rule": "fresh VLM plus complete Flow4, then up to synchronous_chunk_steps clean commands; stop on first success/termination",
+                "pacing": "paced waits only within each execution phase, including final command dwell; ready adds no wait",
+                "clocks": "wall time continues while inference freezes physics; each env.step advances exactly 0.05 simulated seconds",
+                "timing_scope": "instrumented closed-loop debug; real server stage and controller timestamps, no synthetic GPU timeline",
+            }
+        )
+        if args.execution_coupling in ("one_step_async", "chunked_async"):
+            chunked = args.execution_coupling == "chunked_async"
+            prefix = args.synchronous_chunk_steps
+            overlap = args.async_overlap_steps if chunked else 1
+            config["execution_prefix_steps"] = prefix
+            config["async_overlap_steps"] = overlap
+            config["input_dependencies"].update(
+                camera="owned image and state snapshot before executing current action; one prefetch only",
+                vlm="fresh real VLM then complete Flow4 on one policy endpoint for every request",
+                action="first decoded command only; bootstrap source0/target0, then source k/target k+1; no state prediction or compensating action suffix",
+                bootstrap="task-specific full warmup then one RNG reset; scored first policy request must complete before action0",
+            )
+            config["deployment_contract"].update(
+                execution_coupling=args.execution_coupling,
+                execution_prefix_steps=prefix,
+                async_overlap_steps=overlap,
+                execution_rule="submit next full policy from pre-step observation, execute one current command, wait explicitly if next result is not ready; drain unused terminal work",
+                pacing="ready only; no additional wall pacing and no buffered action while waiting",
+                clocks="each env.step advances 0.05 simulated seconds; full policy inference can overlap actual step wall time; no 50ms wall-overlap assumption",
+                observation_lag="0 physics ticks for bootstrap; exactly1 physics tick thereafter; wall age measured from capture to application separately",
+                worker_ownership="dedicated worker creates, uses, and destroys its own PolicyClient; simulator owner alone observes and steps",
+                accounting="controlled window ends after final action; async_work_end retains unused speculative RPC and drain tail separately",
+            )
+            if chunked:
+                config["input_dependencies"].update(
+                    camera="owned image/state at bootstrap and target-D before the current atomic step; reuse post-step observation within a prefix",
+                    action="commit native offsets0..K-1; next target T uses source T-D; final cap accepts min(K,max_steps-T); stop immediately on success/termination",
+                )
+                config["deployment_contract"].update(
+                    protocol_version=2,
+                    execution_rule="submit next full policy D steps before boundary, finish current committed prefix even if result is early, adopt or wait at boundary; drain unused terminal work",
+                    observation_lag="bootstrap offset j: j; later offset j: D+j physical ticks; capture-to-apply wall AoI separate",
+                    accounting="accepted prefix, executed offset count, unexecuted accepted steps, discarded native suffix and all unused native actions are distinct",
+                )
+    elif args.protocol == "deployment":
         from coexecution.libero.features import (
             validate_feature_identity,
             validate_worker_pair,
@@ -543,9 +655,15 @@ def main():
             "fallback": "zero Cartesian delta; retain last committed gripper",
             "flow_publication": "all native clean positions after committed prefix",
             "pir2_publication": "only next clean delay-sized segment",
+            "deployment_scheduling_policy": args.deployment_scheduling_policy,
+            "controller_result_ingestion": "controller-only during pacing after atomic step; callback signals only; no early sensor release or S1 submission"
+            if args.deployment_scheduling_policy == "responsive"
+            else "at physical tick boundary",
             "action_delay_budget": (
                 "fixed bootstrap and control delay; misses and expired/protected slots still recorded"
                 if args.deployment_fixed_delay is not None
+                else "solo calibrated initial d; completed RPC rolling8 P95+5ms; lower one tick after3 full-window supports; raise on deadline miss including dispatch lateness; clamp1..5"
+                if args.deployment_scheduling_policy == "responsive"
                 else "calibratedp95 plus5ms, nondecreasing within episode, maximum5ticks"
             ),
             "service_floor_contract": {
@@ -637,6 +755,20 @@ def main():
                 with trace_path.open("w") as trace:
                     if args.protocol == "algorithm":
                         result, frames = algorithm_episode(
+                            env, obs, client, args, seed, trace
+                        )
+                    elif args.execution_coupling in ("one_step_async", "chunked_async"):
+                        from coexecution.libero.one_step_async import (
+                            one_step_async_episode,
+                        )
+
+                        result, frames = one_step_async_episode(
+                            env, obs, args, seed, trace
+                        )
+                    elif args.execution_coupling == "synchronous":
+                        from coexecution.libero.synchronous import synchronous_episode
+
+                        result, frames = synchronous_episode(
                             env, obs, client, args, seed, trace
                         )
                     else:
