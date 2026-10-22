@@ -49,7 +49,7 @@ flowchart LR
 
 ## 移动目标研究
 
-[LIBERO-Dynamic 接入](coexecution/libero_dynamic/README.md)面向移动目标下的速度与任务质量：已固定完整评测清单和默认GR00T策略接口，后续接入量化与πR²动态闭环；本阶段使用现成权重，不采用论文微调方法。
+[LIBERO-Dynamic 接入](coexecution/libero_dynamic/README.md)已连接移动目标物理环境、默认 GR00T Flow4、BF16/W8A8 和已有 πR² 权重。默认 VLA 按逐请求实测耗时推进推理等待；πR² 用实测耗时驱动独立的 S1/S2 逻辑通道。前端按物理仿真时间回放动作、目标运动与请求来源，实际 CUDA 与物理计算串行。本阶段使用现成权重，不采用论文微调方法；套件覆盖与成功率由对应实验记录证明。
 
 <a id="start--开始"></a>
 

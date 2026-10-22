@@ -305,6 +305,24 @@ test("startup barrier is a physical wait with its own label and unmodified servi
   );
 });
 
+test("average action rate includes inference and startup holds, not video frames", () => {
+  assert.equal(
+    D.averageActionHz({
+      steps: 100,
+      duration_s: 10,
+      control_freq: 20,
+      video_fps: 60,
+    }),
+    10,
+  );
+  assert.equal(
+    D.averageActionHz({ steps: 100, duration_s: 5.4, control_freq: 20 }),
+    100 / 5.4,
+  );
+  assert.equal(D.averageActionHz({ steps: 0, duration_s: 0 }), null);
+  assert.equal(D.averageActionHz({ steps: 100, duration_s: null }), null);
+});
+
 test("S1 state tick and S2 image tick have distinct labels and RPC boundary", () => {
   assert.equal(
     D.observationLabel({ lane: "s1", request_tick: 9, feature_source_tick: 3 }),

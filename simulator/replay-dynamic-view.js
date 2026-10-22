@@ -228,7 +228,7 @@ window.DynamicReplayView = (() => {
             v.start_s < end &&
             (!finite(v.end_s) || v.end_s > start),
         );
-        html += `<div class="task-lane" data-stage="${kind === "action" ? "control" : kind}" style="--precision:${color(run.precision)}"><header class="task-lane-label"><strong>${esc(name(run))}</strong><span>${label}</span><small class="task-phase">${kind === "action" ? `${fmt(e.control_freq, 0)} Hz · ${fmt(1000 / e.control_freq, 1)} ms/步` : esc(timingLabel(e))}</small></header><div class="task-rail"><div class="task-blocks">`;
+        html += `<div class="task-lane" data-stage="${kind === "action" ? "control" : kind}" style="--precision:${color(run.precision)}"><header class="task-lane-label"><strong>${esc(name(run))}</strong><span>${label}</span><small class="task-phase">${kind === "action" ? `物理步长 ${fmt(1000 / e.control_freq, 1)} ms` : esc(timingLabel(e))}</small></header><div class="task-rail"><div class="task-blocks">`;
         html += events
           .map((event) => {
             const v = D.resolveEvent(e, event);
@@ -357,8 +357,13 @@ window.DynamicReplayView = (() => {
         ["已执行动作", `${done} / ${e.steps ?? "—"}`],
         ["真实请求 RPC", `${fmt(now.request?.rpc_duration_ms, 1)} ms`],
         [
-          "视频 / 控制",
-          `${fmt(e.video_fps, 0)} fps / ${fmt(e.control_freq, 0)} Hz`,
+          "视频 / 物理步长",
+          `${fmt(e.video_fps, 0)} fps / ${fmt(1000 / e.control_freq, 1)} ms`,
+        ],
+        [
+          "回合平均动作频率（仿真）",
+          `${fmt(D.averageActionHz(e), 2)} Hz`,
+          "实际完整动作数 ÷ 已记录物理总时长，包含启动和推理等待；不是模型计算频率或墙钟控制频率。",
         ],
       ];
       if (streaming(e))
@@ -368,8 +373,8 @@ window.DynamicReplayView = (() => {
         );
       cards[i].querySelector(".metrics").innerHTML = metrics
         .map(
-          ([name, value]) =>
-            `<div class="metric"><small>${esc(name)}</small><strong>${esc(value)}</strong></div>`,
+          ([name, value, detail]) =>
+            `<div class="metric" title="${esc(detail ?? "")}"><small>${esc(name)}</small><strong>${esc(value)}</strong></div>`,
         )
         .join("");
     });
@@ -424,7 +429,7 @@ window.DynamicReplayView = (() => {
     $("evidence-note").textContent =
       "主轴：物理仿真时间。推理：真实模型调用，各配置标明逐请求实测或固定延迟。GPU 推理与物理计算实际串行；πR² 的 S1/S2 重叠表示逻辑调度，不能作为真实墙钟并发性能。模型使用本项目已有 GR00T 权重。";
     $("timeline-note").textContent =
-      "主轴为物理仿真时间，GPU / 物理实际串行。Bootstrap hold 为启动调用等待；Startup barrier 为调用完成后等待共同起点，两段期间物体持续运动，S1/S2 后续时长不对齐。视频依据实际物理帧时间播放，60 fps 视频与 20 Hz 控制分别计数。点击 S1 关联 S2，点击动作关联实际生产请求。";
+      "主轴为物理仿真时间，GPU / 物理实际串行。Bootstrap hold 为启动调用等待；Startup barrier 为调用完成后等待共同起点，两段期间物体持续运动，S1/S2 后续时长不对齐。视频帧率与每步50ms的物理步长分别计数；回合平均动作频率包含启动和推理等待。点击 S1 关联 S2，点击动作关联实际生产请求。";
     document.querySelector(".timeline-section h2").textContent =
       "LIBERO-Dynamic · 物理时间与动作来源";
     $("curve-title").textContent = "真实 VLM → DiT · 独立 Wall 时间";
