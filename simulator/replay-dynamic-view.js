@@ -26,6 +26,7 @@ window.DynamicReplayView = (() => {
     runs: [],
     rows: [],
     selection: {},
+    comparisons: [],
     clock: 0,
     end: 1,
     playing: false,
@@ -59,8 +60,37 @@ window.DynamicReplayView = (() => {
         : `校准类型 ${e.calibration.kind ?? "未知"}`;
   const conditionLabel = (e) =>
     `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${fmt(e.speed_mps, 3)} m/s · seed ${e.seed ?? "—"}`;
+  const streaming = (e) => e.protocol === "pir2_dynamic";
+  const timingLabel = (e) =>
+    streaming(e)
+      ? `反事实独立通道 · S2 ${fmt(ms(e.stage_latencies?.s2_s), 0)} / S1 ${fmt(ms(e.stage_latencies?.s1_s), 0)} ms · ${e.fixed_delay == null ? "responsive" : `fixed d=${e.fixed_delay}`}`
+      : `${calibration(e)} · τ ${fmt(ms(e.calibration.applied_latency_s), 1)} ms`;
   const runLabel = ({ run, episode: e }) =>
-    `${run.label} · ${calibration(e)} ${fmt(ms(e.calibration.applied_latency_s), 1)} ms · K${e.execution_prefix_steps ?? "?"}`;
+    `${run.label} · ${timingLabel(e)} · ${streaming(e) ? "每步执行1" : `K${e.execution_prefix_steps ?? "?"}`}`;
+  const name = (run) =>
+    `${run.precision.toUpperCase()} · ${D.protocolLabel(run)}`;
+  const eventLabel = (e) =>
+    e.kind === "s2"
+      ? `S2-${e.source.feature_sequence}`
+      : e.kind === "s1"
+        ? `S1[t${e.source.request_tick}] ${e.source.normal_or_recovery ?? ""}`
+        : e.kind === "action"
+          ? `A${e.action_step}${e.partial ? " · 中断物理步" : e.fallback ? " · Fallback" : ""}`
+          : e.kind === "bootstrap_hold"
+            ? "Bootstrap hold"
+            : `Hold C${e.chunk_id}`;
+  const dependencyLabel = (e) =>
+    e.kind === "s1"
+      ? `← ${e.source.feature_sequence === 0 ? "Bootstrap" : `S2-${e.source.feature_sequence}`} · valid [${e.source.server_audit?.valid_start_tick ?? "?"}, ${e.source.server_audit?.valid_end_tick ?? "?"})`
+      : e.kind === "s2"
+        ? `观测 tick ${e.source.source_tick}`
+        : e.kind === "bootstrap_hold"
+          ? "启动 · 物体持续运动"
+          : e.producer_kind === "request"
+            ? `← S1[t${e.source.source?.producer_request_tick}] · AoI ${fmt(ms(e.feature_age_s), 0)} ms`
+            : e.producer_kind
+              ? e.producer_kind
+              : `← C${e.chunk_id}`;
   function navigate(view) {
     const url = new URL(location.href);
     url.searchParams.set("view", view);
@@ -70,7 +100,12 @@ window.DynamicReplayView = (() => {
     $("inspector").textContent = JSON.stringify(value, null, 2);
   }
   function selectRequest(row, event) {
-    state.selected = { runId: row.run.id, requestId: event.request_id, event };
+    state.selected = {
+      runId: row.run.id,
+      columnKey: row.columnKey,
+      requestId: event.request_id,
+      event,
+    };
     inspect({
       clock: "rollout_sim_time_s",
       run_id: row.run.id,
@@ -92,6 +127,7 @@ window.DynamicReplayView = (() => {
       $("sample").value,
       $("precision").value,
       state.selection,
+      state.comparisons,
     );
     state.end =
       Math.max(
@@ -108,11 +144,11 @@ window.DynamicReplayView = (() => {
             { run, episode: e },
             i,
           ) => `<article class="precision-card dynamic-card" data-precision="${esc(run.precision)}" data-boundary="dynamic_simulation" style="--precision:${color(run.precision)}">
-      <div class="card-heading"><h2>${esc(run.precision.toUpperCase())}</h2><span class="coupling-badge">LIBERO-Dynamic · Flow4</span></div>
-      <select class="dynamic-run" data-index="${i}" aria-label="${esc(run.precision)} 动态配置"></select>
+      <div class="card-heading"><h2>${esc(name(run))}</h2><span class="coupling-badge">LIBERO-Dynamic</span></div>
+      <select class="dynamic-run" data-index="${i}" aria-label="${esc(name(run))} 动态配置"></select><button class="dynamic-compare" data-index="${i}">${state.rows[i].comparison ? "移除对照列" : "添加同协议对照"}</button>
       <div class="media-stage"><span class="media-message">等待实际物理帧</span><div class="frame-meta"></div></div>
       <div class="card-status">${esc(result(e))}</div><p class="dynamic-language">${esc(e.language ?? "任务语言未记录")}</p>
-      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(calibration(e))} · τ ${fmt(ms(e.calibration.applied_latency_s), 1)} ms · ${esc(e.timing_rule ?? "未知")}<br>K ${e.execution_prefix_steps ?? "—"} / decoded ${e.decoded_horizon ?? "—"} / predicted ${e.predicted_horizon ?? "—"} · 校准保留 ${e.calibration.retained_requests ?? "—"} 次 / 校准热身 ${e.calibration.warmup_requests ?? "—"} 次 · 每回合热身 ${e.episode_warmup_recorded ?? "—"} / 配置 ${e.episode_warmup_requests ?? "—"} 次<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>
+      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(timingLabel(e))} · ${esc(e.timing_rule ?? e.timing_domain ?? "未知")}${streaming(e) ? "<br>启动等待 " + fmt(ms(e.stage_latencies?.bootstrap_s), 0) + " ms；真实 GPU RPC 串行计算，逻辑通道独立服务。" : ""}<br>${esc(D.modelContract(e))}<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>
       <a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
         )
         .join("") || '<p class="loading">此条件没有记录。</p>';
@@ -120,15 +156,37 @@ window.DynamicReplayView = (() => {
       const row = state.rows[Number(select.dataset.index)];
       option(
         select,
-        D.candidates(state.runs, $("sample").value, row.run.precision).map(
-          (r) => [r.run.id, runLabel(r)],
-        ),
+        D.candidates(
+          state.runs,
+          $("sample").value,
+          row.run.precision,
+          D.protocol(row.run),
+        ).map((r) => [r.run.id, runLabel(r)]),
         row.run.id,
       );
       select.addEventListener("change", () => {
-        state.selection[row.run.precision] = select.value;
+        state.selection[row.columnKey] = select.value;
         configure();
       });
+    }
+    for (const button of grid.querySelectorAll(".dynamic-compare")) {
+      const row = state.rows[Number(button.dataset.index)],
+        key = D.groupKey(row.run);
+      button.hidden =
+        !row.comparison &&
+        (state.comparisons.includes(key) ||
+          D.candidates(
+            state.runs,
+            $("sample").value,
+            row.run.precision,
+            D.protocol(row.run),
+          ).length < 2);
+      button.onclick = () => {
+        state.comparisons = row.comparison
+          ? state.comparisons.filter((k) => k !== key)
+          : [...state.comparisons, key];
+        configure();
+      };
     }
     render();
   }
@@ -150,20 +208,34 @@ window.DynamicReplayView = (() => {
       pct = (t) => (100 * (t - start)) / width;
     $("timeline-range").textContent = `${fmt(start, 3)}–${fmt(end, 3)} sim s`;
     let html = D.timelineAxis(start, end);
-    for (const { run, episode: e } of state.rows) {
-      for (const [kind, label] of [
-        ["inference_hold", "推理等待 · 物体运动"],
-        ["action", "动作执行 · 物理推进"],
-      ]) {
+    for (const row of state.rows) {
+      const { run, episode: e } = row;
+      const selectedIds =
+        state.selected?.columnKey === row.columnKey
+          ? D.lineage(e, state.selected.requestId)
+          : [];
+      const lanes = streaming(e)
+        ? [
+            ["s2", "S2 · VLM"],
+            ["s1", "S1 · DiT"],
+            ["action", "动作执行 / 启动等待"],
+          ]
+        : [
+            ["inference_hold", "推理等待 · 物体运动"],
+            ["action", "动作执行 · 物理推进"],
+          ];
+      for (const [kind, label] of lanes) {
         const events = e.events.filter(
           (v) =>
-            v.kind === kind &&
+            (v.kind === kind ||
+              (kind === "action" && v.kind === "bootstrap_hold")) &&
             v.start_s < end &&
             (!finite(v.end_s) || v.end_s > start),
         );
-        html += `<div class="task-lane" data-stage="${kind === "action" ? "control" : "phase"}" style="--precision:${color(run.precision)}"><header class="task-lane-label"><strong>${esc(run.precision.toUpperCase())}</strong><span>${label}</span><small class="task-phase">${kind === "action" ? `${fmt(e.control_freq, 0)} Hz control · ${fmt(1000 / e.control_freq, 1)} ms/步` : calibration(e)}</small></header><div class="task-rail"><div class="task-blocks">`;
+        html += `<div class="task-lane" data-stage="${kind === "action" ? "control" : kind}" style="--precision:${color(run.precision)}"><header class="task-lane-label"><strong>${esc(name(run))}</strong><span>${label}</span><small class="task-phase">${kind === "action" ? `${fmt(e.control_freq, 0)} Hz · ${fmt(1000 / e.control_freq, 1)} ms/步` : esc(timingLabel(e))}</small></header><div class="task-rail"><div class="task-blocks">`;
         html += events
-          .map((v) => {
+          .map((event) => {
+            const v = D.resolveEvent(e, event);
             const active =
               v.start_s <= state.clock &&
               (!finite(v.end_s) || state.clock < v.end_s);
@@ -174,9 +246,14 @@ window.DynamicReplayView = (() => {
                   ? "running"
                   : "completed";
             const selected =
-              state.selected?.runId === run.id &&
-              state.selected?.requestId === v.request_id;
-            return `<button class="task-block${selected ? " source-selected" : ""}" data-event="${esc(v.id)}" data-run="${esc(run.id)}" data-phase="${phase}" data-phase-kind="${kind === "action" ? "execution" : "inference"}" style="left:${pct(v.start_s)}%;width:${(100 * ((v.end_s ?? end) - v.start_s)) / width}%" title="${esc(`${kind} · chunk ${v.chunk_id} · ${fmt(v.start_s, 6)}–${fmt(v.end_s, 6)} sim s`)}"><strong>${kind === "action" ? `A${v.action_step}` : `Hold C${v.chunk_id}`}</strong><small>← C${v.chunk_id} · ${finite(v.end_s) ? fmt((v.end_s - v.start_s) * 1000, 1) + " ms" : "未完成"}</small></button>`;
+              selectedIds.includes(v.request_id) ||
+              (state.selected?.columnKey === row.columnKey &&
+                state.selected.event.id === v.id);
+            const publication = v.source?.publication;
+            const evidence = publication
+              ? ` · 入队 ${publication.installed_slots ?? "—"} / 过期 ${publication.expired_slots ?? "—"} / 保护 ${publication.protected_slots ?? "—"}`
+              : "";
+            return `<button class="task-block${selected ? " source-selected" : ""}${v.fallback ? " dynamic-fallback" : ""}" data-event="${esc(v.id)}" data-column="${esc(row.columnKey)}" data-run="${esc(run.id)}" data-phase="${phase}" data-phase-kind="${kind === "action" ? "execution" : "inference"}" style="left:${pct(v.start_s)}%;width:${(100 * ((v.end_s ?? end) - v.start_s)) / width}%" title="${esc(`${eventLabel(v)} · ${dependencyLabel(v)} · ${fmt(v.start_s, 6)}–${fmt(v.end_s, 6)} sim s${evidence}`)}"><strong>${esc(eventLabel(v))}</strong><small>${esc(dependencyLabel(v))}</small></button>`;
           })
           .join("");
         html += `</div><div class="task-playhead" style="left:${pct(state.clock)}%"></div></div></div>`;
@@ -186,26 +263,27 @@ window.DynamicReplayView = (() => {
   }
   function renderWall() {
     const panels = state.rows.flatMap((row) => {
-      if (state.selected && state.selected.runId !== row.run.id) return [];
+      if (state.selected && state.selected.columnKey !== row.columnKey)
+        return [];
       const request = state.selected
         ? row.episode.requests.find((r) => r.id === state.selected.requestId)
         : D.at(row.episode, state.clock).request;
       return [{ ...row, request, panel: D.wallPanel(request) }];
     });
-    const key = JSON.stringify(panels.map((p) => [p.run.id, p.request?.id]));
+    const key = JSON.stringify(panels.map((p) => [p.columnKey, p.request?.id]));
     if (key === state.panelKey) return;
     state.panelKey = key;
     $("curve").innerHTML = panels
       .map(({ run, episode: e, request: r, panel: p }) => {
         if (!r)
-          return `<p class="placeholder">${esc(run.precision)} · 当前没有已关联的模型请求。</p>`;
+          return `<p class="placeholder">${esc(name(run))} · 当前没有已关联的模型请求${state.selected?.event.fallback ? "（fallback 动作）" : ""}。</p>`;
         const stageMarkup = p.stages
           .map(
             (s, i) =>
-              `<div class="dynamic-wall-stage"><span>${esc(s.name)}${i === 1 ? ` · ${r.server_audit?.forward_counts?.dit ?? "?"} NFE` : ""}</span><div class="dynamic-wall-rail">${finite(s.start_ms) && finite(s.end_ms) && p.end_ms > 0 ? `<span style="left:${(100 * s.start_ms) / p.end_ms}%;width:${(100 * (s.end_ms - s.start_ms)) / p.end_ms}%;background:${i ? "#766eab" : color(run.precision)}"></span>` : "未记录"}</div><strong>${fmt(s.duration_ms, 2)} ms</strong></div>`,
+              `<div class="dynamic-wall-stage"><span>${esc(s.name)}${i === 1 && r.lane !== "s2" ? ` · ${r.server_audit?.forward_counts?.dit ?? "?"} NFE` : ""}</span><div class="dynamic-wall-rail">${finite(s.start_ms) && finite(s.end_ms) && p.end_ms > 0 ? `<span style="left:${(100 * s.start_ms) / p.end_ms}%;width:${(100 * (s.end_ms - s.start_ms)) / p.end_ms}%;background:${i ? "#766eab" : color(run.precision)}"></span>` : finite(s.duration_ms) ? "仅有实测时长；无绝对边界" : "未记录"}</div><strong>${fmt(s.duration_ms, 2)} ms</strong></div>`,
           )
           .join("");
-        return `<section class="dynamic-wall" data-request-id="${esc(r.id)}"><h3>${esc(run.precision.toUpperCase())} · request ${r.request_sequence} · Fresh VLM → Flow DiT</h3><p>观测 action step ${r.source_tick ?? "—"} · sim ${fmt(r.sim_time_s, 3)} s · RPC ${fmt(r.rpc_duration_ms, 2)} ms；物理等待 τ ${fmt(ms(e.calibration.applied_latency_s), 1)} ms（${esc(calibration(e))}）</p>${stageMarkup}<p class="small-note">独立 wall 轴：0–${fmt(p.end_ms, 2)} ms；原点 monotonic ${fmt(p.origin_s, 6)} s。${esc(r.server_audit?.timing_scope ?? "测量边界未记录")}</p><table><thead><tr><th>Stage</th><th>Wall start / s</th><th>Wall end / s</th></tr></thead><tbody>${p.stages.map((s) => `<tr><td>${esc(s.name)}</td><td>${fmt(s.wall_started_s, 6)}</td><td>${fmt(s.wall_completed_s, 6)}</td></tr>`).join("")}</tbody></table></section>`;
+        return `<section class="dynamic-wall" data-request-id="${esc(r.id)}"><h3>${esc(name(run))} · request ${r.request_sequence} · ${streaming(e) ? esc(r.lane.toUpperCase()) : "Fresh VLM → Flow DiT"}</h3><p>${esc(D.observationLabel(r))} · sim ${fmt(r.sim_time_s, 3)} s · RPC ${fmt(r.rpc_duration_ms, 2)} ms；${esc(timingLabel(e))}</p>${stageMarkup}${streaming(e) ? `<p>依赖 ${r.parent_request_id ? esc(e.requests.find((v) => v.id === r.parent_request_id)?.lane === "bootstrap" ? "Bootstrap feature 0" : `S2 feature ${r.feature_sequence}`) : "无上游请求"} · ${esc(r.normal_or_recovery ?? "")} · valid [${r.server_audit?.valid_start_tick ?? "—"}, ${r.server_audit?.valid_end_tick ?? "—"}) · 入队 ${r.publication?.installed_slots ?? "—"} / 过期 ${r.publication?.expired_slots ?? "—"} / 保护 ${r.publication?.protected_slots ?? "—"}<br>特征 AoI ${fmt(ms(r.feature_age_s), 1)} ms · 请求 delay ${r.delay_ticks ?? "—"} ticks；逻辑服务时长 ${fmt(ms(r.logical_duration_s), 1)} ms。RPC / server wall 与逻辑时钟分别记录。</p>` : ""}<p class="small-note">独立 wall 轴：0–${fmt(p.end_ms, 2)} ms；原点 monotonic ${fmt(p.origin_s, 6)} s。${esc(streaming(e) ? D.rpcScope(e) : (r.server_audit?.timing_scope ?? "测量边界未记录"))}</p><table><thead><tr><th>Stage</th><th>Wall start / s</th><th>Wall end / s</th></tr></thead><tbody>${p.stages.map((s) => `<tr><td>${esc(s.name)}</td><td>${fmt(s.wall_started_s, 6)}</td><td>${fmt(s.wall_completed_s, 6)}</td></tr>`).join("")}</tbody></table></section>`;
       })
       .join("");
   }
@@ -216,7 +294,7 @@ window.DynamicReplayView = (() => {
           .filter((v) => v.rollout_sim_time_s <= state.clock)
           .at(-1);
         const targets = sample?.target_object_poses ?? {};
-        return `<div class="provenance-lines"><strong>${esc(run.precision.toUpperCase())}</strong> · sim ${fmt(sample?.rollout_sim_time_s, 3)} s · ${esc(sample?.kind ?? "无记录")}<table><thead><tr><th>Target</th><th>X / m</th><th>Y / m</th><th>Z / m</th></tr></thead><tbody>${Object.entries(
+        return `<div class="provenance-lines"><strong>${esc(name(run))}</strong> · sim ${fmt(sample?.rollout_sim_time_s, 3)} s · ${esc(sample?.kind ?? "无记录")}<table><thead><tr><th>Target</th><th>X / m</th><th>Y / m</th><th>Z / m</th></tr></thead><tbody>${Object.entries(
           targets,
         )
           .map(
@@ -233,13 +311,13 @@ window.DynamicReplayView = (() => {
     const events = state.rows.flatMap((row) =>
       row.episode.events
         .filter((e) => Math.abs(e.start_s - state.clock) <= 0.75)
-        .map((event) => ({ row, event })),
+        .map((event) => ({ row, event: D.resolveEvent(row.episode, event) })),
     );
     $("event-count").textContent = `游标附近 ${events.length} 条`;
     $("event-list").innerHTML = events
       .map(
         ({ row, event: e }) =>
-          `<button class="event-row" data-event="${esc(e.id)}" data-run="${esc(row.run.id)}">${esc(row.run.precision.toUpperCase())} · ${fmt(e.start_s, 3)} sim s · ${e.kind === "action" ? `Execute ${e.action_step}` : "Inference hold"} · C${e.chunk_id}</button>`,
+          `<button class="event-row" data-event="${esc(e.id)}" data-run="${esc(row.run.id)}" data-column="${esc(row.columnKey)}">${esc(name(row.run))} · ${fmt(e.start_s, 3)} sim s · ${esc(eventLabel(e))} · ${esc(dependencyLabel(e))}</button>`,
       )
       .join("");
   }
@@ -250,7 +328,7 @@ window.DynamicReplayView = (() => {
     $("play").textContent = state.playing ? "暂停" : "播放机器人视频";
     const cards = $("precision-cards").querySelectorAll(".precision-card");
     state.rows.forEach(({ episode: e }, i) => {
-      const now = D.at(e, state.clock),
+      const now = D.at(e, state.clock, $("camera").value),
         frame = now.frame;
       window.ReplayMedia.update(
         cards[i],
@@ -258,7 +336,7 @@ window.DynamicReplayView = (() => {
         frame ? frame.media_time_s + 0.0001 : null,
         "物理仿真采样 · 未生成插值帧",
         {
-          frames: e.frames,
+          frames: D.cameraFrames(e, $("camera").value),
           cursor: state.clock,
           ended: now.ended,
           timeLabel: "仿真采样",
@@ -266,7 +344,11 @@ window.DynamicReplayView = (() => {
         state.epoch,
       );
       const done = e.events.filter(
-        (v) => v.kind === "action" && finite(v.end_s) && v.end_s <= state.clock,
+        (v) =>
+          v.kind === "action" &&
+          !v.partial &&
+          finite(v.end_s) &&
+          v.end_s <= state.clock,
       ).length;
       const metrics = [
         ["当前物理阶段", D.phaseLabel(now, e)],
@@ -277,6 +359,11 @@ window.DynamicReplayView = (() => {
           `${fmt(e.video_fps, 0)} fps / ${fmt(e.control_freq, 0)} Hz`,
         ],
       ];
+      if (streaming(e))
+        metrics.push(
+          ["动作视觉 AoI", `${fmt(ms(now.event?.feature_age_s), 1)} ms`],
+          ["动作状态 AoI", `${fmt(ms(now.event?.state_age_s), 1)} ms`],
+        );
       cards[i].querySelector(".metrics").innerHTML = metrics
         .map(
           ([name, value]) =>
@@ -333,15 +420,15 @@ window.DynamicReplayView = (() => {
       "image",
     );
     $("evidence-note").textContent =
-      "LIBERO-Dynamic：主时间轴采用物理仿真时间，包含推理等待期间目标物体的运动。模型使用本项目已有 GR00T 权重。所选请求的实测 VLM→DiT 耗时在独立 wall 轴展示。";
+      "LIBERO-Dynamic：主时间轴采用物理仿真时间，包含推理等待期间目标物体的运动。模型使用本项目已有 GR00T 权重。Flow4 与 πR² 分列；πR² 的独立 S2/S1 通道采用反事实延迟，真实 GPU RPC 串行计算。实测耗时在独立 wall 轴展示。";
     $("timeline-note").textContent =
-      "Hold 是应用到物理世界的 τ；执行动作按真实物理边界显示。视频逐帧依照 sample_sim_time_s 映射，60 fps 视频与 20 Hz 控制分别计数。点击块检查真实请求来源。";
+      "Hold 是应用到物理世界的 τ；执行动作按真实物理边界显示。视频逐帧依照 sample_sim_time_s 映射，60 fps 视频与 20 Hz 控制分别计数。πR² 首次启动等待付费，随后动作每步推进；点击 S1 关联 S2，点击动作关联实际生产请求；高亮只表示记录中的依赖。";
     document.querySelector(".timeline-section h2").textContent =
       "LIBERO-Dynamic · 物理时间与动作来源";
     $("curve-title").textContent = "真实 VLM → DiT · 独立 Wall 时间";
     $("projection-title").textContent = "移动目标 · 实测物理位姿";
     $("curve-note").textContent =
-      "阶段计时包含准备和解码，以 stream 完成为边界。实际模型耗时与场景 τ 分开显示；不会把 wall 时间按比例挤进物理等待。";
+      "RPC 为实际客户端往返；server 区间按记录边界展示，未提供绝对边界时只显示时长。实际模型耗时与逻辑场景 τ 分开，不按比例映射。";
     for (const id of ["sample", "precision"])
       $(id).addEventListener("change", configure);
     for (const id of ["camera", "window"])
@@ -378,7 +465,9 @@ window.DynamicReplayView = (() => {
       $(id).addEventListener("click", (event) => {
         const target = event.target.closest("[data-event]");
         if (!target) return;
-        const row = state.rows.find((r) => r.run.id === target.dataset.run),
+        const row = state.rows.find(
+            (r) => r.columnKey === target.dataset.column,
+          ),
           item = row?.episode.events.find((e) => e.id === target.dataset.event);
         if (item) selectRequest(row, item);
       });

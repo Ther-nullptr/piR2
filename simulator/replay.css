@@ -971,3 +971,17 @@ body[data-view="dynamic"] .chart td {
 body[data-view="dynamic"] .metric strong {
   font-size: 16px;
 }
+.dynamic-card .dynamic-compare {
+  margin: 0 14px 12px;
+  font-size: 12px;
+}
+.task-block.dynamic-fallback {
+  border-color: #b76136;
+  background-image: repeating-linear-gradient(
+    135deg,
+    transparent,
+    transparent 5px,
+    #b7613620 5px,
+    #b7613620 10px
+  );
+}

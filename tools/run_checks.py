@@ -47,6 +47,7 @@ def main():
         "tests/contracts/test_dynamic_streaming_evaluation.py",
         "tests/contracts/test_dynamic_streaming.py",
         "tests/contracts/test_replay_dynamic.py",
+        "tests/contracts/test_replay_dynamic_streaming.py",
         "tests/contracts/test_responsive_scheduling.py",
         "tests/contracts/test_synchronous_execution.py",
         "tests/contracts/test_one_step_async.py",
