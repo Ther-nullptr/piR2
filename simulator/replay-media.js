@@ -101,7 +101,7 @@ window.ReplayMedia = (() => {
         this.caption.textContent = "等待游标之前的实际帧";
         return;
       }
-      this.caption.textContent = `${this.presented.frame_id} · 采集 ${this.presented.relative_s.toFixed(3)} s · ${this.context?.ended ? "末帧保持" : "本精度独立轨迹"}`;
+      this.caption.textContent = `${this.presented.frame_id} · ${this.context?.timeLabel ?? "采集"} ${this.presented.relative_s.toFixed(3)} s · ${this.context?.ended ? "末帧保持" : "本精度独立轨迹"}`;
     }
     present() {
       const media = this.media;

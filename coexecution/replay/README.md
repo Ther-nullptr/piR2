@@ -46,6 +46,25 @@ python simulator/serve.py --port 8765 --replay /path/to/new-replay-catalog/catal
 
 可用 `--default-execution-clock paced|ready`、`--default-execution-coupling`、`--default-execution-prefix-steps` 与 `--default-async-overlap-steps` 选择默认机器人组合；该组合必须出现在记录中。旧 catalog 默认 paced。前端选择器只切换记录，不改变旧轨迹的时间或调度。
 
+### 移动物体协议：LIBERO-Dynamic
+
+```bash
+python -m coexecution.replay build \
+  --dynamic-evaluation /path/to/dynamic-evaluation \
+  --output /path/to/new-dynamic-catalog
+python simulator/serve.py --port 8765 --replay /path/to/new-dynamic-catalog/catalog.json
+```
+
+打开 `/simulator/replay.html?view=dynamic`。`--dynamic-evaluation` 可重复，也可与原有模型或部署输入一起构建。每个目录包含评估器的 `evaluation.json`、`manifest.jsonl`、policy audit、物理 trace 和 MP4。Builder 读取已有文件，沿用媒体白名单，不启动模型。
+
+Dynamic run 使用 `kind=dynamic`。主轴 `rollout_sim_time_s` 从首次策略观测开始，包含机器人保持、目标继续运动的推理等待。每个 hold 与动作块通过 `chunk_id → policy_request_sequence` 关联本回合的 scored request；warmup 请求不画进主时间轴。选择请求后，独立 wall 面板展示实际 Fresh VLM → Flow DiT 的 stream-complete 起止时间、RPC 和原始测量边界，物理 τ 与实测 wall 延迟分别呈现。
+
+导入 MP4 需要本机 `ffmpeg` / `ffprobe`。Builder 生成浏览器可解码的无损 VP9/WebM 副本；保留原 MP4、源 SHA-256、编码参数与逐帧时间戳，不插帧或重采样。WebM 容器按毫秒舍入 PTS，因此保留 audit 的 `source_media_time_s`，并将 `media_time_s` 更新为 ffprobe 读出的实际 PTS。双相机帧数和 PTS 必须一致。
+
+视频逐帧使用 `video_samples.sample_sim_time_s → media_time_s`，保留等待期间真实采集的运动帧。视频 fps 与控制 Hz 分别显示；`source_tick` 是执行动作计数，不含物理等待子步。反事实固定 τ 标记为 counterfactual，实测校准保留样本数与应用 τ；每回合模型热身和延迟校准热身单独显示。选择器按套件、任务、轨迹、速度、seed 和初始状态配对；每个精度的配置独立选择，未录制精度不生成结果。
+
+导入器验证媒体位于评估根目录、帧时间单调且归属对应 chunk/阶段/动作步、动作来自对应请求前缀、trace 与物理事件一致，并保留源路径/SHA-256。缺失媒体、计时与失败回合保持不可用或未知。浏览器使用同一个机器人播放器和传输控件。
+
 <a id="explicit-recording-and-incremental-delivery"></a>
 
 ## 显式记录与增量交付

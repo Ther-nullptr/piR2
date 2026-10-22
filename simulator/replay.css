@@ -914,3 +914,60 @@ footer {
   border-style: dashed;
   opacity: 0.72;
 }
+
+/* Dynamic replay shares the existing player; its model panel has an independent clock. */
+.dynamic-card .media-stage {
+  max-width: 800px;
+  width: 100%;
+  margin-inline: auto;
+}
+.dynamic-card .dynamic-run {
+  max-width: calc(100% - 28px);
+  margin: 0 14px 12px;
+}
+.dynamic-language {
+  padding: 0 14px;
+}
+.dynamic-wall {
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.dynamic-wall h3 {
+  font-size: 14px;
+}
+.dynamic-wall p {
+  font-size: 12px;
+  line-height: 1.5;
+}
+.dynamic-wall-stage {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr) 90px;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0;
+  font-size: 12px;
+}
+.dynamic-wall-rail {
+  position: relative;
+  height: 24px;
+  background: #eef2ed;
+}
+.dynamic-wall-rail > span {
+  position: absolute;
+  height: 100%;
+  border-radius: 3px;
+}
+body[data-view="dynamic"] .chart table {
+  width: 100%;
+  font-size: 11px;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+body[data-view="dynamic"] .chart th,
+body[data-view="dynamic"] .chart td {
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--line);
+}
+body[data-view="dynamic"] .metric strong {
+  font-size: 16px;
+}

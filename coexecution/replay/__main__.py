@@ -12,6 +12,7 @@ def main(argv=None):
     )
     build.add_argument("--model-run", action="append", type=Path, default=[])
     build.add_argument("--deployment", action="append", type=Path, default=[])
+    build.add_argument("--dynamic-evaluation", action="append", type=Path, default=[])
     build.add_argument("--output", type=Path, required=True)
     build.add_argument(
         "--default-execution-clock",
@@ -66,6 +67,7 @@ def main(argv=None):
     catalog = build_catalog(
         model_runs=args.model_run,
         deployments=args.deployment,
+        dynamic_evaluations=args.dynamic_evaluation,
         output=args.output,
         clock_cohort=args.clock_cohort,
         default_execution_clock=args.default_execution_clock,

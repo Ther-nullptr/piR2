@@ -10,6 +10,8 @@
     <script defer src="replay-timeline.js"></script>
     <script defer src="replay-media.js"></script>
     <script defer src="replay-stream.js"></script>
+    <script defer src="replay-dynamic.js"></script>
+    <script defer src="replay-dynamic-view.js"></script>
     <script defer src="replay-view.js"></script>
   </head>
   <body>
@@ -34,7 +36,10 @@
           机器人响应 · 实际视频</button
         ><button id="mode-model" aria-pressed="false">
           模型组件 · 固定输入</button
-        ><span>视频播放与模型组件时间线使用不同证据</span>
+        ><button id="mode-dynamic" aria-pressed="false">
+          LIBERO-Dynamic · 移动物体
+        </button>
+        <span>视频播放与模型组件时间线使用不同证据</span>
       </nav>
       <section class="control-band" aria-label="实验选择">
         <label id="record-label"

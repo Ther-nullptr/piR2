@@ -11,6 +11,7 @@ def build_catalog(
     model_runs,
     deployments,
     output,
+    dynamic_evaluations=(),
     clock_cohort=None,
     default_execution_clock=None,
     default_execution_coupling=None,
@@ -18,6 +19,7 @@ def build_catalog(
     default_async_overlap_steps=None,
 ):
     from .deployment import deployment_directories, deployment_run
+    from .dynamic import dynamic_run
     from .media import MediaRegistry
     from .model import compare_outputs
     from .model import model_runs as import_models
@@ -35,8 +37,12 @@ def build_catalog(
         if not directories:
             raise ValueError(f"No deployment evidence under {path}")
         runs.extend(deployment_run(directory, media) for directory in directories)
+    for path in dynamic_evaluations:
+        runs.append(dynamic_run(path, media))
     if not runs:
-        raise ValueError("At least one measured model or deployment run is required")
+        raise ValueError(
+            "At least one recorded model, deployment or dynamic run is required"
+        )
     if len({run["id"] for run in runs}) != len(runs):
         raise ValueError("Duplicate replay run input")
     if default_execution_clock is not None and (
