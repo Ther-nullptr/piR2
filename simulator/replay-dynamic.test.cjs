@@ -336,3 +336,36 @@ test("camera mappings prefer canonical image frames while retaining old duplicat
     [],
   );
 });
+
+test("native Flow labels display varying actual calls and K instead of a scalar tau", () => {
+  const episode = {
+    protocol: "default_vla_flow4",
+    timing_mode: "native",
+    execution_prefix_steps: 2,
+    decoded_horizon: 16,
+    predicted_horizon: 40,
+    requests: [{ service_duration_ms: 31.2 }, { service_duration_ms: 83.4 }],
+    calibration: { kind: null, applied_latency_s: null },
+    episode_warmup_recorded: 8,
+    episode_warmup_requests: 8,
+  };
+  const label = D.timingLabel(episode);
+  assert.ok(label.includes("逐请求实测"));
+  assert.ok(label.includes("31.2–83.4"));
+  assert.ok(label.includes("K 2"));
+  assert.ok(!label.includes("τ"));
+  const contract = D.modelContract(episode);
+  assert.ok(contract.includes("decoded 16 / predicted 40"));
+  assert.ok(contract.includes("K 2"));
+  assert.ok(!contract.includes("校准保留"));
+});
+
+test("native Flow wall note states the full request boundary", () => {
+  const scope = D.rpcScope({
+    protocol: "default_vla_flow4",
+    timing_mode: "native",
+  });
+  assert.match(scope, /NumPy/);
+  assert.match(scope, /完整策略调用/);
+  assert.match(scope, /RPC/);
+});

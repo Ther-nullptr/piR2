@@ -48,7 +48,85 @@ def _stage(audit, name, start_key, end_key):
     }
 
 
-def _requests(audit, item_id, episode_id):
+def _native_equal(left, right, label, *, tolerance=1e-9):
+    if abs(_number(left) - _number(right)) > tolerance:
+        raise ValueError(f"Native Flow {label} disagrees with recorded evidence")
+
+
+def _native_mode(manifest, config, audit):
+    native = (
+        config.get("native_latency") is True
+        or manifest.get("timing_mode") == "native"
+        or audit.get("timing_mode") == "native"
+    )
+    if not native:
+        return False
+    if (
+        config.get("native_latency") is not True
+        or manifest.get("timing_mode") != "native"
+        or manifest.get("latency_kind") != "measured_per_request"
+        or manifest.get("timing_rule") != "release_continuous_sync"
+        or any(
+            manifest.get(key) is not None
+            for key in (
+                "applied_latency_s",
+                "raw_calibration_latency_s",
+                "calibration_kind",
+                "calibration_protocol",
+                "calibration_retained_requests",
+            )
+        )
+        or any(
+            config.get(key) is not None for key in ("calibration", "latency_seconds")
+        )
+        or config.get("calibrate", False)
+    ):
+        raise ValueError("Native Flow requires measured requests, not a scalar latency")
+    if audit and (
+        audit.get("timing_mode") != "native"
+        or audit.get("latency_kind") != "measured_per_request"
+        or audit.get("calibration") is not None
+        or not isinstance(manifest.get("latency_boundary"), str)
+        or not manifest["latency_boundary"]
+        or audit.get("latency_boundary") != manifest["latency_boundary"]
+    ):
+        raise ValueError("Native Flow audit must identify its measured timing boundary")
+    return True
+
+
+def _native_request(record, *, boundary, prefix):
+    duration = _number(record.get("controller_policy_elapsed_s"))
+    if (
+        duration <= 0
+        or record.get("controller_timing_boundary") != boundary
+        or record.get("predicted_horizon") != 40
+        or record.get("decoded_horizon") != 16
+        or record.get("execution_prefix_steps") != prefix
+        or record.get("server_audit", {}).get("forward_counts") != {"vlm": 1, "dit": 4}
+    ):
+        raise ValueError(
+            "Native Flow needs full fresh-VLM/Flow4 request timing and H16 prefix"
+        )
+    start, end = (
+        _number(record.get("request_started_s")),
+        _number(record.get("request_completed_s")),
+    )
+    interval(start, end)
+    if end - start > duration + 1e-6:
+        raise ValueError(
+            "Native Flow full policy duration cannot exclude part of its adapter call"
+        )
+    rpc_start, rpc_end = (
+        _number(record.get("rpc_started_s")),
+        _number(record.get("rpc_completed_s")),
+    )
+    interval(rpc_start, rpc_end)
+    if rpc_start < start - 1e-6 or rpc_end > end + 1e-6:
+        raise ValueError("Native Flow adapter timing must enclose its RPC")
+    return duration
+
+
+def _requests(audit, item_id, episode_id, *, native=False, boundary=None, prefix=None):
     requests = {}
     for record in audit.get("records", []):
         if record.get("item_id") != item_id:
@@ -70,8 +148,27 @@ def _requests(audit, item_id, episode_id):
         vlm_end, dit_start = stages[0]["wall_completed_s"], stages[1]["wall_started_s"]
         if vlm_end is not None and dit_start is not None and dit_start < vlm_end:
             raise ValueError("Fresh VLM must complete before dependent Flow DiT")
+        duration = (
+            _native_request(record, boundary=boundary, prefix=prefix)
+            if native and record.get("status") == "complete"
+            else None
+        )
+        if duration is not None:
+            stages.insert(
+                0,
+                {
+                    "name": "Full policy call + normalization",
+                    # Source perf_counter exposes a duration, not absolute endpoints.
+                    # Do not manufacture endpoints from the adapter's monotonic clock.
+                    "wall_started_s": None,
+                    "wall_completed_s": None,
+                    "duration_ms": duration * 1000,
+                    "timing_scope": boundary,
+                },
+            )
         requests[sequence] = {
             **record,
+            "service_duration_ms": None if duration is None else duration * 1000,
             "id": f"{episode_id}-request-{sequence}",
             "wall_stages": stages,
             "rpc_duration_ms": _stage(
@@ -81,7 +178,7 @@ def _requests(audit, item_id, episode_id):
     return requests
 
 
-def _chunks(audit, requests):
+def _chunks(audit, requests, *, native=False):
     chunks, used_requests = {}, set()
     for chunk in audit.get("chunks", []):
         sequence = chunk.get("metadata", {}).get("policy_request_sequence")
@@ -103,6 +200,27 @@ def _chunks(audit, requests):
             )
         if chunk.get("obs_step_idx") != request.get("source_tick"):
             raise ValueError("Dynamic chunk and observation action step disagree")
+        if native:
+            metadata = chunk["metadata"]
+            duration = request["controller_policy_elapsed_s"]
+            if (
+                metadata.get("timing_mode") != "native"
+                or metadata.get("latency_kind") != "measured_per_request"
+                or metadata.get("latency_boundary")
+                != request["controller_timing_boundary"]
+                or metadata.get("timing_rule") != "release_continuous_sync"
+                or metadata.get("raw_calibration_latency_s") is not None
+                or metadata.get("physics_time_quantized_to_control_steps") is not False
+            ):
+                raise ValueError("Native Flow chunk has inconsistent timing metadata")
+            _native_equal(chunk.get("policy_elapsed_s"), duration, "chunk duration")
+            for key in ("applied_latency_s", "sim_latency_s"):
+                _native_equal(metadata.get(key), duration, key)
+            _native_equal(
+                chunk.get("rollout_sim_time_s"),
+                request.get("sim_time_s"),
+                "observation time",
+            )
         used_requests.add(sequence)
         chunks[chunk_id] = {**chunk, "request": request}
     return chunks
@@ -124,8 +242,11 @@ def _same_action(left, right):
     )
 
 
-def _events(audit, chunks, episode_id, control_freq, trace):
+def _events(
+    audit, chunks, episode_id, control_freq, trace, *, native=False, complete=False
+):
     events, pending = [], {}
+    seen_holds = set()
     previous_time = 0.0
     actions = {}
     for motion in audit.get("motion_events", []):
@@ -142,6 +263,27 @@ def _events(audit, chunks, episode_id, control_freq, trace):
         if kind == "hold_started":
             if chunk_id in pending:
                 raise ValueError("Duplicate inference hold start")
+            if native:
+                if (
+                    chunk_id in seen_holds
+                    or motion.get("action_step") != request["source_tick"]
+                ):
+                    raise ValueError(
+                        "Native Flow must apply each request hold exactly once"
+                    )
+                _native_equal(end, previous_time, "hold progression", tolerance=1e-8)
+                _native_equal(
+                    end,
+                    request.get("sim_time_s"),
+                    "hold observation time",
+                    tolerance=1e-8,
+                )
+                _native_equal(
+                    motion.get("applied_latency_s"),
+                    request["controller_policy_elapsed_s"],
+                    "hold start duration",
+                )
+                seen_holds.add(chunk_id)
             pending[chunk_id] = motion
             previous_time = end
             continue
@@ -150,8 +292,25 @@ def _events(audit, chunks, episode_id, control_freq, trace):
                 raise ValueError("Inference hold completion has no start")
             start_motion = pending.pop(chunk_id)
             start = _number(start_motion["rollout_sim_time_s"])
+            if native:
+                duration = request["controller_policy_elapsed_s"]
+                _native_equal(
+                    motion.get("applied_latency_s"),
+                    duration,
+                    "hold completion duration",
+                    tolerance=1e-8,
+                )
+                _native_equal(
+                    end - start, duration, "physical hold duration", tolerance=1e-8
+                )
+                if motion.get("action_step") != request["source_tick"]:
+                    raise ValueError(
+                        "Native Flow hold completion has a different action source"
+                    )
             kind = "inference_hold"
         else:
+            if native and (chunk_id not in seen_holds or chunk_id in pending):
+                raise ValueError("Native Flow action cannot precede its measured hold")
             start = end - 1 / control_freq
             if abs(start - previous_time) > 1e-6:
                 raise ValueError(
@@ -184,6 +343,10 @@ def _events(audit, chunks, episode_id, control_freq, trace):
             }
         )
         previous_time = end
+    if native and complete and seen_holds != set(chunks):
+        raise ValueError(
+            "Native Flow complete episode requires every measured chunk hold"
+        )
     if pending:
         # A failed episode may retain a start without inventing its completion.
         for chunk_id, motion in pending.items():
@@ -273,13 +436,33 @@ def _episode(root, manifest, config, media, run_id):
     if audit and audit.get("item_id") != item_id:
         raise ValueError("Dynamic audit belongs to another episode")
     trace = read_optional("step_trace", lines=True)
-    requests = _requests(audit, item_id, episode_id)
-    chunks = _chunks(audit, requests)
+    native = _native_mode(manifest, config, audit)
+    requests = _requests(
+        audit,
+        item_id,
+        episode_id,
+        native=native,
+        boundary=manifest.get("latency_boundary"),
+        prefix=manifest.get("replan_steps_requested"),
+    )
+    chunks = _chunks(audit, requests, native=native)
     freq = _number(manifest.get("control_freq"))
     if freq <= 0:
         raise ValueError("Dynamic control frequency must be positive")
     duration = optional_number(manifest.get("policy_rollout_sim_time_s"))
-    events = _events(audit, chunks, episode_id, freq, trace) if audit else []
+    events = (
+        _events(
+            audit,
+            chunks,
+            episode_id,
+            freq,
+            trace,
+            native=native,
+            complete=manifest.get("status") == "ok",
+        )
+        if audit
+        else []
+    )
     if (
         audit
         and manifest.get("status") == "ok"
@@ -357,6 +540,9 @@ def _episode(root, manifest, config, media, run_id):
                 "steps",
                 "diagnostics",
                 "timing_rule",
+                "timing_mode",
+                "latency_kind",
+                "latency_boundary",
                 "policy_identity",
                 "video_view_contract",
                 "setup",

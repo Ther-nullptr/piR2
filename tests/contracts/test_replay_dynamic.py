@@ -476,3 +476,218 @@ def test_dynamic_rejects_different_camera_derivative_pts(
     monkeypatch.setattr(MediaRegistry, "browser_video", browser_video)
     with pytest.raises(ValueError, match="camera.*timestamps"):
         build(root, tmp_path)
+
+
+@pytest.fixture(params=[1, 2])
+def native_evidence(evidence, request):
+    root, manifest, audit = evidence
+    prefix = request.param
+    durations = [0.03123456789, 0.08345678912]
+    boundary = (
+        "upstream perf_counter: full get_action_chunk + NumPy result normalization; "
+        "preprocessing/RPC/postprocessing included; warmup/reset/physics excluded"
+    )
+    mode = {
+        "timing_mode": "native",
+        "latency_kind": "measured_per_request",
+        "latency_boundary": boundary,
+    }
+    base = audit["records"][1]
+    audit.update(
+        **mode, calibration=None, chunks=[], motion_events=[], video_samples=[]
+    )
+    audit["records"] = [audit["records"][0]]
+    traces = []
+    sim_time = 0.0
+    for index, duration in enumerate(durations):
+        step, sequence, chunk_id = index * prefix, 8 + index, 1 + index
+        wall = 100.0 + index
+        record = deepcopy(base)
+        record.update(
+            request_sequence=sequence,
+            source_tick=step,
+            sim_time_s=sim_time,
+            request_started_s=wall,
+            request_completed_s=wall + duration - 1e-7,
+            rpc_started_s=wall + duration * 0.1,
+            rpc_completed_s=wall + duration * 0.9,
+            controller_policy_elapsed_s=duration,
+            controller_timing_boundary=boundary,
+            execution_prefix_steps=prefix,
+            actions=record["actions"][:prefix],
+        )
+        record["server_audit"].update(
+            source_tick=step,
+            vlm_started_s=wall + duration * 0.2,
+            vlm_completed_s=wall + duration * 0.6,
+            action_started_s=wall + duration * 0.6,
+            action_completed_s=wall + duration * 0.8,
+        )
+        audit["records"].append(record)
+        audit["chunks"].append(
+            {
+                "chunk_id": chunk_id,
+                "obs_step_idx": step,
+                "rollout_sim_time_s": sim_time,
+                "policy_elapsed_s": duration,
+                "metadata": {
+                    **mode,
+                    "timing_rule": "release_continuous_sync",
+                    "physics_time_quantized_to_control_steps": False,
+                    "policy_request_sequence": sequence,
+                    "raw_calibration_latency_s": None,
+                    "applied_latency_s": duration,
+                    "sim_latency_s": duration,
+                },
+            }
+        )
+        for kind, timestamp in [
+            ("hold_started", sim_time),
+            ("hold_completed", sim_time + duration),
+        ]:
+            audit["motion_events"].append(
+                {
+                    "kind": kind,
+                    "rollout_sim_time_s": timestamp,
+                    "applied_latency_s": duration,
+                    "active_chunk_id": chunk_id,
+                    "action_step": step,
+                }
+            )
+        sim_time += duration
+        for offset in range(prefix):
+            sim_time += 0.05
+            action = record["actions"][offset]
+            audit["motion_events"].append(
+                {
+                    "kind": "action_completed",
+                    "rollout_sim_time_s": sim_time,
+                    "active_chunk_id": chunk_id,
+                    "action_step": step + offset,
+                    "action": action,
+                }
+            )
+            traces.append(
+                {
+                    "step_idx": step + offset,
+                    "sim_time_s": sim_time,
+                    "chunk_id": chunk_id,
+                    "executed_action": action,
+                }
+            )
+    manifest.update(
+        **mode,
+        steps=2 * prefix,
+        policy_rollout_sim_time_s=sim_time,
+        applied_latency_s=None,
+        raw_calibration_latency_s=None,
+        calibration_kind=None,
+        calibration_protocol=None,
+        calibration_retained_requests=None,
+        replan_steps_requested=prefix,
+        video_frame_count=0,
+    )
+    write(root / "audit.json", audit)
+    write(root / "manifest.jsonl", manifest)
+    (root / "trace.jsonl").write_text("\n".join(json.dumps(row) for row in traces))
+    (root / "calibration.json").unlink()
+    write(
+        root / "evaluation.json",
+        {
+            "schema": "pir2.libero_dynamic.default.v1",
+            "configuration": {"seed": 0, "native_latency": True},
+            **mode,
+        },
+    )
+    return root, manifest, audit
+
+
+def test_native_replay_preserves_distinct_request_holds_and_short_prefix(
+    native_evidence, tmp_path
+):
+    root, manifest, audit = native_evidence
+    _, run, _ = build(root, tmp_path)
+    episode = run["episodes"][0]
+    assert episode["timing_mode"] == "native"
+    assert episode["latency_kind"] == "measured_per_request"
+    assert episode["calibration"]["kind"] is None
+    assert episode["execution_prefix_steps"] == manifest["replan_steps_requested"]
+    holds = [event for event in episode["events"] if event["kind"] == "inference_hold"]
+    for hold, request in zip(holds, episode["requests"]):
+        assert hold["end_s"] - hold["start_s"] == pytest.approx(
+            request["service_duration_ms"] / 1000
+        )
+        assert hold["start_s"] == request["sim_time_s"]
+    assert holds[0]["end_s"] == 0.03123456789
+    assert holds[1]["start_s"] == pytest.approx(
+        0.03123456789 + 0.05 * episode["execution_prefix_steps"]
+    )
+    assert (
+        episode["requests"][0]["wall_stages"][0]["name"]
+        == "Full policy call + normalization"
+    )
+    assert episode["requests"][0]["wall_stages"][0]["wall_started_s"] is None
+    assert (
+        episode["requests"][0]["wall_stages"][0]["duration_ms"]
+        == audit["chunks"][0]["policy_elapsed_s"] * 1000
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda m, a: a["chunks"][1]["metadata"].update(
+            sim_latency_s=a["chunks"][0]["policy_elapsed_s"]
+        ),
+        lambda m, a: a["chunks"][1].update(policy_elapsed_s=0.05),
+        lambda m, a: a["records"][2].update(controller_policy_elapsed_s=0.05),
+        lambda m, a: a["records"][2].update(sim_time_s=0),
+        lambda m, a: a["motion_events"][1].update(applied_latency_s=0.05),
+        lambda m, a: a["motion_events"][0].update(applied_latency_s=0.05),
+        lambda m, a: m.update(applied_latency_s=0.05),
+        lambda m, a: m.update(timing_rule="paper_quantized_sync"),
+        lambda m, a: a.update(calibration={"kind": "measured", "raw_latency_s": 0.05}),
+        lambda m, a: a["records"][1]["server_audit"].update(
+            forward_counts={"vlm": 0, "dit": 1}
+        ),
+    ],
+)
+def test_native_replay_rejects_stale_or_altered_delay_evidence(
+    native_evidence, tmp_path, mutation
+):
+    root, manifest, audit = native_evidence
+    mutation(manifest, audit)
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    with pytest.raises(ValueError, match="[Nn]ative"):
+        build(root, tmp_path)
+
+
+def test_native_failed_episode_retains_untimed_failed_request(
+    native_evidence, tmp_path
+):
+    root, manifest, audit = native_evidence
+    failed = deepcopy(audit["records"][-1])
+    failed.update(request_sequence=10, status="error", error="RPC failed")
+    failed.pop("controller_policy_elapsed_s")
+    failed.pop("controller_timing_boundary")
+    audit["records"].append(failed)
+    manifest.update(status="error", success=None, error="RPC failed")
+    write(root / "audit.json", audit)
+    write(root / "manifest.jsonl", manifest)
+    _, run, _ = build(root, tmp_path)
+    episode = run["episodes"][0]
+    assert episode["requests"][-1]["status"] == "error"
+    assert episode["requests"][-1]["service_duration_ms"] is None
+    assert (
+        len([event for event in episode["events"] if event["kind"] == "inference_hold"])
+        == 2
+    )
+
+
+def test_native_physical_duration_must_equal_this_request(native_evidence, tmp_path):
+    root, _, audit = native_evidence
+    audit["motion_events"][1]["rollout_sim_time_s"] += 0.001
+    write(root / "audit.json", audit)
+    with pytest.raises(ValueError, match="Native Flow physical hold"):
+        build(root, tmp_path)
