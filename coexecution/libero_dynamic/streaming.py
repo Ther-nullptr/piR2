@@ -1,7 +1,7 @@
-"""πR² in a moving world with explicit independent-stage logical service times.
+"""πR² in a moving world with measured or fixed stage service times.
 
 All GPU RPCs and env steps run serially on the caller thread. Logical futures
-hide GPU results until the declared completion; the real world's next boundary
+hide GPU results until the measured or declared completion; the next boundary
 observation stays private while intervening logical events are processed. This
 is an algorithm-time experiment, not a same-GPU concurrent deployment benchmark.
 """
@@ -44,6 +44,8 @@ class StepResult:
 
 class StreamingResult(TypedDict):
     schema: str
+    timing_mode: str
+    stage_latencies: dict | None
     timing_domain: str
     resource_model: str
     compute_coupling: str
@@ -65,6 +67,20 @@ class StreamingResult(TypedDict):
     config: dict
 
 
+def timing_metadata(mode, latencies):
+    """Describe service timing separately from physical execution coupling."""
+    return {
+        "timing_mode": mode,
+        "timing_domain": "measured_request_discrete_event"
+        if mode == "native"
+        else "counterfactual_discrete_event",
+        "latency_provenance": "measured_per_request"
+        if mode == "native"
+        else "fixed_counterfactual",
+        "stage_latencies": None if latencies is None else asdict(latencies),
+    }
+
+
 @dataclass(frozen=True)
 class _Frame:
     observation: Any
@@ -76,7 +92,7 @@ class StreamingController:
     """Reuse command ownership/mailbox rules without wall-clock cross arithmetic.
 
     Call ``bootstrap`` on the scored initial observation. Then the runner must
-    advance the real moving world for ``latencies.bootstrap_s`` while holding the
+    advance the real moving world for the receipt's ``logical_duration_s`` holding the
     robot and recapture state. Pass that observation and its separate logical
     capture to ``run``. During ``run`` only step_fn advances the world; each call
     consumes exactly one 50 ms action, including real fallback commands.
@@ -88,8 +104,21 @@ class StreamingController:
 
     period_s = 0.05
 
-    def __init__(self, rpc, *, latencies, fixed_delay=None, epoch_s=1000.0):
-        if not isinstance(latencies, StageLatencies):
+    def __init__(
+        self,
+        rpc,
+        *,
+        latencies=None,
+        fixed_delay=None,
+        epoch_s=1000.0,
+        timing_mode="fixed",
+        clock=None,
+    ):
+        if timing_mode not in ("native", "fixed"):
+            raise ValueError("Timing mode must be native or fixed")
+        if timing_mode == "native" and latencies is not None:
+            raise ValueError("Native timing rejects fixed stage latencies")
+        if timing_mode == "fixed" and not isinstance(latencies, StageLatencies):
             raise TypeError("latencies must be StageLatencies")
         if (
             type(epoch_s) not in (float, int)
@@ -102,15 +131,42 @@ class StreamingController:
         ):
             raise ValueError("Fixed delay must be an integer in 1..5")
         self.rpc, self.latencies = rpc, latencies
+        self.timing_mode = timing_mode
+        self.clock = time.monotonic if clock is None else clock
         self.fixed_delay, self.epoch_s = fixed_delay, float(epoch_s)
-        initial, self.over_training_budget = latency_budget(
-            latencies.s1_s + 0.005, self.period_s
+        initial, self.over_training_budget = (
+            (1, False)
+            if timing_mode == "native"
+            else latency_budget(latencies.s1_s + 0.005, self.period_s)
         )
         self.initial_delay = fixed_delay if fixed_delay is not None else initial
         self.logical_time_s = self.epoch_s
         self._receipt = None
         self._ran = False
         self._generation = 0
+
+    def _call(self, method, *args, **kwargs):
+        if self.timing_mode == "fixed":
+            return method(*args, **kwargs), None
+        started = self.clock()
+        result = method(*args, **kwargs)
+        completed = self.clock()
+        if (
+            any(
+                type(value) not in (int, float) or not math.isfinite(value)
+                for value in (started, completed)
+            )
+            or completed < started
+            or not math.isfinite(completed - started)
+        ):
+            raise ValueError("Measured monotonic times must be finite and ordered")
+        return result, {
+            "clock": "host_monotonic",
+            "started_s": started,
+            "completed_s": completed,
+            "duration_s": completed - started,
+            "boundary": "full_adapter_call",
+        }
 
     def bootstrap(self, raw_observation, language, *, seed=1000):
         # A bootstrap RPC can change server state even if its response/audit
@@ -119,16 +175,24 @@ class StreamingController:
         self._ran = True
         self._generation += 1
         self.logical_time_s = self.epoch_s
-        receipt = self.rpc.bootstrap(
+        receipt, service_wall = self._call(
+            self.rpc.bootstrap,
             raw_observation,
             language,
             capture_s=self.epoch_s,
             delay_ticks=self.initial_delay,
             seed=seed,
         )
+        duration = (
+            service_wall["duration_s"]
+            if service_wall is not None
+            else self.latencies.bootstrap_s
+        )
+        if service_wall is not None:
+            receipt["service_wall"] = service_wall
         receipt.update(
-            logical_duration_s=self.latencies.bootstrap_s,
-            logical_completed_s=self.epoch_s + self.latencies.bootstrap_s,
+            logical_duration_s=duration,
+            logical_completed_s=self.epoch_s + duration,
             timing_domain="logical_simulation",
             startup_policy="paid_moving_world_hold",
             generation=self._generation,
@@ -173,7 +237,8 @@ class StreamingController:
         if self.s2 is not None or self.mailbox.pending is None:
             return
         frame = self.mailbox.take()
-        result = self.rpc.vision(
+        result, service_wall = self._call(
+            self.rpc.vision,
             frame.observation,
             self.language,
             capture_s=frame.capture_s,
@@ -184,7 +249,8 @@ class StreamingController:
         request = self._new_request(
             "s2",
             result,
-            self.latencies.s2_s,
+            self.latencies.s2_s if service_wall is None else service_wall["duration_s"],
+            **({} if service_wall is None else {"service_wall": service_wall}),
             source_tick=frame.tick,
             capture_s=frame.capture_s,
             feature_sequence=result["sequence"],
@@ -198,7 +264,8 @@ class StreamingController:
         prefix = self.timeline.reserve(tick, d)
         feature = self.mailbox.latest
         age = frame.capture_s - feature["meta"]["capture_s"]
-        result = self.rpc.plan(
+        result, service_wall = self._call(
+            self.rpc.plan,
             frame.observation,
             self.language,
             request_tick=tick,
@@ -208,11 +275,18 @@ class StreamingController:
             feature=feature,
         )
         recovered = result["audit"]["buffer_restarted"]
-        duration = self.latencies.recovery_s if recovered else self.latencies.s1_s
+        duration = (
+            service_wall["duration_s"]
+            if service_wall is not None
+            else self.latencies.recovery_s
+            if recovered
+            else self.latencies.s1_s
+        )
         request = self._new_request(
             "s1",
             result,
             duration,
+            **({} if service_wall is None else {"service_wall": service_wall}),
             request_tick=tick,
             delay_ticks=d,
             state_capture_s=frame.capture_s,
@@ -319,7 +393,8 @@ class StreamingController:
             raise RuntimeError("Run requires a fresh bootstrap receipt")
         if type(max_steps) is not int or max_steps < 1:
             raise ValueError("max_steps counts positive actual physical actions")
-        expected = self.epoch_s + self.latencies.bootstrap_s
+        startup_seconds = self._receipt["logical_duration_s"]
+        expected = self._receipt["logical_completed_s"]
         if not math.isclose(initial_capture_s, expected, rel_tol=0, abs_tol=1e-10):
             raise ValueError(
                 "Post-startup state capture must follow the paid startup hold"
@@ -360,7 +435,7 @@ class StreamingController:
             "control_started",
             startup_capture_s=bootstrap["capture_s"],
             state_capture_s=initial_capture_s,
-            startup_seconds=self.latencies.bootstrap_s,
+            startup_seconds=startup_seconds,
             action_buffer=self.timeline.snapshot(),
         )
         for tick in range(max_steps):
@@ -456,15 +531,14 @@ class StreamingController:
         steady = len(self.actions) * self.period_s
         return {
             "schema": "pir2.libero_dynamic.streaming.v1",
-            "timing_domain": "counterfactual_discrete_event",
+            **timing_metadata(self.timing_mode, self.latencies),
             "resource_model": "independent_stage_service",
             "compute_coupling": "serialized_gpu_simulation",
-            "latency_provenance": "fixed_counterfactual",
             "logical_epoch_s": self.epoch_s,
             "control_origin_s": self.control_origin_s,
-            "startup_seconds": self.latencies.bootstrap_s,
+            "startup_seconds": startup_seconds,
             "steady_seconds": steady,
-            "physical_seconds": self.latencies.bootstrap_s + steady,
+            "physical_seconds": startup_seconds + steady,
             "action_steps": len(self.actions),
             "success": success,
             "terminated": terminated,
@@ -475,7 +549,9 @@ class StreamingController:
             "inflight_at_end": inflight,
             "final_buffer": self.timeline.snapshot(),
             "config": {
-                "stage_latencies": asdict(self.latencies),
+                "stage_latencies": None
+                if self.latencies is None
+                else asdict(self.latencies),
                 "period_s": self.period_s,
                 "fixed_delay": self.fixed_delay,
                 "initial_delay_ticks": self.initial_delay,

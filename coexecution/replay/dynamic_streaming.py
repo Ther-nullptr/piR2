@@ -9,6 +9,29 @@ def _equal(left, right, label):
         raise ValueError(f"Streaming {label} disagrees with recorded evidence")
 
 
+def _service_duration(record, expected):
+    service = record.get("service_wall") or {}
+    if (
+        service.get("clock") != "host_monotonic"
+        or service.get("boundary") != "full_adapter_call"
+    ):
+        raise ValueError(
+            "Native streaming needs full adapter monotonic service evidence"
+        )
+    start, end = _number(service.get("started_s")), _number(service.get("completed_s"))
+    interval(start, end)
+    duration = _number(service.get("duration_s"))
+    _equal(end - start, duration, "native service interval")
+    _equal(duration, expected, "native logical duration")
+    rpc = record.get("wall", record)
+    rpc_start, rpc_end = rpc.get("wall_started_s"), rpc.get("wall_completed_s")
+    if rpc_start is not None and (
+        _number(rpc_start) < start - 1e-6 or _number(rpc_end) > end + 1e-6
+    ):
+        raise ValueError("Native adapter service must enclose its own RPC interval")
+    return duration
+
+
 def _wall(record, lane):
     rpc = _stage(record, "RPC", "wall_started_s", "wall_completed_s")
     server = record.get("server_audit", {})
@@ -32,10 +55,24 @@ def _wall(record, lane):
         "duration_ms": duration * 1000 if duration is not None else None,
         "timing_scope": "server reported interval; not isolated GPU kernel time",
     }
-    return [rpc, stage]
+    service = record.get("service_wall")
+    full = (
+        []
+        if not service
+        else [
+            {
+                "name": "Full adapter call",
+                "wall_started_s": service["started_s"],
+                "wall_completed_s": service["completed_s"],
+                "duration_ms": service["duration_s"] * 1000,
+                "timing_scope": "measured full adapter call; contains RPC, not additive",
+            }
+        ]
+    )
+    return [rpc, *full, stage]
 
 
-def _requests(stream, episode_id, epoch, latencies):
+def _requests(stream, episode_id, epoch, latencies, *, native=False):
     records, by_tick, features = [], {}, {}
     bootstrap = stream.get("bootstrap")
     if bootstrap:
@@ -43,7 +80,10 @@ def _requests(stream, episode_id, epoch, latencies):
         end = _number(bootstrap["logical_completed_s"]) - epoch
         interval(start, end)
         _equal(end - start, bootstrap.get("logical_duration_s"), "bootstrap duration")
-        _equal(end - start, latencies.get("bootstrap_s"), "bootstrap latency label")
+        if native:
+            _service_duration(bootstrap, end - start)
+        else:
+            _equal(end - start, latencies.get("bootstrap_s"), "bootstrap latency label")
         record = {
             **bootstrap,
             **bootstrap.get("wall", {}),
@@ -58,6 +98,9 @@ def _requests(stream, episode_id, epoch, latencies):
         }
         record["wall_stages"] = _wall(record, "bootstrap")
         record["rpc_duration_ms"] = record["wall_stages"][0]["duration_ms"]
+        record["service_duration_ms"] = (
+            bootstrap["service_wall"]["duration_s"] * 1000 if native else None
+        )
         records.append(record)
         features[0] = record
     seen = set()
@@ -77,7 +120,10 @@ def _requests(stream, episode_id, epoch, latencies):
             if raw.get("normal_or_recovery") == "recovery5"
             else "s1_s"
         )
-        _equal(end - start, latencies.get(latency_key), "stage latency label")
+        if native:
+            _service_duration(raw, end - start)
+        else:
+            _equal(end - start, latencies.get(latency_key), "stage latency label")
         if start < 0:
             raise ValueError("Streaming request starts before logical epoch")
         record = {
@@ -91,6 +137,9 @@ def _requests(stream, episode_id, epoch, latencies):
             "wall_stages": _wall(raw, lane),
         }
         record["rpc_duration_ms"] = record["wall_stages"][0]["duration_ms"]
+        record["service_duration_ms"] = (
+            raw["service_wall"]["duration_s"] * 1000 if native else None
+        )
         if lane == "s2":
             sequence = raw.get("feature_sequence")
             if type(sequence) is not int or sequence <= 0 or sequence in features:
@@ -584,6 +633,22 @@ def streaming_episode(root, manifest, config, media, run_id):
     # retained at audit top level even if the steady-state controller failed.
     if not stream.get("bootstrap") and audit.get("bootstrap"):
         stream["bootstrap"] = audit["bootstrap"]
+    mode = manifest.get("timing_mode", "fixed")
+    native = mode == "native"
+    if mode not in ("native", "fixed") or stream.get("timing_mode", mode) != mode:
+        raise ValueError("Streaming timing mode disagrees with its audit")
+    if native:
+        for evidence in (manifest, stream):
+            if evidence and (
+                evidence.get("latency_provenance") != "measured_per_request"
+                or evidence.get("timing_domain") != "measured_request_discrete_event"
+            ):
+                raise ValueError("Native streaming timing provenance is inconsistent")
+        if any(
+            evidence.get("stage_latencies") is not None
+            for evidence in (manifest, stream, stream.get("config", {}), audit)
+        ):
+            raise ValueError("Native streaming cannot declare fixed stage latencies")
     epoch = (
         _number(manifest["logical_epoch_s"])
         if manifest.get("logical_epoch_s") is not None
@@ -601,13 +666,22 @@ def streaming_episode(root, manifest, config, media, run_id):
     else:
         if stream.get("logical_epoch_s") is not None:
             _equal(epoch, stream["logical_epoch_s"], "logical epoch")
-        latencies = manifest.get("stage_latencies", {})
-        _equal(
-            manifest.get("control_origin_s"),
-            epoch + _number(latencies.get("bootstrap_s")),
-            "control origin",
+        latencies = manifest.get("stage_latencies") or {}
+        bootstrap = stream.get("bootstrap")
+        if bootstrap or not native:
+            startup = (
+                _number(bootstrap.get("logical_duration_s"))
+                if native
+                else _number(latencies.get("bootstrap_s"))
+            )
+            _equal(manifest.get("control_origin_s"), epoch + startup, "control origin")
+            if native:
+                _equal(manifest.get("startup_seconds"), startup, "native startup")
+        elif complete or stream.get("requests") or stream.get("actions"):
+            raise ValueError("Native streaming requires a completed bootstrap")
+        records, by_tick = _requests(
+            stream, episode_id, epoch, latencies, native=native
         )
-        records, by_tick = _requests(stream, episode_id, epoch, latencies)
         events = _events(
             stream,
             audit.get("motion_events", []),
@@ -649,7 +723,7 @@ def streaming_episode(root, manifest, config, media, run_id):
         "decoded_horizon": identity.get("decoded_horizon"),
         "policy_identity": identity,
         "calibration": {
-            "kind": "counterfactual",
+            "kind": "measured_per_request" if native else "counterfactual",
             "protocol": "independent_stage_service",
             "retained_requests": 0,
             "warmup_requests": 0,

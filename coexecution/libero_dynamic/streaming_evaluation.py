@@ -1,8 +1,8 @@
 """Existing πR² policies in the same pinned moving-object physical scenes.
 
 The physical loop owns rendering, task success and one paid startup hold. The
-core owns the two logical service lanes. RPCs remain real CUDA service calls;
-the four fixed logical latencies are counterfactual algorithm controls.
+core owns two logical service lanes. Native timing uses each full adapter call's
+measured duration; fixed timing exposes explicit counterfactual controls.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import os
 import time
 import traceback
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +30,7 @@ from .evaluation import (
     prepare_conditions,
 )
 from .physical import make_physical_episode_type
-from .streaming import StageLatencies, StepResult, StreamingController
+from .streaming import StageLatencies, StepResult, StreamingController, timing_metadata
 from .streaming_rpc import Pir2RPC
 
 
@@ -40,23 +39,37 @@ def add_streaming_arguments(parser):
     add_model_arguments(parser)
     parser.add_argument("--action-port", type=int, required=True)
     parser.add_argument("--vision-port", type=int, required=True)
+    parser.add_argument(
+        "--timing-mode",
+        choices=("native", "fixed"),
+        default="native",
+        help="Native uses each measured full adapter call; fixed requires all four stage durations",
+    )
     for stage in ("bootstrap", "s1", "s2", "recovery"):
         parser.add_argument(
             f"--{stage}-latency-seconds",
             type=float,
-            required=True,
             help=f"Fixed counterfactual {stage} service duration in seconds",
         )
     parser.add_argument("--fixed-delay", type=int, choices=range(1, 6))
 
 
 def stage_latencies(options):
-    return StageLatencies(
-        **{
-            stage + "_s": getattr(options, stage + "_latency_seconds")
-            for stage in ("bootstrap", "s1", "s2", "recovery")
-        }
-    )
+    # Old programmatic configurations retain fixed semantics. CLI defaults native.
+    mode = getattr(options, "timing_mode", "fixed")
+    values = {
+        stage + "_s": getattr(options, stage + "_latency_seconds", None)
+        for stage in ("bootstrap", "s1", "s2", "recovery")
+    }
+    if mode == "native":
+        if any(value is not None for value in values.values()):
+            raise ValueError("Native timing rejects fixed stage latency arguments")
+        return None
+    if mode != "fixed":
+        raise ValueError("Timing mode must be native or fixed")
+    if any(value is None for value in values.values()):
+        raise ValueError("Fixed timing requires all four stage latency arguments")
+    return StageLatencies(**values)
 
 
 def validate_options(options):
@@ -223,6 +236,7 @@ def _partial_streaming(controller):
     timeline = getattr(controller, "timeline", None)
     return {
         "status": "incomplete",
+        **timing_metadata(controller.timing_mode, controller.latencies),
         "logical_time_s": controller.logical_time_s,
         "requests": copy.deepcopy(getattr(controller, "requests", [])),
         "actions": copy.deepcopy(getattr(controller, "actions", [])),
@@ -237,6 +251,8 @@ def make_streaming_episode_type(source, options):
         source, options, callback_convention="physical_origin"
     )
     latencies = stage_latencies(options)
+    mode = getattr(options, "timing_mode", "fixed")
+    timing = timing_metadata(mode, latencies)
 
     class StreamingEpisode(physical_type):
         def __init__(self, item, args, *, rpc):
@@ -258,6 +274,7 @@ def make_streaming_episode_type(source, options):
             scored_record_start = None
             start_physics = end_physics = None
             rollout = 0.0
+            startup_seconds = None
             started = time.monotonic()
             try:
                 self._configure_env_selection()
@@ -298,7 +315,10 @@ def make_streaming_episode_type(source, options):
                 }
                 identities = self.rpc.prepare()
                 controller = StreamingController(
-                    self.rpc, latencies=latencies, fixed_delay=options.fixed_delay
+                    self.rpc,
+                    latencies=latencies,
+                    fixed_delay=options.fixed_delay,
+                    timing_mode=mode,
                 )
                 warmup_streaming(
                     self.rpc,
@@ -325,11 +345,12 @@ def make_streaming_episode_type(source, options):
                 bootstrap = controller.bootstrap(
                     observation, language, seed=options.seed
                 )
+                startup_seconds = bootstrap["logical_duration_s"]
                 self.hold_phase = "bootstrap_hold"
-                self._apply_sync_latency(self.env, latencies.bootstrap_s)
+                self._apply_sync_latency(self.env, startup_seconds)
                 if not math.isclose(
                     float(self.env.sim.data.time) - start_physics,
-                    latencies.bootstrap_s,
+                    startup_seconds,
                     rel_tol=0,
                     abs_tol=1e-8,
                 ):
@@ -339,7 +360,7 @@ def make_streaming_episode_type(source, options):
                 fresh = self.env.env._get_observations(force_update=True)
                 self._motion_event(
                     "post_bootstrap_observation",
-                    logical_capture_s=controller.epoch_s + latencies.bootstrap_s,
+                    logical_capture_s=bootstrap["logical_completed_s"],
                     observation_sha256=observation_fingerprint(fresh, language),
                 )
 
@@ -386,7 +407,7 @@ def make_streaming_episode_type(source, options):
                 result = controller.run(
                     bootstrap,
                     initial_observation=fresh,
-                    initial_capture_s=controller.epoch_s + latencies.bootstrap_s,
+                    initial_capture_s=bootstrap["logical_completed_s"],
                     language=language,
                     step_fn=step,
                     max_steps=options.max_steps,
@@ -448,6 +469,7 @@ def make_streaming_episode_type(source, options):
                 error_text = "; ".join([error_text or "", *cleanup_errors]).lstrip("; ")
             evidence = {
                 "schema": "pir2.libero_dynamic.streaming_audit.v1",
+                **timing,
                 "item_id": self.item["item_id"],
                 "identities": identities,
                 "diagnostics": diagnostic_summary,
@@ -512,14 +534,14 @@ def make_streaming_episode_type(source, options):
                 "language": language,
                 "precision": options.precision,
                 "speed_mps": options.speed_mps,
-                "timing_domain": "counterfactual_discrete_event",
+                **timing,
                 "resource_model": "independent_stage_service",
                 "compute_coupling": "serialized_gpu_simulation",
-                "latency_provenance": "fixed_counterfactual",
-                "stage_latencies": asdict(latencies),
                 "fixed_delay": options.fixed_delay,
-                "startup_seconds": latencies.bootstrap_s,
-                "startup_seconds_applied": min(rollout, latencies.bootstrap_s),
+                "startup_seconds": startup_seconds,
+                "startup_seconds_applied": 0.0
+                if startup_seconds is None
+                else min(rollout, startup_seconds),
                 "rollout_sim_time_s": rollout,
                 "physical_started_s": start_physics,
                 "physical_completed_s": end_physics,
@@ -527,8 +549,8 @@ def make_streaming_episode_type(source, options):
                 "warmup_rounds": options.warmup_requests,
                 "logical_epoch_s": None if controller is None else controller.epoch_s,
                 "control_origin_s": None
-                if controller is None
-                else controller.epoch_s + latencies.bootstrap_s,
+                if bootstrap is None
+                else bootstrap["logical_completed_s"],
                 "video_frame_count": min(videos.frame_counts),
                 "video_sample_attempts": len(self.video_samples),
                 "video_frame_counts": dict(
@@ -564,6 +586,9 @@ def make_streaming_episode_type(source, options):
 
 def evaluate_streaming(options):
     validate_options(options)
+    timing = timing_metadata(
+        getattr(options, "timing_mode", "fixed"), stage_latencies(options)
+    )
     inventory, conditions = prepare_conditions(options)
     options.output.mkdir(parents=True, exist_ok=False)
     evaluation = {
@@ -574,7 +599,7 @@ def evaluate_streaming(options):
         "conditions": conditions,
         "protocol": "pir2_dynamic",
         "phase_contract": inventory["phase_contract"],
-        "latency_provenance": "fixed_counterfactual",
+        **timing,
         "resource_model": "independent_stage_service",
         "startup_policy": "paid_moving_world_hold",
         "action_budget_contract": "max_steps counts actual 50ms actions; startup hold adds physics once",
@@ -657,8 +682,7 @@ def evaluate_streaming(options):
                         "conditions_planned": len(items),
                         "conditions_completed": len(results),
                         "successes": sum(row["success"] for row in results),
-                        "latency_provenance": "fixed_counterfactual",
-                        "stage_latencies": asdict(stage_latencies(options)),
+                        **timing,
                     },
                 )
                 if interrupted is not None:
@@ -688,6 +712,7 @@ def evaluate_streaming(options):
             {
                 "schema": "pir2.libero_dynamic.streaming_summary.v1",
                 "status": "failed",
+                **timing,
                 "protocol": "pir2_dynamic",
                 "conditions_completed": len(results),
                 "successes": sum(row["success"] for row in results),

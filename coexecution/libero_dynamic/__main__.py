@@ -31,9 +31,9 @@ def main(argv=None):
         "evaluate-pir2",
         help="Run existing πR² policies in real moving worlds",
         description=(
-            "Evaluate moving-world πR² with fixed counterfactual latencies and "
-            "independent logical S1/S2 lanes. All real RPCs execute serially; "
-            "this is not measured same-GPU concurrent deployment."
+            "Evaluate moving-world πR² with native per-request latency by default; "
+            "fixed counterfactual timing is an explicit control. "
+            "Real GPU/physics work is serial, with independent logical service lanes."
         ),
     )
     from .streaming_evaluation import add_streaming_arguments
