@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .catalog import LEVELS, SPEEDS_MPS, SUITES, build_inventory
-from .world import NativeFixtureTiming, observation_registry, observe_objects
+from .physical import make_physical_episode_type
 
 TIMING_RULES = ("release_continuous_sync", "paper_quantized_sync")
 OBSERVATION_KEYS = (
@@ -489,7 +489,8 @@ def attach_capture(snapshot, packet, *, capture_s):
     }
 
 
-def add_evaluate_arguments(parser):
+def add_scene_arguments(parser):
+    """Shared physical condition, budget and recording arguments."""
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--suite", choices=SUITES, required=True)
@@ -497,28 +498,36 @@ def add_evaluate_arguments(parser):
     parser.add_argument("--levels", nargs="+", choices=LEVELS, default=list(LEVELS))
     parser.add_argument("--traj-indices", nargs="+", type=int, default=list(range(5)))
     parser.add_argument("--speed-mps", type=float, choices=SPEEDS_MPS, required=True)
-    parser.add_argument("--model-host", default="127.0.0.1")
-    parser.add_argument("--model-port", type=int, required=True)
-    parser.add_argument("--expected-checkpoint", type=Path, required=True)
-    parser.add_argument("--precision", choices=("bf16", "w8a8"), required=True)
-    parser.add_argument("--chunk-steps", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init-state-id", type=int, default=0)
-    parser.add_argument("--timing-rule", choices=TIMING_RULES, default=TIMING_RULES[0])
-    latency = parser.add_mutually_exclusive_group(required=True)
-    latency.add_argument("--calibrate", action="store_true")
-    latency.add_argument("--calibration", type=Path)
-    latency.add_argument("--latency-seconds", type=float)
-    parser.add_argument("--warmup-requests", type=int, default=8)
-    parser.add_argument("--calibration-requests", type=int, default=88)
-    parser.add_argument("--calibration-max-p95-ratio", type=float, default=2)
-    parser.add_argument("--rpc-timeout-seconds", type=int, default=900)
     parser.add_argument("--camera-size", type=int, default=256)
     parser.add_argument("--video-fps", type=float, default=60)
     parser.add_argument(
         "--save-videos", action=argparse.BooleanOptionalAction, default=True
     )
+
+
+def add_model_arguments(parser):
+    parser.add_argument("--model-host", default="127.0.0.1")
+    parser.add_argument("--expected-checkpoint", type=Path, required=True)
+    parser.add_argument("--precision", choices=("bf16", "w8a8"), required=True)
+    parser.add_argument("--rpc-timeout-seconds", type=int, default=900)
+    parser.add_argument("--warmup-requests", type=int, default=8)
+
+
+def add_evaluate_arguments(parser):
+    add_scene_arguments(parser)
+    add_model_arguments(parser)
+    parser.add_argument("--model-port", type=int, required=True)
+    parser.add_argument("--chunk-steps", type=int, default=8)
+    parser.add_argument("--timing-rule", choices=TIMING_RULES, default=TIMING_RULES[0])
+    latency = parser.add_mutually_exclusive_group(required=True)
+    latency.add_argument("--calibrate", action="store_true")
+    latency.add_argument("--calibration", type=Path)
+    latency.add_argument("--latency-seconds", type=float)
+    parser.add_argument("--calibration-requests", type=int, default=88)
+    parser.add_argument("--calibration-max-p95-ratio", type=float, default=2)
 
 
 def _validate_options(args):
@@ -638,154 +647,19 @@ def _effective_items(source, args, options, conditions):
 
 def make_episode_type(source, options, session):
     """Extend setup/evidence hooks while retaining upstream physical control."""
-    runtime = source.runtime
+    physical_episode = make_physical_episode_type(source, options)
 
-    class GrootEpisode(runtime.RealtimeEpisode):
+    class GrootEpisode(physical_episode):
         def __init__(self, item, args, *, policy):
             # One process, one episode: source seed + worker_slot remains seed 0.
-            super().__init__(item, args, worker_slot=0)
+            super().__init__(item, args)
             self.policy = policy
             self.controller = None
-            self.env = None
-            self.initial_observation = None
-            self.last_capture_s = None
-            self.control_started = False
-            self.rollout_sim_time_s = 0.0
-            self.motion_events = []
             self.chunk_events = []
             self.cleanup_errors = []
             self.calibration_scope = None
             self.applied_latency_s = None
             self.closed = False
-            self.action_step = 0
-            self.active_chunk_id = None
-            self.video_samples = []
-            self.next_video_sample_s = 1.0 / options.video_fps
-            self.fixture_timing = None
-            self.latency_backend = (
-                "source_preview_exact_hold" if self.use_preview else None
-            )
-            self.observed_objects = []
-            self._source_action_callback_offset_s = 0.0
-
-        def _motion_phase_s(self):
-            if self.fixture_timing is not None:
-                return float(self.env.dynamic_fixture_body_state["elapsed"])
-            return float(self.preview_elapsed)
-
-        def _motion_event(self, kind, **fields):
-            if self.env is None:
-                return
-            poses = observe_objects(
-                self.env, self.observed_objects, runtime._object_pose
-            )
-            self.motion_events.append(
-                {
-                    "kind": kind,
-                    "wall_s": time.monotonic(),
-                    "rollout_sim_time_s": self.rollout_sim_time_s,
-                    "motion_phase_s": self._motion_phase_s(),
-                    "physics_sim_time_s": float(self.env.sim.data.time),
-                    "target_object_poses": poses,
-                    "action_step": self.action_step,
-                    "active_chunk_id": self.active_chunk_id,
-                    **fields,
-                }
-            )
-
-        def _setup_world(self, env, init_state):
-            self.env = env
-            result = super()._setup_world(env, init_state)
-            if result[3] != 40:
-                raise ValueError("Require 40 actual source pre-policy control steps")
-            if not self.use_preview:
-                # Preserve source-native fixture initialization and env.step.
-                # Its pending-latency path is extracted below, never forced into
-                # the carrier-only preview setup.
-                self.fixture_timing = NativeFixtureTiming(env)
-                self.latency_backend = self.fixture_timing.backend
-            self.observed_objects = observation_registry(
-                self.item, env, runtime._target_entries(self.item, env)
-            )
-            self.initial_observation = result[0]
-            # _step_env timestamps the actual returned observation. The fallback
-            # is only for an alternative source setup returning its own capture.
-            if self.last_capture_s is None:
-                self.last_capture_s = time.monotonic()
-            self._motion_event("initial_observation", capture_s=self.last_capture_s)
-            return result
-
-        def _step_env(self, env, action, **kwargs):
-            started = time.monotonic()
-            physics_started = float(env.sim.data.time)
-            if self.control_started:
-                callback = kwargs.get("on_substep")
-                offset = self._source_action_callback_offset_s
-                self._source_action_callback_offset_s = 0.0
-                if callback is not None and offset:
-                    # Native run() expects hold physics inside this action and
-                    # subtracts tau from its video base. Hold has already run,
-                    # so correct only its callback, not our physical frame map.
-                    kwargs = {**kwargs, "on_substep": lambda dt: callback(dt + offset)}
-                kwargs = self._recording_kwargs(kwargs, "action")
-            result = super()._step_env(env, action, **kwargs)
-            self.last_capture_s = time.monotonic()
-            if self.control_started:
-                advanced = float(env.sim.data.time) - physics_started
-                if not math.isclose(advanced, self.preview_dt, rel_tol=0, abs_tol=1e-8):
-                    raise RuntimeError(
-                        "Action physics duration differs from one control step"
-                    )
-                self.rollout_sim_time_s += advanced
-                self._motion_event(
-                    "action_completed",
-                    physics_elapsed_s=advanced,
-                    action=np.asarray(action).copy(),
-                    wall_started_s=started,
-                    capture_s=self.last_capture_s,
-                )
-                self.action_step += 1
-            return result
-
-        def _apply_sync_latency(self, env, duration, **kwargs):
-            self._motion_event("hold_started", applied_latency_s=float(duration))
-            recording = self._recording_kwargs(kwargs, "inference_hold")
-            if self.fixture_timing is not None:
-                advanced = self.fixture_timing.advance(duration, **recording)
-                self._source_action_callback_offset_s += float(advanced)
-            else:
-                advanced = super()._apply_sync_latency(env, duration, **recording)
-            self.rollout_sim_time_s += float(advanced)
-            self._motion_event("hold_completed", applied_latency_s=float(advanced))
-            return advanced
-
-        def _recording_kwargs(self, kwargs, phase):
-            callback = kwargs.get("on_substep")
-            if callback is None or not options.save_videos:
-                return kwargs
-            base_sim_time_s = self.rollout_sim_time_s
-
-            def record(advanced_s):
-                absolute_sim_time_s = base_sim_time_s + float(advanced_s)
-                callback(advanced_s)
-                # Source callback samples at this threshold after a real physics
-                # substep. Verify the sample count against its final manifest.
-                if absolute_sim_time_s + 1e-9 >= self.next_video_sample_s:
-                    self.video_samples.append(
-                        {
-                            "frame_index": len(self.video_samples),
-                            "media_time_s": len(self.video_samples) / options.video_fps,
-                            "nominal_sim_time_s": self.next_video_sample_s,
-                            "sample_sim_time_s": absolute_sim_time_s,
-                            "wall_completed_s": time.monotonic(),
-                            "phase": phase,
-                            "action_step": self.action_step,
-                            "active_chunk_id": self.active_chunk_id,
-                        }
-                    )
-                    self.next_video_sample_s += 1.0 / options.video_fps
-
-            return {**kwargs, "on_substep": record}
 
         def _call(self, controller, function):
             return controller.executor.submit(function).result(
@@ -1091,11 +965,8 @@ def make_episode_type(source, options, session):
     return GrootEpisode
 
 
-def evaluate_default(options):
-    """Evaluate a declared moving condition set with one existing Flow4 worker."""
-    from .policy import GrootChunkPolicy
-
-    _validate_options(options)
+def prepare_conditions(options):
+    """Verify clean pinned source and resolve shared physical condition coverage."""
     options.upstream = options.upstream.expanduser().resolve()
     options.output = options.output.expanduser().resolve()
     options.expected_checkpoint = options.expected_checkpoint.expanduser().resolve()
@@ -1128,6 +999,15 @@ def evaluate_default(options):
         traj_indices=options.traj_indices,
         speed_mps=options.speed_mps,
     )
+    return inventory, conditions
+
+
+def evaluate_default(options):
+    """Evaluate a declared moving condition set with one existing Flow4 worker."""
+    from .policy import GrootChunkPolicy
+
+    _validate_options(options)
+    inventory, conditions = prepare_conditions(options)
     if options.calibration is not None:
         calibration = json.loads(options.calibration.read_text())
         if (

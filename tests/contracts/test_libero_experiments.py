@@ -621,12 +621,19 @@ def test_invalid_selected_tasks_rejected(plan, ids):
         module().validate_plan(plan)
 
 
-def test_subset_deployment_report_reads_actual_trace_and_reports_selected_scope(
-    plan, tmp_path
+@pytest.mark.parametrize(
+    "selected", [None, "libero_spatial", "libero_object", "libero_goal", "libero_10"]
+)
+@pytest.mark.parametrize("full_suite", [False, True], ids=["subset", "full"])
+def test_deployment_report_reads_actual_trace_and_reports_suite_scope(
+    plan, tmp_path, selected, full_suite
 ):
     import json
 
-    plan.update(task_ids=[0], conditions=plan["conditions"][:1])
+    tasks = list(range(10)) if full_suite else [0]
+    plan.update(task_ids=tasks, conditions=plan["conditions"][:1])
+    if selected is not None:
+        plan["suite"] = selected
     directory = tmp_path / plan["conditions"][0]["name"] / "deployment"
     directory.mkdir(parents=True)
     metadata = {
@@ -636,7 +643,9 @@ def test_subset_deployment_report_reads_actual_trace_and_reports_selected_scope(
         "success": True,
         "control_rate_valid": True,
     }
-    (directory / "episodes.jsonl").write_text(json.dumps(metadata) + "\n")
+    (directory / "episodes.jsonl").write_text(
+        "\n".join(json.dumps({**metadata, "task_id": task}) for task in tasks) + "\n"
+    )
     events = [
         {
             "kind": "control_start",
@@ -656,13 +665,28 @@ def test_subset_deployment_report_reads_actual_trace_and_reports_selected_scope(
         },
         {"kind": "control_end", "t_s": 10.05, "control_steps": 1},
     ]
-    (directory / "task0-episode0-trace.jsonl").write_text(
-        "\n".join(map(json.dumps, events))
-    )
+    for task in tasks:
+        (directory / f"task{task}-episode0-trace.jsonl").write_text(
+            "\n".join(map(json.dumps, events))
+        )
     report = module().deployment_report(plan, tmp_path)
-    assert report["task_ids"] == [0]
-    assert "subset" in report["scope"] and "Full Spatial" not in report["scope"]
-    assert len(report["conditions"][0]["episodes"]) == 1
+    expected_name = {
+        None: "Spatial",
+        "libero_spatial": "Spatial",
+        "libero_object": "Object",
+        "libero_goal": "Goal",
+        "libero_10": "Long",
+    }[selected]
+    expected_scope = (
+        f"Full {expected_name} suite" if full_suite else f"{expected_name} task subset"
+    )
+    assert (
+        report["scope"]
+        == expected_scope
+        + ", paired declared initial states; actual executed image/state ages"
+    )
+    assert report["task_ids"] == tasks
+    assert len(report["conditions"][0]["episodes"]) == len(tasks)
     assert (tmp_path / "feature-usage.json").is_file()
 
 
@@ -884,3 +908,232 @@ def test_responsive_plan_global_and_condition_identity(plan):
     plan["conditions"][0]["deployment_fixed_delay"] = 1
     with pytest.raises(ValueError, match="Responsive"):
         module().validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "suite", ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
+)
+def test_declared_suite_reaches_static_evaluator(plan, suite):
+    plan["suite"] = suite
+    m = module()
+    m.validate_plan(plan)
+    command = m.build_commands(plan, plan["conditions"][0], "deployment", Path("/out"))[
+        "evaluate"
+    ]
+    assert command[command.index("--suite") + 1] == suite
+
+
+def test_unknown_suite_rejected_before_launch(plan):
+    plan["suite"] = "libero_90"
+    with pytest.raises(ValueError, match="suite"):
+        module().validate_plan(plan)
+
+
+@pytest.mark.parametrize(
+    "selected", [None, "libero_spatial", "libero_object", "libero_goal", "libero_10"]
+)
+def test_static_main_uses_selected_benchmark_tasks_and_state_files(
+    tmp_path, monkeypatch, selected
+):
+    """Exercise the evaluator loop with distinct suite files; no neural computation."""
+    import hashlib
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from scripts import evaluate_libero_protocol as evaluator
+
+    expected_suite = selected or "libero_spatial"
+    suites = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+    opened = []
+    initialized = []
+    environments = []
+    for number, name in enumerate(suites):
+        directory = tmp_path / name
+        directory.mkdir()
+        for task_id in (1, 7):
+            np.save(
+                directory / f"task{task_id}.npy",
+                [[number, task_id, 0], [number, task_id, 1]],
+            )
+            (directory / f"task{task_id}.bddl").write_text(f"{name}:task{task_id}")
+
+    class Suite:
+        def __init__(self, name):
+            self.name = name
+            opened.append(("suite", name))
+
+        def get_task(self, task_id):
+            return SimpleNamespace(
+                name=f"{self.name}:task{task_id}",
+                language=f"{self.name} language {task_id}",
+                problem_folder=self.name,
+                bddl_file=f"task{task_id}.bddl",
+            )
+
+        def get_task_init_states(self, task_id):
+            path = tmp_path / self.name / f"task{task_id}.npy"
+            opened.append(("states", path))
+            return np.load(path)
+
+    class Environment:
+        def __init__(self, bddl, language):
+            self.bddl = Path(bddl)
+            self.language = language
+            self._env = self
+            self.settle_actions = []
+            self.closed = False
+            environments.append(self)
+
+        def seed(self, value):
+            self.seed_value = value
+
+        def reset(self):
+            return None
+
+        def set_init_state(self, state):
+            initialized.append((self.bddl, self.seed_value, state.copy()))
+            self.state = state.copy()
+            return {"state": self.state}
+
+        def step(self, action):
+            self.settle_actions.append(action)
+            return {"state": self.state}, 0, False, {}
+
+        def _process_observation(self, raw):
+            return raw
+
+        def initial_fingerprints(self, observation):
+            return {"fixture_model_sha256": self.bddl.read_text()}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setitem(sys.modules, "libero", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "libero.libero",
+        SimpleNamespace(
+            benchmark=SimpleNamespace(
+                get_benchmark_dict=lambda: {
+                    name: lambda name=name: Suite(name) for name in suites
+                }
+            ),
+            get_libero_path=lambda name: str(tmp_path),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "libero_reproducible_env", SimpleNamespace(LiberoEnv=Environment)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "libero_observations",
+        SimpleNamespace(write_video=lambda *_: pytest.fail("unexpected video")),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "wait_server",
+        lambda port: SimpleNamespace(
+            call_endpoint=lambda *args, **kwargs: {"variant": "flow"}
+        ),
+    )
+    monkeypatch.setattr(
+        evaluator, "algorithm_episode", lambda env, obs, *args: ({"success": True}, [])
+    )
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(path):
+        # Pinned model sources are deliberately absent from public host-only CI.
+        if "upstream/learning/Isaac-GR00T/" in path.as_posix():
+            return b"host fixture for the pinned upstream source identity"
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    output = tmp_path / "output"
+    argv = [
+        "evaluate_libero_protocol.py",
+        "--protocol",
+        "algorithm",
+        "--variant",
+        "flow",
+        "--output",
+        str(output),
+        "--task-ids",
+        "1",
+        "7",
+        "--episodes-per-task",
+        "2",
+        "--no-video",
+    ]
+    if selected is not None:
+        argv += ["--suite", selected]
+    monkeypatch.setattr(sys, "argv", argv)
+    evaluator.main()
+
+    assert opened == [
+        ("suite", expected_suite),
+        ("states", tmp_path / expected_suite / "task1.npy"),
+        ("states", tmp_path / expected_suite / "task7.npy"),
+    ]
+    expected_states = [
+        np.array([suites.index(expected_suite), task_id, episode_id])
+        for task_id in (1, 7)
+        for episode_id in range(2)
+    ]
+    for (bddl, seed, state), expected in zip(initialized, expected_states, strict=True):
+        task_id, episode_id = expected[1:]
+        assert bddl == tmp_path / expected_suite / f"task{task_id}.bddl"
+        assert seed == 1000 + 1000 * task_id + episode_id
+        np.testing.assert_array_equal(state, expected)
+    assert all(env.closed and len(env.settle_actions) == 20 for env in environments)
+    assert all(
+        action == [0, 0, 0, 0, 0, 0, -1]
+        for env in environments
+        for action in env.settle_actions
+    )
+    assert [env.language for env in environments] == [
+        f"{expected_suite} language {task_id}" for task_id in (1, 7)
+    ]
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["config"]["suite"] == expected_suite
+    assert summary["config"]["initial_state_indices"] == [0, 1]
+    assert summary["complete"] and summary["episodes"] == 4
+    assert summary["evaluation_scope"] == "selected_task_subset"
+    records = [
+        json.loads(line)
+        for line in (output / "episodes.jsonl").read_text().splitlines()
+    ]
+    assert [record["initial_state_sha256"] for record in records] == [
+        hashlib.sha256(state.tobytes()).hexdigest() for state in expected_states
+    ]
+
+
+@pytest.mark.parametrize(
+    "suite,scope",
+    [
+        ("libero_spatial", "full_spatial_suite"),
+        ("libero_object", "full_object_suite"),
+        ("libero_goal", "full_goal_suite"),
+        ("libero_10", "full_long_suite"),
+    ],
+)
+def test_static_full_suite_summary_identifies_actual_suite(tmp_path, suite, scope):
+    import json
+
+    from scripts.evaluate_libero_protocol import save_summary
+
+    records = [
+        {"task_id": task, "episode_id": 0, "task": f"task{task}", "success": True}
+        for task in range(10)
+    ]
+    save_summary(
+        tmp_path,
+        records,
+        {"suite": suite, "episodes_per_task": 1, "protocol": "algorithm"},
+    )
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["evaluation_scope"] == scope
+    assert summary["expected_episodes"] == 10
+    assert summary["complete"] is True

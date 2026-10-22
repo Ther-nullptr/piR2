@@ -39,6 +39,15 @@ python scripts/serve_libero_protocol.py \
 
 该命令启动 action 服务。运行完整协议时，为独立 VLM 服务选择对应配置，或使用声明条件的实验 runner。每份策略由一个提交者串行调用；`--server-layout paired` 使用两份独立策略与流，并协调所有端点的冷 VLM/DiT capture，稳定执行可重叠。配对服务支持纯 DiT Graph，拒绝 whole-action Graph；特征租约与 placement 见[时序协议](../docs/timing-protocols.md)。
 
+原始静态 LIBERO 评测入口 `scripts/evaluate_libero_protocol.py` 接受
+`--suite libero_spatial|libero_object|libero_goal|libero_10`，默认仍为 Spatial。
+所选套件统一决定任务语言、BDDL 场景和初始状态文件；`--task-ids` 是该套件内的
+0–9，初始状态索引仍为 0 到 `--episodes-per-task - 1`。`coexecution.libero.experiments`
+计划可在顶层声明同名 `suite` 字段。启动模型服务时需选择该套件已有的任务权重；
+切换套件不改变动作转换、推理协议或 20 Hz 物理步长。汇总保留原始套件 ID，完整
+Long 套件（`libero_10`）的范围标记为 `full_long_suite`；只选部分任务则为
+`selected_task_subset`。入口支持四套件选择，各套件的真实模型闭环结果须单独验证。
+
 已有 eval-mode BF16 CUDA 策略可直接使用可恢复作用域：
 
 ```python
