@@ -3,6 +3,9 @@
 window.DynamicReplayView = (() => {
   const D = window.DynamicReplay,
     $ = (id) => document.getElementById(id);
+  const store = new window.DynamicReplayStore.Store({
+    fetch: (...args) => fetch(...args),
+  });
   const esc = (value) =>
     String(value ?? "").replace(
       /[&<>"']/g,
@@ -23,7 +26,7 @@ window.DynamicReplayView = (() => {
     ({ bf16: "#315b8a", w8a8: "#087b6d", w4a4: "#a45b08" })[precision] ??
     "#78669d";
   const state = {
-    runs: [],
+    index: [],
     rows: [],
     selection: {},
     comparisons: [],
@@ -53,7 +56,7 @@ window.DynamicReplayView = (() => {
           ? "任务未成功"
           : "结果未知";
   const conditionLabel = (e) =>
-    `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${D.motionLabel(e)} · seed ${e.seed ?? "—"}${e.seed_scope === "custom" ? "（自定义）" : ""}`;
+    `${D.initializationLabel(e)} · ${D.motionLabel(e)}`;
   const streaming = (e) => e.protocol === "pir2_dynamic";
   const timingLabel = D.timingLabel;
   const runLabel = ({ run, episode: e }) =>
@@ -111,19 +114,66 @@ window.DynamicReplayView = (() => {
     });
     render();
   }
-  function configure() {
+  async function configure() {
     state.playing = false;
     state.clock = 0;
     state.selected = null;
-    state.epoch++;
+    const epoch = ++state.epoch;
     state.panelKey = null;
-    state.rows = D.rows(
-      state.runs,
-      $("sample").value,
-      $("precision").value,
-      state.selection,
-      state.comparisons,
-    );
+    state.rows = [];
+    state.end = 1;
+    const grid = $("precision-cards");
+    for (const card of grid.querySelectorAll(".precision-card"))
+      window.ReplayMedia.dispose(card);
+    grid.innerHTML = '<p class="loading">正在加载所选运行的完整记录…</p>';
+    $("inspector").textContent = "";
+    $("error-banner").hidden = true;
+    $("data-status").textContent = "加载所选动态配置…";
+    $("data-status").dataset.state = "loading";
+    const controls = [
+      "play",
+      "seek",
+      "previous",
+      "next",
+      "inspect-run",
+      "download",
+    ];
+    for (const id of controls) $(id).disabled = true;
+    render();
+    let planned = [];
+    try {
+      planned = D.rows(
+        state.index,
+        $("sample").value,
+        $("precision").value,
+        state.selection,
+        state.comparisons,
+      );
+      renderCards(planned, false);
+      const rows = await store.select(planned);
+      if (epoch !== state.epoch || rows === null) return;
+      state.rows = rows;
+      renderCards();
+      for (const id of controls) $(id).disabled = !rows.length;
+      $("data-status").textContent =
+        `${state.index.length} 个动态配置 · 已加载 ${new Set(rows.map((r) => r.run.id)).size} 个所选运行`;
+      $("data-status").dataset.state = "ready";
+    } catch (error) {
+      if (epoch !== state.epoch) return;
+      void store.select([]);
+      state.rows = [];
+      state.panelKey = null;
+      renderCards(planned, false);
+      for (const card of grid.querySelectorAll(".precision-card"))
+        card.querySelector(".card-status").textContent =
+          "加载失败；可重新选择配置";
+      $("error-banner").hidden = false;
+      $("error-banner").textContent = error.message;
+      $("data-status").textContent = "动态证据加载失败";
+      $("data-status").dataset.state = "error";
+    }
+  }
+  function renderCards(rows = state.rows, loaded = true) {
     state.end =
       Math.max(
         0,
@@ -131,28 +181,34 @@ window.DynamicReplayView = (() => {
       ) || 1;
     $("seek").max = state.end;
     const grid = $("precision-cards");
-    grid.style.setProperty("--precision-count", state.rows.length || 1);
+    for (const card of grid.querySelectorAll(".precision-card"))
+      window.ReplayMedia.dispose(card);
+    grid.style.setProperty("--precision-count", rows.length || 1);
     grid.innerHTML =
-      state.rows
+      rows
         .map(
           (
             { run, episode: e },
             i,
           ) => `<article class="precision-card dynamic-card" data-precision="${esc(run.precision)}" data-boundary="dynamic_simulation" style="--precision:${color(run.precision)}">
       <div class="card-heading"><h2>${esc(name(run))}</h2><span class="coupling-badge">LIBERO-Dynamic</span></div>
-      <select class="dynamic-run" data-index="${i}" aria-label="${esc(name(run))} 动态配置"></select><button class="dynamic-compare" data-index="${i}">${state.rows[i].comparison ? "移除对照列" : "添加同协议对照"}</button>
+      <select class="dynamic-run" data-index="${i}" aria-label="${esc(name(run))} 动态配置"></select><button class="dynamic-compare" data-index="${i}">${rows[i].comparison ? "移除对照列" : "添加同协议对照"}</button>
       <div class="media-stage"><span class="media-message">等待实际物理帧</span><div class="frame-meta"></div></div>
-      <div class="card-status">${esc(result(e))}</div><p class="dynamic-language">${esc(e.language ?? "任务语言未记录")}</p>
-      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(timingLabel(e))} · ${esc(e.timing_rule ?? e.timing_domain ?? "未知")}${streaming(e) ? "<br>" + esc(D.startupLabel(e)) : ""}<br>${esc(D.modelContract(e))}<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>
+      <div class="card-status">${loaded ? esc(result(e)) : "加载完整记录…"}</div>${
+        loaded
+          ? `<p class="dynamic-language">${esc(e.language ?? "任务语言未记录")}</p>
+      <div class="metrics"></div><p class="card-details">${esc(conditionLabel(e))}<br>${esc(timingLabel(e))} · ${esc(e.timing_rule ?? e.timing_domain ?? "未知")}${streaming(e) ? "<br>" + esc(D.startupLabel(e)) : ""}<br>${esc(D.modelContract(e))}<br>${esc(e.video_view_contract ?? "场景观察相机；不是模型预处理后的输入张量")}<br>${esc(e.warnings.join(" · "))}</p>`
+          : ""
+      }
       <a class="run-source" href="/api/replay/run/${encodeURIComponent(run.id)}" target="_blank" rel="noopener">Run JSON ↗</a></article>`,
         )
         .join("") || '<p class="loading">此条件没有记录。</p>';
     for (const select of grid.querySelectorAll(".dynamic-run")) {
-      const row = state.rows[Number(select.dataset.index)];
+      const row = rows[Number(select.dataset.index)];
       option(
         select,
         D.candidates(
-          state.runs,
+          state.index,
           $("sample").value,
           row.run.precision,
           D.protocol(row.run),
@@ -161,26 +217,27 @@ window.DynamicReplayView = (() => {
       );
       select.addEventListener("change", () => {
         state.selection[row.columnKey] = select.value;
-        configure();
+        return configure();
       });
     }
     for (const button of grid.querySelectorAll(".dynamic-compare")) {
-      const row = state.rows[Number(button.dataset.index)],
+      const row = rows[Number(button.dataset.index)],
         key = D.groupKey(row.run);
       button.hidden =
         !row.comparison &&
         (state.comparisons.includes(key) ||
           D.candidates(
-            state.runs,
+            state.index,
             $("sample").value,
             row.run.precision,
             D.protocol(row.run),
           ).length < 2);
+      button.disabled = !row.comparison && rows.length >= D.MAX_ROWS;
       button.onclick = () => {
         state.comparisons = row.comparison
           ? state.comparisons.filter((k) => k !== key)
           : [...state.comparisons, key];
-        configure();
+        return configure();
       };
     }
     render();
@@ -422,7 +479,7 @@ window.DynamicReplayView = (() => {
     $("mode-model").onclick = () => navigate("model");
     $("mode-deployment").onclick = () => navigate("deployment");
     $("speed").value = "1";
-    $("sample-label").textContent = "动态场景 / 速度";
+    $("sample-label").textContent = "动态场景初始化 / 速度";
     option(
       $("camera"),
       [
@@ -524,54 +581,30 @@ window.DynamicReplayView = (() => {
       setTimeout(() => URL.revokeObjectURL(url), 0);
     };
     try {
-      const response = await fetch("/api/replay/catalog");
-      if (!response.ok) throw new Error(`Catalog HTTP ${response.status}`);
-      const catalog = await response.json();
-      if (catalog.schema !== "pir2.replay.catalog" || catalog.version !== 1)
-        throw new Error("不支持的 catalog");
-      const descriptors = (catalog.runs ?? []).filter(
-        (r) => r.kind === "dynamic",
-      );
-      state.runs = await Promise.all(
-        descriptors.map(async (descriptor) => {
-          const result = await fetch(
-            `/api/replay/run/${encodeURIComponent(descriptor.id)}`,
-          );
-          if (!result.ok) throw new Error(`Run HTTP ${result.status}`);
-          const run = await result.json();
-          if (
-            run.id !== descriptor.id ||
-            run.kind !== "dynamic" ||
-            run.precision !== descriptor.precision
-          )
-            throw new Error("Dynamic run identity mismatch");
-          return run;
-        }),
-      );
+      const catalog = await store.initialize();
+      state.index = store.index;
       option(
         $("sample"),
-        D.conditions(state.runs).map(({ key, episode }) => [
+        D.conditions(state.index).map(({ key, episode }) => [
           key,
-          conditionLabel(episode),
+          D.initializationLabel(episode),
         ]),
       );
       option(
         $("precision"),
         [
           ["all", "已记录精度 · 同条件并排"],
-          ...[...new Set(state.runs.map((r) => r.precision))].map((p) => [
+          ...[...new Set(state.index.map((r) => r.precision))].map((p) => [
             p,
             p.toUpperCase(),
           ]),
         ],
         "all",
       );
-      $("data-status").textContent = `${state.runs.length} 个动态配置`;
-      $("data-status").dataset.state = "ready";
       $("catalog-meta").textContent =
         `LIBERO-Dynamic · ${catalog.created_at ?? ""}`;
-      configure();
       requestAnimationFrame(tick);
+      await configure();
     } catch (error) {
       $("error-banner").hidden = false;
       $("error-banner").textContent = error.message;

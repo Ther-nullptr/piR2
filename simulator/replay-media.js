@@ -11,14 +11,28 @@ window.ReplayMedia = (() => {
       this.presented = null;
       this.busy = false;
     }
+    releaseMedia() {
+      const media = this.media;
+      this.media = null;
+      this.presented = null;
+      this.busy = false;
+      if (!media) return;
+      if (media.tagName === "VIDEO") media.pause?.();
+      media.removeAttribute?.("src");
+      if (media.tagName === "VIDEO") media.load?.();
+      media.remove();
+    }
+    dispose() {
+      this.releaseMedia();
+      this.context = null;
+      this.target = null;
+    }
     update(asset, target, caption, context, epoch) {
       this.target = target;
       this.context = context;
       this.fallbackCaption = caption;
       if (!asset?.media_id || target == null) {
-        this.media?.remove();
-        this.media = null;
-        this.presented = null;
+        this.releaseMedia();
         this.message.hidden = false;
         this.message.textContent = !asset?.media_id
           ? "该视角未记录媒体"
@@ -46,9 +60,7 @@ window.ReplayMedia = (() => {
       } else this.caption.textContent = caption;
     }
     create(asset, key) {
-      this.media?.remove();
-      this.presented = null;
-      this.busy = false;
+      this.releaseMedia();
       const media = document.createElement(
         asset.mime?.startsWith("video") ? "video" : "img",
       );
@@ -158,5 +170,9 @@ window.ReplayMedia = (() => {
     }
     presenter.update(asset, target, caption, context, epoch);
   }
-  return { update };
+  function dispose(card) {
+    presenters.get(card)?.dispose();
+    presenters.delete(card);
+  }
+  return { update, dispose };
 })();

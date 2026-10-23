@@ -849,3 +849,195 @@ def test_native_physical_duration_must_equal_this_request(native_evidence, tmp_p
     write(root / "audit.json", audit)
     with pytest.raises(ValueError, match="Native Flow physical hold"):
         build(root, tmp_path)
+
+
+def test_catalog_indexes_small_episode_metadata_and_actual_request_bounds(
+    native_evidence, tmp_path
+):
+    root, _, _ = native_evidence
+    catalog, run, _ = build(root, tmp_path)
+    descriptor = catalog["runs"][0]
+    assert descriptor["episodes"] == len(run["episodes"])
+    assert descriptor["protocol"] == run["protocol"]
+    summary = descriptor["episode_summaries"][0]
+    episode = run["episodes"][0]
+    for key in (
+        "id",
+        "condition_id",
+        "suite",
+        "task_id",
+        "level",
+        "traj_index",
+        "speed_mps",
+        "seed",
+        "init_state_id",
+        "scene_drive",
+        "scene_drive_scope",
+        "protocol",
+        "timing_mode",
+        "calibration",
+        "execution_prefix_steps",
+    ):
+        assert summary[key] == episode[key]
+    durations = [request["service_duration_ms"] for request in episode["requests"]]
+    assert summary["request_duration_bounds_ms"] == {
+        "all": {"min": min(durations), "max": max(durations)},
+        "s1": None,
+        "s2": None,
+    }
+    assert (
+        not {
+            "requests",
+            "frames",
+            "events",
+            "trace",
+            "motion_events",
+            "policy_identity",
+            "provenance",
+            "media",
+        }
+        & summary.keys()
+    )
+
+
+@pytest.fixture
+def existing_replay_catalog(tmp_path):
+    root = tmp_path / "existing"
+    run = {
+        "schema": "pir2.replay.run",
+        "version": 1,
+        "id": "dynamic-saved",
+        "kind": "dynamic",
+        "precision": "bf16",
+        "protocol": "pir2_dynamic",
+        "mode": "libero_dynamic",
+        "label": "saved",
+        "episodes": [
+            {
+                "id": "episode-original",
+                "condition_id": "parent__drive_frozen",
+                "parent_dynamic_condition_id": "parent",
+                "item_id": "task0",
+                "suite": "libero_spatial",
+                "task_id": 0,
+                "level": "l1",
+                "traj_index": 0,
+                "speed_mps": 0.001,
+                "speed_scope": "custom",
+                "seed": 8000,
+                "init_state_id": 0,
+                "seed_scope": "custom",
+                "scene_drive": "frozen",
+                "scene_drive_scope": "owned_control",
+                "protocol": "pir2_dynamic",
+                "timing_mode": "native",
+                "fixed_delay": None,
+                "stage_latencies": None,
+                "execution_prefix_steps": 1,
+                "calibration": {"kind": "measured_per_request"},
+                "requests": [
+                    {"lane": "s2", "service_duration_ms": 31.25},
+                    {"lane": "s2", "service_duration_ms": 39.75},
+                    {"lane": "s1", "service_duration_ms": 12.5},
+                    {"lane": "s1", "service_duration_ms": None},
+                ],
+                "frames": [{"frame_id": "original"}],
+                "trace": [{"source": "raw"}],
+            }
+        ],
+    }
+    descriptor = {
+        key: run[key] for key in ("id", "kind", "precision", "mode", "label")
+    } | {"path": "runs/dynamic-saved.json", "episodes": 1, "custom": {"keep": True}}
+    catalog = {
+        "schema": "pir2.replay.catalog",
+        "version": 1,
+        "runs": [descriptor],
+        "media_manifest": "media.json",
+        "streams": [{"run_id": run["id"], "journal_path": "original.jsonl"}],
+        "unknown": {"nested": [1, 2, 3]},
+        "created_at": "unchanged",
+    }
+    write(root / descriptor["path"], run)
+    write(root / "catalog.json", catalog)
+    write(root / "media.json", {"assets": ["unchanged"]})
+    return root, catalog, run
+
+
+def test_refresh_index_cli_preserves_raw_files_ids_and_unknown_fields(
+    existing_replay_catalog,
+):
+    from coexecution.replay.__main__ import main
+
+    root, catalog, run = existing_replay_catalog
+    raw = (root / catalog["runs"][0]["path"]).read_bytes()
+    media = (root / "media.json").read_bytes()
+    main(["refresh-index", "--catalog", str(root / "catalog.json")])
+    refreshed = json.loads((root / "catalog.json").read_text())
+    for key in catalog.keys() - {"runs"}:
+        assert refreshed[key] == catalog[key]
+    descriptor = refreshed["runs"][0]
+    for key in catalog["runs"][0]:
+        assert descriptor[key] == catalog["runs"][0][key]
+    summary = descriptor["episode_summaries"][0]
+    assert summary["id"] == run["episodes"][0]["id"]
+    assert summary["condition_id"] == "parent__drive_frozen"
+    assert summary["scene_drive_scope"] == "owned_control"
+    assert summary["seed"] == 8000
+    assert summary["request_duration_bounds_ms"] == {
+        "all": None,
+        "s1": None,
+        "s2": {"min": 31.25, "max": 39.75},
+    }
+    assert (root / catalog["runs"][0]["path"]).read_bytes() == raw
+    assert (root / "media.json").read_bytes() == media
+
+
+@pytest.mark.parametrize(
+    "defect", ["escape", "symlink", "id", "kind", "precision", "duplicate_episode"]
+)
+def test_refresh_index_rejects_escaped_or_mismatched_evidence_atomically(
+    existing_replay_catalog, defect
+):
+    from coexecution.replay import catalog as module
+
+    root, catalog, run = existing_replay_catalog
+    if defect in {"escape", "symlink"}:
+        write(root.parent / "outside.json", run)
+        if defect == "escape":
+            catalog["runs"][0]["path"] = "../outside.json"
+        else:
+            (root / "alias.json").symlink_to(root.parent / "outside.json")
+            catalog["runs"][0]["path"] = "alias.json"
+    elif defect == "duplicate_episode":
+        run["episodes"].append(deepcopy(run["episodes"][0]))
+    else:
+        run[defect] = "mismatch"
+    write(root / "runs/dynamic-saved.json", run)
+    write(root / "catalog.json", catalog)
+    original = (root / "catalog.json").read_bytes()
+    with pytest.raises(ValueError):
+        module.refresh_index(root / "catalog.json")
+    assert (root / "catalog.json").read_bytes() == original
+
+
+def test_refresh_index_leaves_non_dynamic_descriptors_unchanged(
+    existing_replay_catalog,
+):
+    from coexecution.replay import catalog as module
+
+    root, catalog, _ = existing_replay_catalog
+    descriptor = {
+        "id": "model-1",
+        "kind": "model",
+        "precision": "bf16",
+        "path": "runs/model-1.json",
+    }
+    write(
+        root / descriptor["path"],
+        {**descriptor, "schema": "pir2.replay.run", "version": 1},
+    )
+    catalog["runs"].append(descriptor)
+    write(root / "catalog.json", catalog)
+    refreshed = module.refresh_index(root / "catalog.json")
+    assert refreshed["runs"][1] == descriptor

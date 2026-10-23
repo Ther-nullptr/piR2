@@ -325,10 +325,13 @@ test("average action rate includes inference and startup holds, not video frames
 
 test("frozen-drive controls name parent speed and never claim continuing external motion", () => {
   const e = { scene_drive: "frozen", speed_mps: 0.001, status: "ok" };
-  assert.match(D.motionLabel(e), /外驱冻结.*初始化.*0\.001/);
+  assert.match(D.motionLabel(e), /外驱冻结/);
+  assert.match(D.initializationLabel(e), /初始化速度 0\.001/);
   for (const kind of ["inference_hold", "bootstrap_hold", "startup_barrier"])
     assert.match(D.phaseLabel({ event: { kind } }, e), /外驱冻结/);
-  assert.match(D.motionLabel({ speed_mps: 0.03 }), /0\.030 m\/s/);
+  assert.match(D.initializationLabel({ speed_mps: 0.03 }), /0\.030 m\/s/);
+  assert.match(D.initializationLabel({ speed_mps: 0.0003 }), /0\.0003 m\/s/);
+  assert.match(D.initializationLabel({ speed_mps: 0.00105 }), /0\.00105 m\/s/);
 });
 
 test("S1 state tick and S2 image tick have distinct labels and RPC boundary", () => {
@@ -425,4 +428,86 @@ test("native Flow wall note states the full request boundary", () => {
   assert.match(scope, /NumPy/);
   assert.match(scope, /完整策略调用/);
   assert.match(scope, /RPC/);
+});
+
+test("indexed native labels equal full labels and partial duration evidence stays unknown", () => {
+  for (const protocol of ["default_vla_flow4", "pir2_dynamic"]) {
+    const full = {
+      ...episode,
+      protocol,
+      timing_mode: "native",
+      execution_prefix_steps: 2,
+      requests: [
+        { lane: "s1", service_duration_ms: 12.4 },
+        { lane: "s1", service_duration_ms: 17.3 },
+        { lane: "s2", service_duration_ms: 31.2 },
+        { lane: "s2", service_duration_ms: 39.8 },
+      ],
+    };
+    const summary = D.episodeSummary(full);
+    assert.equal(summary.requests, undefined);
+    assert.equal(summary.frames, undefined);
+    assert.equal(D.timingLabel(summary), D.timingLabel(full));
+    assert.deepEqual(summary.request_duration_bounds_ms.s1, {
+      min: 12.4,
+      max: 17.3,
+    });
+    full.requests[1].service_duration_ms = null;
+    assert.equal(D.episodeSummary(full).request_duration_bounds_ms.s1, null);
+    assert.equal(D.episodeSummary(full).request_duration_bounds_ms.all, null);
+    assert.match(
+      D.timingLabel(full),
+      protocol === "pir2_dynamic" ? /S1 —/ : /Flow4 —/,
+    );
+    assert.equal(D.timingLabel(D.episodeSummary(full)), D.timingLabel(full));
+  }
+  assert.match(D.timingLabel({ timing_mode: "native" }), /Flow4 —/);
+});
+
+test("condition choices describe parent initialization independently of selected scene drive", () => {
+  const moving = {
+    ...episode,
+    scene_drive: "moving",
+    speed_scope: "custom",
+    seed_scope: "custom",
+    seed: 8000,
+  };
+  const frozen = { ...moving, id: "frozen", scene_drive: "frozen" };
+  const runs = [moving, frozen].map((e, i) => ({
+    id: `run${i}`,
+    kind: "dynamic",
+    episodes: 1,
+    episode_summaries: [e],
+  }));
+  const choices = D.conditions(runs);
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].episode.id, moving.id);
+  assert.equal(D.initializationLabel(moving), D.initializationLabel(frozen));
+  assert.match(
+    D.initializationLabel(frozen),
+    /初始化.*0\.060.*seed 8000.*初态 0/,
+  );
+  assert.doesNotMatch(D.initializationLabel(frozen), /冻结/);
+  assert.match(D.motionLabel(frozen), /冻结/);
+});
+
+test("four primary groups keep their columns when comparison requests exceed capacity", () => {
+  const runs = ["bf16", "w8a8"].flatMap((precision) =>
+    ["default_vla_flow4", "pir2_dynamic"].flatMap((protocol) =>
+      [1, 2].map((n) => ({
+        id: `${precision}-${protocol}-${n}`,
+        kind: "dynamic",
+        precision,
+        protocol,
+        episodes: [episode],
+      })),
+    ),
+  );
+  const groups = [...new Set(runs.map(D.groupKey))];
+  const rows = D.rows(runs, D.conditionKey(episode), "all", {}, groups);
+  assert.equal(rows.length, 4);
+  assert.deepEqual(
+    rows.map((r) => r.columnKey),
+    groups,
+  );
 });
