@@ -373,6 +373,29 @@ def _events(
     return events
 
 
+def _seed_fields(manifest, config):
+    fields = {key: config.get(key) for key in ("seed", "init_state_id")}
+    if "seed_scope" not in manifest and "seed_scope" not in config:
+        return fields
+    for record in (manifest, config):
+        seed, initial = record.get("seed"), record.get("init_state_id")
+        if (
+            type(seed) is not int
+            or not 0 <= seed < 2**32
+            or type(initial) is not int
+            or initial != 0
+            or record.get("seed_scope") != ("default" if seed == 0 else "custom")
+        ):
+            raise ValueError(
+                "Dynamic seed scope requires explicit valid seed/init evidence"
+            )
+    if any(
+        manifest[key] != config[key] for key in ("seed", "init_state_id", "seed_scope")
+    ):
+        raise ValueError("Dynamic seed evidence disagrees with run configuration")
+    return {**fields, "seed_scope": config["seed_scope"]}
+
+
 def _frames(audit, episode_id, duration, events):
     frames = []
     previous_sim = previous_media = -1.0
@@ -550,8 +573,7 @@ def _episode(root, manifest, config, media, run_id):
                 "setup",
             )
         },
-        "seed": config.get("seed"),
-        "init_state_id": config.get("init_state_id"),
+        **_seed_fields(manifest, config),
         "duration_s": duration,
         "clock": "rollout_sim_time_s",
         "control_freq": freq,

@@ -1,6 +1,6 @@
 """Import recorded πR² dynamic scheduling and its separate measured RPC evidence."""
 
-from .dynamic import _frames, _number, _path, _same_action, _stage
+from .dynamic import _frames, _number, _path, _same_action, _seed_fields, _stage
 from .schema import digest, interval, optional_number, read_json, read_jsonl, source
 
 
@@ -798,8 +798,7 @@ def streaming_episode(root, manifest, config, media, run_id):
     return {
         **manifest,
         "id": episode_id,
-        "seed": config.get("seed"),
-        "init_state_id": config.get("init_state_id"),
+        **_seed_fields(manifest, config),
         "duration_s": duration,
         "clock": "rollout_sim_time_s",
         "control_freq": 1 / period,
