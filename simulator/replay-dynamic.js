@@ -6,6 +6,88 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
   const finite = (v) => typeof v === "number" && Number.isFinite(v);
+  const MAX_ROWS = 4;
+  const episodes = (run) => run.episode_summaries ?? run.episodes ?? [];
+  function durationBounds(e, lane) {
+    if (Array.isArray(e.requests)) {
+      const requests =
+        lane === "all" ? e.requests : e.requests.filter((r) => r.lane === lane);
+      if (
+        !requests.length ||
+        requests.some(
+          (r) => !finite(r.service_duration_ms) || r.service_duration_ms < 0,
+        )
+      )
+        return null;
+      return requests.reduce(
+        (bounds, r) => ({
+          min: Math.min(bounds.min, r.service_duration_ms),
+          max: Math.max(bounds.max, r.service_duration_ms),
+        }),
+        { min: Infinity, max: -Infinity },
+      );
+    }
+    const bounds = e.request_duration_bounds_ms?.[lane];
+    return finite(bounds?.min) &&
+      finite(bounds?.max) &&
+      bounds.min >= 0 &&
+      bounds.max >= bounds.min
+      ? { min: bounds.min, max: bounds.max }
+      : null;
+  }
+  function episodeSummary(e) {
+    // Match the catalog allowlist; no request, media, trace or policy identity references.
+    const summary = Object.fromEntries(
+      [
+        "id",
+        "item_id",
+        "condition_id",
+        "parent_dynamic_condition_id",
+        "template_condition_id",
+        "suite",
+        "task_id",
+        "level",
+        "traj_index",
+        "speed_mps",
+        "seed",
+        "init_state_id",
+        "speed_scope",
+        "seed_scope",
+        "scene_drive",
+        "scene_drive_scope",
+        "protocol",
+        "timing_mode",
+        "fixed_delay",
+        "execution_prefix_steps",
+      ].map((key) => [key, e[key] ?? null]),
+    );
+    for (const [key, fields] of [
+      ["stage_latencies", ["bootstrap_s", "s1_s", "s2_s"]],
+      [
+        "calibration",
+        [
+          "kind",
+          "protocol",
+          "retained_requests",
+          "warmup_requests",
+          "raw_latency_s",
+          "applied_latency_s",
+        ],
+      ],
+    ])
+      summary[key] =
+        e[key] && typeof e[key] === "object"
+          ? Object.fromEntries(
+              fields
+                .filter((field) => Object.hasOwn(e[key], field))
+                .map((field) => [field, e[key][field]]),
+            )
+          : null;
+    summary.request_duration_bounds_ms = Object.fromEntries(
+      ["all", "s1", "s2"].map((lane) => [lane, durationBounds(e, lane)]),
+    );
+    return summary;
+  }
   function conditionKey(e) {
     return JSON.stringify([
       e.suite,
@@ -20,7 +102,8 @@
   function conditions(runs) {
     const found = new Map();
     for (const run of runs.filter((r) => r.kind === "dynamic"))
-      for (const e of run.episodes ?? []) found.set(conditionKey(e), e);
+      for (const e of episodes(run))
+        if (!found.has(conditionKey(e))) found.set(conditionKey(e), e);
     return [...found].map(([key, episode]) => ({ key, episode }));
   }
   const protocol = (run) =>
@@ -37,7 +120,7 @@
           (!selectedProtocol || protocol(r) === selectedProtocol),
       )
       .flatMap((run) =>
-        (run.episodes ?? [])
+        episodes(run)
           .filter((e) => conditionKey(e) === key)
           .map((episode) => ({ run, episode })),
       );
@@ -46,7 +129,7 @@
     const groups = new Map();
     for (const run of runs.filter((r) => r.kind === "dynamic"))
       groups.set(groupKey(run), run);
-    return [...groups]
+    const primary = [...groups]
       .filter(([, run]) => precision === "all" || run.precision === precision)
       .flatMap(([columnKey, run]) => {
         const found = candidates(runs, key, run.precision, protocol(run));
@@ -56,16 +139,23 @@
               r.run.id === (selection[columnKey] ?? selection[run.precision]),
           ) ?? found[0];
         if (!selected) return [];
-        const result = [{ ...selected, columnKey }];
-        if (comparisons.includes(columnKey) && found.length > 1) {
-          const extraKey = columnKey + ":compare";
-          const extra =
-            found.find((r) => r.run.id === selection[extraKey]) ??
-            found.find((r) => r.run.id !== selected.run.id);
-          result.push({ ...extra, columnKey: extraKey, comparison: true });
-        }
-        return result;
+        return [{ ...selected, columnKey }];
       });
+    if (primary.length > MAX_ROWS)
+      throw new Error("最多显示 4 列；请选择单一精度");
+    let available = MAX_ROWS - primary.length;
+    return primary.flatMap((selected) => {
+      const { columnKey, run } = selected;
+      const found = candidates(runs, key, run.precision, protocol(run));
+      if (!available || !comparisons.includes(columnKey) || found.length < 2)
+        return [selected];
+      const extraKey = columnKey + ":compare";
+      const extra =
+        found.find((r) => r.run.id === selection[extraKey]) ??
+        found.find((r) => r.run.id !== run.id);
+      available--;
+      return [selected, { ...extra, columnKey: extraKey, comparison: true }];
+    });
   }
   function cameraFrames(episode, camera = "image") {
     if (camera === "image")
@@ -167,34 +257,29 @@
   function timingLabel(e) {
     if (e.protocol !== "pir2_dynamic") {
       if (e.timing_mode === "native") {
-        const values = (e.requests ?? [])
-          .map((r) => r.service_duration_ms)
-          .filter(finite);
-        const range = values.length
-          ? `${Math.min(...values).toFixed(1)}–${Math.max(...values).toFixed(1)}`
+        const bounds = durationBounds(e, "all");
+        const range = bounds
+          ? `${bounds.min.toFixed(1)}–${bounds.max.toFixed(1)}`
           : "—";
         return `逐请求实测延迟 · 完整 Flow4 ${range} ms · K ${e.execution_prefix_steps ?? "—"}`;
       }
       const kind =
-        e.calibration.kind === "measured"
+        e.calibration?.kind === "measured"
           ? "实测校准延迟"
-          : e.calibration.kind === "counterfactual"
+          : e.calibration?.kind === "counterfactual"
             ? "反事实固定延迟"
-            : `校准类型 ${e.calibration.kind ?? "未知"}`;
-      const tau = e.calibration.applied_latency_s;
+            : `校准类型 ${e.calibration?.kind ?? "未知"}`;
+      const tau = e.calibration?.applied_latency_s;
       return `${kind} · τ ${finite(tau) ? (tau * 1000).toFixed(1) : "—"} ms`;
     }
     const policy =
       e.fixed_delay == null ? "responsive" : `fixed d=${e.fixed_delay}`;
     if (e.timing_mode === "native") {
       const range = (lane) => {
-        const values = (e.requests ?? [])
-          .filter((r) => r.lane === lane)
-          .map((r) => r.service_duration_ms)
-          .filter(finite);
-        if (!values.length) return "—";
-        const low = Math.min(...values),
-          high = Math.max(...values);
+        const bounds = durationBounds(e, lane);
+        if (!bounds) return "—";
+        const low = bounds.min,
+          high = bounds.max;
         return low === high
           ? low.toFixed(1)
           : `${low.toFixed(1)}–${high.toFixed(1)}`;
@@ -216,10 +301,15 @@
       : null;
   }
   function motionLabel(e) {
-    const speed = finite(e.speed_mps) ? e.speed_mps.toFixed(3) : "—";
-    return e.scene_drive === "frozen"
-      ? `外驱冻结对照 · 初始化驱动 ${speed} m/s`
-      : `${speed} m/s${e.speed_scope === "custom" ? "（自定义物体速度）" : ""}`;
+    return e.scene_drive === "frozen" ? "外驱冻结对照" : "外驱运动";
+  }
+  function initializationLabel(e) {
+    const speed = !finite(e.speed_mps)
+      ? "—"
+      : Number(e.speed_mps.toFixed(3)) === e.speed_mps
+        ? e.speed_mps.toFixed(3)
+        : String(e.speed_mps);
+    return `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · 初始化速度 ${speed} m/s${e.speed_scope === "custom" ? "（自定义）" : ""} · seed ${e.seed ?? "—"}${e.seed_scope === "custom" ? "（自定义）" : ""} · 初态 ${e.init_state_id ?? "—"}`;
   }
   function startupLabel(e) {
     const ms = (v) => (finite(v) ? (v * 1000).toFixed(1) : "—");
@@ -264,6 +354,8 @@
     return now.event.kind === "action" ? "动作执行" : "无已记录阶段";
   }
   return {
+    MAX_ROWS,
+    episodeSummary,
     protocol,
     protocolLabel,
     groupKey,
@@ -281,6 +373,7 @@
     timingLabel,
     averageActionHz,
     motionLabel,
+    initializationLabel,
     startupLabel,
     stageNfe,
     observationLabel,

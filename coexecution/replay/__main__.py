@@ -1,4 +1,4 @@
-"""Build recorded evidence or explicitly start a live model recording."""
+"""Build or index recorded evidence, or explicitly start a live model recording."""
 
 import argparse
 from pathlib import Path
@@ -7,6 +7,11 @@ from pathlib import Path
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    refresh = commands.add_parser(
+        "refresh-index",
+        help="Refresh dynamic selector summaries from existing run JSON",
+    )
+    refresh.add_argument("--catalog", type=Path, required=True)
     build = commands.add_parser(
         "build", help="Normalize explicit recorded model/deployment evidence"
     )
@@ -41,6 +46,17 @@ def main(argv=None):
     record.add_argument("--catalog-output", type=Path, required=True)
     record.add_argument("--clock-cohort")
     args = parser.parse_args(argv)
+    if args.command == "refresh-index":
+        from .catalog import refresh_index
+
+        try:
+            catalog = refresh_index(args.catalog)
+        except (ValueError, TypeError, OSError) as error:
+            parser.error(str(error))
+        print(
+            f"Refreshed index for {len(catalog['runs'])} replay runs at {args.catalog}"
+        )
+        return
     if args.command == "record-model":
         from .live import record_model
 

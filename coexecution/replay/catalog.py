@@ -1,9 +1,156 @@
 """Offline replay catalog builder. Model array loading is lazy and untimed."""
 
+import math
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .schema import VERSION, write_json
+from .schema import VERSION, read_json, under_root, write_json
+
+EPISODE_INDEX_FIELDS = (
+    "id",
+    "item_id",
+    "condition_id",
+    "parent_dynamic_condition_id",
+    "template_condition_id",
+    "suite",
+    "task_id",
+    "level",
+    "traj_index",
+    "speed_mps",
+    "seed",
+    "init_state_id",
+    "speed_scope",
+    "seed_scope",
+    "scene_drive",
+    "scene_drive_scope",
+    "protocol",
+    "timing_mode",
+    "fixed_delay",
+    "execution_prefix_steps",
+)
+
+
+def _duration_bounds(requests):
+    values = [request.get("service_duration_ms") for request in requests]
+    if not values or any(
+        type(value) not in (int, float) or not math.isfinite(value) or value < 0
+        for value in values
+    ):
+        return None
+    return {"min": min(values), "max": max(values)}
+
+
+def dynamic_index(run):
+    """Small selector metadata; measured bounds are unknown for partial evidence."""
+    episodes = run.get("episodes")
+    if not isinstance(episodes, list):
+        raise TypeError("Dynamic run needs recorded episodes")
+    summaries, identifiers = [], set()
+    for episode in episodes:
+        identifier = episode.get("id")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in identifiers
+        ):
+            raise ValueError("Dynamic episodes need unique identities")
+        identifiers.add(identifier)
+        summary = {key: episode.get(key) for key in EPISODE_INDEX_FIELDS}
+        for key, fields in (
+            ("stage_latencies", ("bootstrap_s", "s1_s", "s2_s")),
+            (
+                "calibration",
+                (
+                    "kind",
+                    "protocol",
+                    "retained_requests",
+                    "warmup_requests",
+                    "raw_latency_s",
+                    "applied_latency_s",
+                ),
+            ),
+        ):
+            value = episode.get(key)
+            summary[key] = (
+                {field: value[field] for field in fields if field in value}
+                if isinstance(value, dict)
+                else None
+            )
+        requests = episode.get("requests", [])
+        summary["request_duration_bounds_ms"] = {
+            lane: _duration_bounds(
+                requests
+                if lane == "all"
+                else [r for r in requests if r.get("lane") == lane]
+            )
+            for lane in ("all", "s1", "s2")
+        }
+        summaries.append(summary)
+    return {"protocol": run.get("protocol"), "episode_summaries": summaries}
+
+
+def refresh_index(catalog_path):
+    """Refresh only catalog summaries, atomically, from its listed recorded runs."""
+    path = Path(catalog_path)
+    if path.is_dir():
+        path /= "catalog.json"
+    path = path.resolve(strict=True)
+    catalog = read_json(path)
+    if (
+        catalog.get("schema") != "pir2.replay.catalog"
+        or catalog.get("version") != VERSION
+        or not isinstance(catalog.get("runs"), list)
+    ):
+        raise ValueError("Unsupported replay catalog schema/version")
+    identifiers = set()
+    for descriptor in catalog["runs"]:
+        identifier = descriptor.get("id")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in identifiers
+        ):
+            raise ValueError("Catalog needs unique run identities")
+        identifiers.add(identifier)
+        relative = descriptor.get("path")
+        if not isinstance(relative, str) or not relative:
+            raise ValueError("Catalog run needs a relative path")
+        run = read_json(under_root(path.parent, relative))
+        if (
+            run.get("schema") != "pir2.replay.run"
+            or run.get("version") != VERSION
+            or any(
+                not descriptor.get(key) or run.get(key) != descriptor[key]
+                for key in ("id", "kind", "precision")
+            )
+        ):
+            raise ValueError(f"Replay run identity mismatch: {identifier}")
+        if run["kind"] == "dynamic":
+            summary = dynamic_index(run)
+            if "episodes" in descriptor and descriptor["episodes"] != len(
+                summary["episode_summaries"]
+            ):
+                raise ValueError(f"Dynamic episode count mismatch: {identifier}")
+            descriptor.update(summary)
+        # Drop the full run before reading the next, even for a legacy catalog.
+        del run
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=".catalog-", delete=False
+        ) as target:
+            temporary = Path(target.name)
+        write_json(temporary, catalog)
+        temporary.chmod(path.stat().st_mode & 0o777)
+        with temporary.open("rb") as source:
+            os.fsync(source.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return catalog
 
 
 def build_catalog(
@@ -127,6 +274,7 @@ def build_catalog(
                 "profile_requests": len(run.get("profile_requests", [])),
                 "episodes": len(run.get("episodes", [])),
                 "warnings": run["warnings"],
+                **(dynamic_index(run) if run["kind"] == "dynamic" else {}),
                 **(
                     {
                         "execution_clock": run["execution_clock"],

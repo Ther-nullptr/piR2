@@ -5,6 +5,7 @@
 | 入口                                        | 职责                                                   |
 | ------------------------------------------- | ------------------------------------------------------ |
 | `python -m coexecution.replay build`        | 读取显式指定的既有证据，生成 catalog、run 和媒体清单   |
+| `python -m coexecution.replay refresh-index` | 从已有 run JSON 刷新动态回放选择器索引                 |
 | `python -m coexecution.replay record-model` | 显式启动 CUDA 模型测量，并增量发布 snapshot / SSE 事件 |
 | `python simulator/serve.py --replay …`      | 在 loopback 提供目录、媒体和注册事件流                 |
 | [桌面调试前端](../../simulator/README.md)   | 比较模型输出、依赖时间线和各精度实际机器人响应         |
@@ -56,6 +57,22 @@ python simulator/serve.py --port 8765 --replay /path/to/new-dynamic-catalog/cata
 ```
 
 打开 `/simulator/replay.html?view=dynamic`。`--dynamic-evaluation` 可重复，也可与原有模型或部署输入一起构建。每个目录包含评估器的 `evaluation.json`、`manifest.jsonl`、policy audit、物理 trace 和 MP4。Builder 读取已有文件，沿用媒体白名单，不启动模型。
+
+动态目录在每个描述符中保留 `episodes` 计数，并增加 `protocol` 与小型
+`episode_summaries`。浏览器用索引显示条件和配置，只读取当前所选运行的完整 JSON，
+最多保留四列；切换后释放未选运行与播放器。索引中的
+`request_duration_bounds_ms` 分别记录全部请求、S1、S2 的实际时长上下界；
+该组没有请求或有缺失时长时为 `null`。原始请求、视频、wall 阶段和 Run JSON 链接保留。
+
+已有目录可直接刷新索引，无需重新导入实验或编码媒体：
+
+```bash
+python -m coexecution.replay refresh-index --catalog /path/to/dynamic-catalog/catalog.json
+```
+
+命令逐个校验已列出的 run 路径与身份，原子替换目录索引，保留其它目录字段和
+媒体/流登记；完整 run 与媒体文件不改写。旧目录没有摘要时，浏览器逐个读取运行来
+提取小型索引，因此旧目录仍可阅读，但建议先刷新索引以缩短首次加载。
 
 Dynamic run 使用 `kind=dynamic`。主轴 `rollout_sim_time_s` 从首次策略观测开始，包含机器人保持、目标继续运动的推理等待。每个 hold 与动作块通过 `chunk_id → policy_request_sequence` 关联本回合的 scored request；warmup 请求不画进主时间轴。选择请求后，独立 wall 面板展示实际 Fresh VLM → Flow DiT 的 stream-complete 起止时间、RPC 和原始测量边界，物理 τ 与实测 wall 延迟分别呈现。
 
