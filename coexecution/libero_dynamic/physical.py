@@ -5,7 +5,13 @@ import time
 
 import numpy as np
 
-from .world import NativeFixtureTiming, observation_registry, observe_objects
+from .world import (
+    NativeFixtureTiming,
+    freeze_preview_states,
+    observation_registry,
+    observe_objects,
+    scene_drive_metadata,
+)
 
 
 def make_physical_episode_type(source, options, *, callback_convention="source_run"):
@@ -35,6 +41,8 @@ def make_physical_episode_type(source, options, *, callback_convention="source_r
             self.frame_sink = None
             self.hold_phase = "inference_hold"
             self.fixture_timing = None
+            self.drive_freeze = None
+            self.drive_mode = scene_drive_metadata(options)["scene_drive"]
             self.latency_backend = (
                 "source_preview_exact_hold" if self.use_preview else None
             )
@@ -62,6 +70,7 @@ def make_physical_episode_type(source, options, *, callback_convention="source_r
                     "target_object_poses": poses,
                     "action_step": self.action_step,
                     "active_chunk_id": self.active_chunk_id,
+                    "scene_drive": self.drive_mode,
                     **fields,
                 }
             )
@@ -72,11 +81,21 @@ def make_physical_episode_type(source, options, *, callback_convention="source_r
             if result[3] != 40:
                 raise ValueError("Require 40 actual source pre-policy control steps")
             if not self.use_preview:
+                if self.drive_mode == "frozen":
+                    raise ValueError(
+                        "Frozen external drive requires preview slide-joint carriers"
+                    )
                 # Preserve source-native fixture initialization and env.step.
                 # Its pending-latency path is extracted below, never forced into
                 # the carrier-only preview setup.
                 self.fixture_timing = NativeFixtureTiming(env)
                 self.latency_backend = self.fixture_timing.backend
+            if self.drive_mode == "frozen":
+                states, receipt = freeze_preview_states(
+                    env, self.preview_states, phase_s=self.preview_elapsed
+                )
+                self.preview_states, self.drive_freeze = states, receipt
+                env.dynamic_multi_target_states = states
             self.observed_objects = observation_registry(
                 self.item, env, runtime._target_entries(self.item, env)
             )
@@ -86,6 +105,8 @@ def make_physical_episode_type(source, options, *, callback_convention="source_r
             if self.last_capture_s is None:
                 self.last_capture_s = time.monotonic()
             self._motion_event("initial_observation", capture_s=self.last_capture_s)
+            if self.drive_freeze is not None:
+                self._motion_event("drive_frozen", drive_freeze=self.drive_freeze)
             return result
 
         def _step_env(self, env, action, **kwargs):

@@ -223,6 +223,63 @@ def test_startup_moves_world_freshens_state_and_steady_actions_add_no_hold(tmp_p
     assert options.output.exists()
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_frozen_streaming_receipt_survives_success_and_partial_physics(tmp_path, fail):
+    from coexecution.libero_dynamic.streaming_evaluation import (
+        make_streaming_episode_type,
+    )
+    from tests.contracts.test_dynamic_world import CarrierEnv
+
+    source, options, args, item, rpc, _, env, _ = fixtures(tmp_path)
+    carriers = CarrierEnv()
+    for name, value in vars(carriers.sim.model).items():
+        setattr(env.sim.model, name, value)
+    for name, value in vars(carriers.sim.data).items():
+        if name != "time":
+            setattr(env.sim.data, name, value)
+    options.scene_drive = "frozen"
+    if fail:
+        env.fail_after = 42
+
+    class CarrierSourceEpisode(SourceEpisode):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.preview_states = carriers.states()
+
+    source.runtime.RealtimeEpisode = CarrierSourceEpisode
+    runner = make_streaming_episode_type(source, options)(item, args, rpc=rpc)
+    result = runner.run()
+    audit = json.loads(Path(result["policy_audit"]).read_text())
+    assert result["status"] == ("error" if fail else "ok")
+    assert result["scene_drive"] == audit["scene_drive"] == "frozen"
+    assert result["scene_drive_scope"] == audit["scene_drive_scope"] == "owned_control"
+    receipt = result["drive_freeze"]
+    assert receipt == audit["drive_freeze"]
+    assert receipt["phase_s"] == pytest.approx(2.0)
+    assert receipt["capture_state_before"] == receipt["capture_state_after"]
+    assert carriers.writes == []
+    # This host double's free object continues moving; the adapter does not
+    # constrain it or stop actual physics during the bootstrap service.
+    assert env.sim.x > 0.12
+    assert result["startup_seconds_applied"] == pytest.approx(0.1)
+    assert len(env.actions) >= 42
+
+
+def test_unsupported_frozen_setup_retains_requested_mode_without_receipt(tmp_path):
+    from coexecution.libero_dynamic.streaming_evaluation import (
+        make_streaming_episode_type,
+    )
+
+    source, options, args, item, rpc, _, _, _ = fixtures(tmp_path)
+    options.scene_drive = "frozen"  # The ordinary fixture has no carrier states.
+    result = make_streaming_episode_type(source, options)(item, args, rpc=rpc).run()
+    assert result["status"] == "error" and result["steps"] == 0
+    assert result["scene_drive"] == "frozen" and result["drive_freeze"] is None
+    audit = json.loads(Path(result["policy_audit"]).read_text())
+    assert audit["scene_drive"] == "frozen" and audit["drive_freeze"] is None
+    assert not [r for r in audit["rpc_records"] if r.get("phase") == "scored"]
+
+
 def test_physical_failure_keeps_partial_actions_rpc_events_and_media(tmp_path):
     runner, (_, _, _, _, _, endpoints, env, writers) = make_runner(tmp_path)
     env.fail_after = 42
@@ -889,16 +946,20 @@ def test_native_failure_before_receipt_does_not_invent_paid_startup(
     assert audit["cleanup_errors"] == []
 
 
+@pytest.mark.parametrize("scene_drive", ["moving", "frozen"])
 @pytest.mark.parametrize("timing_mode", ["native", "fixed"])
 @pytest.mark.parametrize("custom_speed", [False, True])
 @pytest.mark.parametrize("seed", [0, 8000, 2**32 - 1])
 def test_streaming_cli_remains_compatible_with_shared_source_arguments(
-    tmp_path, timing_mode, custom_speed, seed
+    tmp_path, timing_mode, custom_speed, seed, scene_drive
 ):
     import argparse
     import copy
 
-    from coexecution.libero_dynamic.evaluation import _source_arguments
+    from coexecution.libero_dynamic.evaluation import (
+        _source_arguments,
+        scene_drive_metadata,
+    )
     from coexecution.libero_dynamic.streaming_evaluation import (
         add_streaming_arguments,
         validate_options,
@@ -927,6 +988,8 @@ def test_streaming_cli_remains_compatible_with_shared_source_arguments(
         timing_mode,
         "--seed",
         str(seed),
+        "--scene-drive",
+        scene_drive,
     ]
     if timing_mode == "fixed":
         for stage, seconds in [
@@ -942,6 +1005,12 @@ def test_streaming_cli_remains_compatible_with_shared_source_arguments(
         )
     options = parser.parse_args(argv)
     validate_options(options)
+    assert scene_drive_metadata(options) == {
+        "scene_drive": scene_drive,
+        "scene_drive_scope": "owned_control"
+        if scene_drive == "frozen"
+        else "source_driver",
+    }
     assert not hasattr(options, "native_latency")
     source_options = copy.copy(options)
     source_options.chunk_steps = 1  # Same adapter used by evaluate_streaming.

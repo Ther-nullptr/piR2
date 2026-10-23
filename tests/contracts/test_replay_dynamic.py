@@ -191,6 +191,130 @@ def test_custom_seed_replay_rejects_mismatched_manifest_and_configuration(
         build(root, tmp_path)
 
 
+def frozen_evidence(evidence):
+    root, manifest, audit = evidence
+    snapshot = {
+        "qpos_sha256": "1" * 64,
+        "qvel_sha256": "2" * 64,
+        "qpos_shape": [20],
+        "qvel_shape": [18],
+        "qpos_dtype": "float64",
+        "qvel_dtype": "float64",
+        "physics_time_s": 4.5,
+    }
+    body = "libero_dynamic_preview_platform_0_cup"
+    receipt = {
+        "schema": "pir2.libero_dynamic.drive_freeze.v1",
+        "backend": "owned_constant_carrier_path",
+        "freeze_stage": "after_40_pre_policy_steps",
+        "target_velocity_policy": "preserve",
+        "capture_no_state_mutation": True,
+        "phase_s": 2.0,
+        "physics_time_s": 4.5,
+        "capture_state_before": deepcopy(snapshot),
+        "capture_state_after": deepcopy(snapshot),
+        "carriers": [
+            {
+                "carrier_body_name": body,
+                "carrier_joint_names": {axis: f"{body}_{axis}" for axis in "xyz"},
+                "carrier_qpos": [0, 0, 0.9],
+                "carrier_qvel": [0.001, 0, 0],
+                "target_name": "cup",
+                "target_joint": "cup_joint0",
+                "target_qpos": [0, 0, 0.95, 1, 0, 0, 0],
+                "target_qvel": [0.001, 0, 0, 0, 0, 0],
+                "original_motion": {"type": "conveyor_linear", "alpha_mps": 0.001},
+                "effective_motion": {
+                    "type": "zigzag_waypoints",
+                    "trajectory": "zigzag_waypoints",
+                    "waypoints_xyz": [[0, 0, 0]],
+                    "alpha_mps": 0.001,
+                    "loop": False,
+                },
+            }
+        ],
+    }
+    manifest.update(
+        scene_drive="frozen",
+        scene_drive_scope="owned_control",
+        condition_id="moving-case__drive_frozen",
+        parent_dynamic_condition_id="moving-case",
+        drive_freeze=receipt,
+    )
+    audit["drive_freeze"] = receipt
+    for event in audit["motion_events"]:
+        event["scene_drive"] = "frozen"
+    audit["motion_events"].insert(
+        0,
+        {
+            "kind": "drive_frozen",
+            "scene_drive": "frozen",
+            "rollout_sim_time_s": 0,
+            "physics_sim_time_s": 4.5,
+            "motion_phase_s": 2.0,
+            "drive_freeze": receipt,
+        },
+    )
+    evaluation = json.loads((root / "evaluation.json").read_text())
+    evaluation["configuration"].update(
+        scene_drive="frozen", scene_drive_scope="owned_control"
+    )
+    write(root / "evaluation.json", evaluation)
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    return root, manifest, audit
+
+
+def test_frozen_drive_replay_retains_control_identity_and_native_physical_clock(
+    evidence, tmp_path
+):
+    root, _, _ = frozen_evidence(evidence)
+    _, run, _ = build(root, tmp_path)
+    episode = run["episodes"][0]
+    assert episode["scene_drive"] == "frozen"
+    assert episode["scene_drive_scope"] == "owned_control"
+    assert episode["parent_dynamic_condition_id"] == "moving-case"
+    assert episode["drive_freeze"]["capture_no_state_mutation"] is True
+    assert episode["events"][0]["end_s"] == 0.1
+    assert episode["duration_s"] == 0.15
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda m, a: m.update(scene_drive_scope="source_driver"),
+        lambda m, a: m.update(parent_dynamic_condition_id="another-case"),
+        lambda m, a: a.update(drive_freeze=None),
+        lambda m, a: a["motion_events"][0].update(rollout_sim_time_s=0.05),
+        lambda m, a: m["drive_freeze"].update(backend="target_qpos_override"),
+        lambda m, a: m["drive_freeze"].update(freeze_stage="before_setup"),
+        lambda m, a: m["drive_freeze"].update(target_velocity_policy="zero"),
+        lambda m, a: m["drive_freeze"]["carriers"][0].update(target_qvel=[0]),
+        lambda m, a: m["drive_freeze"]["carriers"][0]["effective_motion"].update(
+            type="conveyor_linear"
+        ),
+        lambda m, a: m["drive_freeze"]["carriers"][0]["effective_motion"].update(
+            waypoints_xyz=[[1, 0, 0]]
+        ),
+        lambda m, a: m["drive_freeze"]["carriers"][0]["effective_motion"].update(
+            alpha_mps=0
+        ),
+        lambda m, a: a["motion_events"][0].update(scene_drive="moving"),
+        lambda m, a: a["motion_events"][0].update(drive_freeze=None),
+        lambda m, a: a["motion_events"][1].update(scene_drive="moving"),
+    ],
+)
+def test_frozen_drive_replay_rejects_inconsistent_control_evidence(
+    evidence, tmp_path, mutation
+):
+    root, manifest, audit = frozen_evidence(evidence)
+    mutation(manifest, audit)
+    write(root / "manifest.jsonl", manifest)
+    write(root / "audit.json", audit)
+    with pytest.raises(ValueError, match="drive|freeze"):
+        build(root, tmp_path)
+
+
 def test_dynamic_catalog_uses_recorded_sim_phases_and_independent_wall_stages(
     evidence, tmp_path
 ):

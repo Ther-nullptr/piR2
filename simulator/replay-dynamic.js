@@ -215,6 +215,12 @@
       ? e.steps / e.duration_s
       : null;
   }
+  function motionLabel(e) {
+    const speed = finite(e.speed_mps) ? e.speed_mps.toFixed(3) : "—";
+    return e.scene_drive === "frozen"
+      ? `外驱冻结对照 · 初始化驱动 ${speed} m/s`
+      : `${speed} m/s${e.speed_scope === "custom" ? "（自定义物体速度）" : ""}`;
+  }
   function startupLabel(e) {
     const ms = (v) => (finite(v) ? (v * 1000).toFixed(1) : "—");
     if (!finite(e.requested_startup_release_seconds))
@@ -243,6 +249,13 @@
     if (episode.status && episode.status !== "ok") return "回合失败";
     if (!now.event) return "无已记录阶段";
     if (now.ended) return "已结束";
+    if (
+      episode.scene_drive === "frozen" &&
+      ["bootstrap_hold", "startup_barrier", "inference_hold"].includes(
+        now.event.kind,
+      )
+    )
+      return "推理等待 · 外驱冻结";
     if (now.event.kind === "bootstrap_hold") return "启动等待 · 目标移动";
     if (now.event.kind === "startup_barrier") return "共同起点等待 · 目标移动";
     if (now.event.kind === "action" && now.event.fallback)
@@ -267,6 +280,7 @@
     modelContract,
     timingLabel,
     averageActionHz,
+    motionLabel,
     startupLabel,
     stageNfe,
     observationLabel,
