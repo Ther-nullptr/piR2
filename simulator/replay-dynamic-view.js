@@ -53,7 +53,7 @@ window.DynamicReplayView = (() => {
           ? "任务未成功"
           : "结果未知";
   const conditionLabel = (e) =>
-    `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${fmt(e.speed_mps, 3)} m/s${e.speed_scope === "custom" ? "（自定义物体速度）" : ""} · seed ${e.seed ?? "—"}`;
+    `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${fmt(e.speed_mps, 3)} m/s${e.speed_scope === "custom" ? "（自定义物体速度）" : ""} · seed ${e.seed ?? "—"}${e.seed_scope === "custom" ? "（自定义）" : ""}`;
   const streaming = (e) => e.protocol === "pir2_dynamic";
   const timingLabel = D.timingLabel;
   const runLabel = ({ run, episode: e }) =>

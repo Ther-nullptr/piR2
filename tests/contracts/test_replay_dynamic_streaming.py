@@ -301,6 +301,27 @@ def test_native_replay_preserves_each_measured_call_and_separate_rpc_boundary(
     assert requests["s1"]["parent_request_id"] == requests["bootstrap"]["id"]
 
 
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_streaming_replay_checks_custom_seed_against_run_configuration(
+    streaming_evidence, tmp_path, mismatch
+):
+    root, manifest, _ = native_evidence(streaming_evidence)
+    fields = {"seed": 8000, "init_state_id": 0, "seed_scope": "custom"}
+    manifest.update(fields)
+    evaluation = json.loads((root / "evaluation.json").read_text())
+    evaluation["configuration"].update(fields)
+    if mismatch:
+        evaluation["configuration"]["seed"] = 8001
+    write(root / "evaluation.json", evaluation)
+    write(root / "manifest.jsonl", manifest)
+    if mismatch:
+        with pytest.raises(ValueError, match="seed"):
+            build(root, tmp_path)
+    else:
+        episode = build(root, tmp_path)["episodes"][0]
+        assert {key: episode[key] for key in fields} == fields
+
+
 def aligned_native_evidence(evidence):
     root, manifest, audit = native_evidence(evidence)
     stream = audit["streaming"]

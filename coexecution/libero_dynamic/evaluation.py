@@ -94,6 +94,19 @@ def speed_metadata(options):
     }
 
 
+def seed_metadata(options):
+    """Validate explicit paired seeds while retaining the reviewed initial state."""
+    if type(options.seed) is not int or not 0 <= options.seed <= 2**32 - 1:
+        raise ValueError("seed must be an integer in [0, 2**32-1]")
+    if type(options.init_state_id) is not int or options.init_state_id != 0:
+        raise ValueError("init_state_id must be integer 0")
+    return {
+        "seed": options.seed,
+        "init_state_id": options.init_state_id,
+        "seed_scope": "default" if options.seed == 0 else "custom",
+    }
+
+
 def select_conditions(
     inventory, *, suite, task_ids, levels, traj_indices, speed_mps, custom_speed=False
 ):
@@ -582,10 +595,7 @@ def _validate_options(args):
             raise ValueError(f"{name} must be a positive integer")
     if not 1 <= args.chunk_steps <= 16:
         raise ValueError("Default GR00T uses native decoded H16; choose prefix 1..16")
-    if args.seed != 0 or args.init_state_id != 0:
-        raise ValueError(
-            "Reviewed benchmark currently requires seed=0 and init_state_id=0"
-        )
+    seed_metadata(args)
     if not 1 <= args.rpc_timeout_seconds <= (2**31 - 1) // 1000:
         raise ValueError("RPC timeout must fit positive int32 milliseconds")
     if not 1 <= args.model_port <= 65535:
@@ -708,7 +718,7 @@ def make_episode_type(source, options, session):
 
     class GrootEpisode(physical_episode):
         def __init__(self, item, args, *, policy):
-            # One process, one episode: source seed + worker_slot remains seed 0.
+            # worker_slot=0 preserves the explicitly requested source seed.
             super().__init__(item, args)
             self.policy = policy
             self.controller = None
@@ -965,6 +975,7 @@ def make_episode_type(source, options, session):
                     "timing_rule": options.timing_rule,
                     **latency_metadata(options),
                     **speed_metadata(options),
+                    **seed_metadata(options),
                     "policy_identity": self.policy.identity,
                     "raw_calibration_latency_s": None
                     if session["calibration"] is None
@@ -1040,6 +1051,7 @@ def make_episode_type(source, options, session):
 
 def prepare_conditions(options):
     """Verify clean pinned source and resolve shared physical condition coverage."""
+    initialization = seed_metadata(options)
     options.upstream = options.upstream.expanduser().resolve()
     options.output = options.output.expanduser().resolve()
     options.expected_checkpoint = options.expected_checkpoint.expanduser().resolve()
@@ -1073,6 +1085,11 @@ def prepare_conditions(options):
         speed_mps=options.speed_mps,
         custom_speed=getattr(options, "custom_speed", False),
     )
+    for condition in conditions:
+        condition.update(initialization)
+        if options.seed != 0:
+            condition.setdefault("template_condition_id", condition["condition_id"])
+            condition["condition_id"] += f"__seed{options.seed}"
     return inventory, conditions
 
 
@@ -1103,11 +1120,12 @@ def evaluate_default(options):
         {
             "schema": "pir2.libero_dynamic.default.v1",
             "status": "starting",
-            "configuration": vars(options),
+            "configuration": {**vars(options), **seed_metadata(options)},
             "upstream": inventory["upstream"],
             "conditions": conditions,
             "protocol": "default_vla_flow4",
             **speed_metadata(options),
+            **seed_metadata(options),
             "phase_contract": inventory["phase_contract"],
             **latency_metadata(options),
             "calibration_policy": None
@@ -1143,6 +1161,11 @@ def evaluate_default(options):
             )
             result = episode_type(item, args, policy=policy).run()
             result["condition_id"] = conditions[index]["condition_id"]
+            result.update(seed_metadata(options))
+            if "template_condition_id" in conditions[index]:
+                result["template_condition_id"] = conditions[index][
+                    "template_condition_id"
+                ]
             result["upstream"] = inventory["upstream"]
             _write_json(Path(result["manifest"]), result)
             results.append(result)
@@ -1154,6 +1177,7 @@ def evaluate_default(options):
                     **json.loads(summary_path.read_text()),
                     **calibration_summary(session["calibration"]),
                     **latency_metadata(options),
+                    **seed_metadata(options),
                 },
             )
             print(
@@ -1176,6 +1200,7 @@ def evaluate_default(options):
             "success_rate": sum(row["success"] for row in results) / len(results),
             **calibration_summary(session["calibration"]),
             **latency_metadata(options),
+            **seed_metadata(options),
             "raw_calibration_latency_s": None
             if options.native_latency
             else session["calibration"]["raw_latency_s"],
@@ -1196,6 +1221,7 @@ def evaluate_default(options):
                 "error": f"{type(error).__name__}: {error}",
                 "completed_episodes": len(results),
                 "calibration": session["calibration"],
+                **seed_metadata(options),
             },
         )
         raise

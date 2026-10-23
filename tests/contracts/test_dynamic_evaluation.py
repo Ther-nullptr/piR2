@@ -1066,11 +1066,15 @@ def native_options(tmp_path, *extra):
 
 
 @pytest.mark.parametrize("custom_speed", [False, True])
+@pytest.mark.parametrize("seed", [0, 8000, 2**32 - 1])
 def test_native_cli_selects_measured_source_without_fixed_or_calibration(
-    tmp_path, custom_speed
+    tmp_path, custom_speed, seed
 ):
     options = native_options(
-        tmp_path, *(["--speed-mps", ".015", "--custom-speed"] if custom_speed else [])
+        tmp_path,
+        "--seed",
+        str(seed),
+        *(["--speed-mps", ".015", "--custom-speed"] if custom_speed else []),
     )
     ev._validate_options(options)
     assert options.native_latency and not options.calibrate
@@ -1085,6 +1089,87 @@ def test_native_cli_selects_measured_source_without_fixed_or_calibration(
     assert args.latency_source == "measured_wallclock"
     assert args.calibrated_latency_seconds is None
     assert args.control_mode == "sync_hold"
+    assert args.seed == seed and args.init_state_id == 0
+
+
+@pytest.mark.parametrize("protocol", ["flow", "pir2"])
+@pytest.mark.parametrize(
+    "field,value",
+    [("seed", value) for value in (True, False, -1, 2**32, 8000.0, "8000")]
+    + [("init_state_id", value) for value in (True, False, -1, 1, 0.0, "0")],
+)
+def test_both_protocols_reject_invalid_seed_or_unsupported_initial_state(
+    tmp_path, protocol, field, value
+):
+    from coexecution.libero_dynamic import streaming_evaluation
+
+    options = native_options(tmp_path)
+    options.action_port, options.vision_port = 1001, 1002
+    options.timing_mode, options.fixed_delay = "native", None
+    setattr(options, field, value)
+    validate = (
+        ev._validate_options
+        if protocol == "flow"
+        else streaming_evaluation.validate_options
+    )
+    with pytest.raises(ValueError, match=field):
+        validate(options)
+
+
+@pytest.mark.parametrize("custom_speed", [False, True])
+@pytest.mark.parametrize("seed", [0, 8000])
+def test_prepared_seed_conditions_preserve_inventory_and_speed_template(
+    tmp_path, monkeypatch, custom_speed, seed
+):
+    options = native_options(
+        tmp_path,
+        "--task-ids",
+        "0",
+        "--levels",
+        "l1",
+        "--traj-indices",
+        "0",
+        "--seed",
+        str(seed),
+        *(["--speed-mps", ".015", "--custom-speed"] if custom_speed else []),
+    )
+    inventory = {
+        "upstream": {"actual_revision": "pinned", "expected_revision": "pinned"},
+        "conditions": [
+            {
+                "item_id": "task0-l1-traj0",
+                "condition_id": f"task0-l1-traj0__s{round(speed * 100):03d}",
+                "suite": "libero_spatial",
+                "task_id": 0,
+                "level": "l1",
+                "traj_index": 0,
+                "speed_mps": speed,
+                "seed": 0,
+                "init_state_id": 0,
+                "motion": {"alpha_mps": 0.055},
+            }
+            for speed in (0.03, 0.06, 0.09)
+        ],
+    }
+    before = copy.deepcopy(inventory)
+    monkeypatch.setattr(ev, "build_inventory", lambda *a, **kw: inventory)
+    monkeypatch.setattr(
+        ev.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout="")
+    )
+    returned_inventory, conditions = ev.prepare_conditions(options)
+    condition = conditions[0]
+    base = "task0-l1-traj0__custom_v0p015" if custom_speed else "task0-l1-traj0__s006"
+    assert condition["condition_id"] == base + (f"__seed{seed}" if seed else "")
+    assert condition["seed"] == seed and condition["init_state_id"] == 0
+    assert condition["seed_scope"] == ("custom" if seed else "default")
+    if custom_speed or seed:
+        assert condition["template_condition_id"] == (
+            "task0-l1-traj0__s003" if custom_speed else base
+        )
+    else:
+        assert "template_condition_id" not in condition
+    condition["motion"]["alpha_mps"] = 999
+    assert returned_inventory == inventory == before
 
 
 def test_custom_speed_without_flag_is_rejected_before_loading_conditions(tmp_path):
@@ -1163,9 +1248,14 @@ def test_native_requests_apply_distinct_unrounded_holds_after_unpaid_warmup(
     assert policy.calls[-1][0] == "close"
 
 
-def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch):
-    options = native_options(tmp_path, "--no-save-videos")
+@pytest.mark.parametrize("seed", [0, 8000])
+def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch, seed):
+    from coexecution.libero_dynamic import policy
+
+    options = native_options(tmp_path, "--no-save-videos", "--seed", str(seed))
     conditions = [{"item_id": "item0", "condition_id": "condition0"}]
+    if seed:
+        conditions[0]["template_condition_id"] = "official-template"
     monkeypatch.setattr(
         ev,
         "prepare_conditions",
@@ -1185,7 +1275,7 @@ def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch):
 
     class Episode:
         def __init__(self, item, args, *, policy):
-            pass
+            assert policy.seed == seed
 
         def run(self):
             return {
@@ -1196,6 +1286,9 @@ def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch):
             }
 
     monkeypatch.setattr(ev, "make_episode_type", lambda *args: Episode)
+    monkeypatch.setattr(
+        policy, "GrootChunkPolicy", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
     result = ev.evaluate_default(options)
     assert result["latency_kind"] == "measured_per_request"
     assert result["raw_calibration_latency_s"] is None
@@ -1208,3 +1301,11 @@ def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch):
         ]
         is None
     )
+    evaluation = json.loads((options.output / "evaluation.json").read_text())
+    manifest = json.loads((options.output / "item.json").read_text())
+    assert manifest.get("template_condition_id") == (
+        "official-template" if seed else None
+    )
+    for record in (result, evaluation, evaluation["configuration"], manifest):
+        assert record["seed"] == seed and record["init_state_id"] == 0
+        assert record["seed_scope"] == ("custom" if seed else "default")

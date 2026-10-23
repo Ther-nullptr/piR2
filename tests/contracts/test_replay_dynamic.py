@@ -168,6 +168,29 @@ def test_custom_speed_scope_survives_flow_normalization(evidence, tmp_path):
     assert run["episodes"][0]["template_condition_id"] == "official-template"
 
 
+def test_custom_seed_replay_preserves_paired_identity(evidence, tmp_path):
+    root, manifest, _ = evidence
+    fields = {"seed": 8000, "init_state_id": 0, "seed_scope": "custom"}
+    manifest.update(fields)
+    evaluation = json.loads((root / "evaluation.json").read_text())
+    evaluation["configuration"].update(fields)
+    write(root / "evaluation.json", evaluation)
+    write(root / "manifest.jsonl", manifest)
+    _, run, _ = build(root, tmp_path)
+    episode = run["episodes"][0]
+    assert {key: episode[key] for key in fields} == fields
+
+
+def test_custom_seed_replay_rejects_mismatched_manifest_and_configuration(
+    evidence, tmp_path
+):
+    root, manifest, _ = evidence
+    manifest.update(seed=8000, init_state_id=0, seed_scope="custom")
+    write(root / "manifest.jsonl", manifest)
+    with pytest.raises(ValueError, match="seed"):
+        build(root, tmp_path)
+
+
 def test_dynamic_catalog_uses_recorded_sim_phases_and_independent_wall_stages(
     evidence, tmp_path
 ):

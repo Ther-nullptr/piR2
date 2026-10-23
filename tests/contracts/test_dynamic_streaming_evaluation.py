@@ -413,16 +413,19 @@ def test_scored_rpc_phase_and_source_diagnostics_are_saved(tmp_path):
 
 
 @pytest.mark.parametrize("fail", [False, True, "interrupt"])
+@pytest.mark.parametrize("seed", [0, 8000])
 def test_batch_manifests_and_summary_preserve_success_or_failed_partial_episode(
-    tmp_path, monkeypatch, fail
+    tmp_path, monkeypatch, fail, seed
 ):
     from coexecution.libero_dynamic import streaming_evaluation as module
 
-    source, options, args, item, rpc, _, env, _ = fixtures(tmp_path)
+    source, options, args, item, rpc, endpoints, env, _ = fixtures(tmp_path)
     options.output = tmp_path / "batch"
     options.upstream = tmp_path / "source"
     options.action_port, options.vision_port = 1001, 1002
     options.model_host = "127.0.0.1"
+    options.seed = seed
+    args.seed = seed
     args.output_dir = options.output
     if fail:
         env.fail_after = 42
@@ -439,10 +442,13 @@ def test_batch_manifests_and_summary_preserve_success_or_failed_partial_episode(
         "upstream": {"actual_revision": "test-owned-source"},
         "phase_contract": {},
     }
+    condition = {"condition_id": "condition-1"}
+    if seed:
+        condition["template_condition_id"] = "official-template"
     monkeypatch.setattr(
         module,
         "prepare_conditions",
-        lambda options: (inventory, [{"condition_id": "condition-1"}]),
+        lambda options: (inventory, [condition]),
     )
     monkeypatch.setattr(module, "_load_runtime", lambda path: source)
     monkeypatch.setattr(module, "_source_arguments", lambda source, options: args)
@@ -462,6 +468,9 @@ def test_batch_manifests_and_summary_preserve_success_or_failed_partial_episode(
     ]
     assert len(records) == 1
     assert records[0]["condition_id"] == "condition-1"
+    assert records[0].get("template_condition_id") == (
+        "official-template" if seed else None
+    )
     assert records[0]["success"] is (not fail)
     assert records[0]["upstream"] == inventory["upstream"]
     assert Path(records[0]["policy_audit"]).is_file()
@@ -471,6 +480,19 @@ def test_batch_manifests_and_summary_preserve_success_or_failed_partial_episode(
         evaluation["status"] == summary["status"] == ("failed" if fail else "complete")
     )
     assert summary["conditions_completed"] == 1
+    for record in (evaluation, evaluation["configuration"], records[0], summary):
+        assert record["seed"] == seed and record["init_state_id"] == 0
+        assert record["seed_scope"] == ("custom" if seed else "default")
+    assert env.seed_value == seed
+    resets = [
+        data
+        for endpoint in endpoints.values()
+        for name, data in endpoint.calls
+        if name == "reset"
+    ]
+    assert resets[-1]["options"]["seed"] == seed
+    bootstraps = [data for name, data in endpoints[1001].calls if name == "bootstrap"]
+    assert bootstraps[-1]["seed"] == seed
 
 
 def test_native_setup_failure_stops_before_any_scored_rpc(tmp_path):
@@ -869,8 +891,9 @@ def test_native_failure_before_receipt_does_not_invent_paid_startup(
 
 @pytest.mark.parametrize("timing_mode", ["native", "fixed"])
 @pytest.mark.parametrize("custom_speed", [False, True])
+@pytest.mark.parametrize("seed", [0, 8000, 2**32 - 1])
 def test_streaming_cli_remains_compatible_with_shared_source_arguments(
-    tmp_path, timing_mode, custom_speed
+    tmp_path, timing_mode, custom_speed, seed
 ):
     import argparse
     import copy
@@ -902,6 +925,8 @@ def test_streaming_cli_remains_compatible_with_shared_source_arguments(
         "0.06",
         "--timing-mode",
         timing_mode,
+        "--seed",
+        str(seed),
     ]
     if timing_mode == "fixed":
         for stage, seconds in [
@@ -934,6 +959,7 @@ def test_streaming_cli_remains_compatible_with_shared_source_arguments(
     assert runtime_args.calibrated_latency_seconds == 0
     assert options.timing_mode == timing_mode
     assert options.startup_release_seconds == (0.4 if custom_speed else None)
+    assert runtime_args.seed == seed and runtime_args.init_state_id == 0
 
 
 @pytest.mark.parametrize("seconds", [0, -0.1, True, float("nan"), float("inf")])

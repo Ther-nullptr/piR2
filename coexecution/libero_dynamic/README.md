@@ -19,6 +19,8 @@ python -m coexecution.libero_dynamic inventory \
 
 源码固定在 `1e5845720643da281c47bf4423ae99e115976a13`。清单验证上游评审配置哈希，保存任务、轨迹、速度和来源；它只读取配置，不执行模型或仿真。仿真使用独立 Python3.10 环境、robosuite1.4.0、MuJoCo2.3.7及EGL，模型继续使用现有 CUDA 环境。依赖见 [requirements-simulation.txt](requirements-simulation.txt)，其中 termcolor 显式补齐 robosuite 的日志依赖。PyTorch 使用适合目标驱动的 CUDA 构建，模型环境与仿真环境分开。初始化、接触和位姿校验通过后再开展模型评测。
 
+默认使用 `seed=0`、`init_state_id=0`。配对其他已测种子时，可显式传入 `--seed 8000`；支持0至2³²−1的整数，初态索引仍限定为0。非零seed记录为 `seed_scope=custom`，条件ID追加 `__seed8000` 并保留原模板来源，前端显示实际seed。官方1800项清单和默认ID保持不变；自定义seed结果单独统计。例如原始静态入口对task8使用基础seed0加task_id×1000，动态跟进应显式设8000，不能将seed0录像标成同一随机种子的配对。
+
 ## 必须显式区分的时间与静态对照
 
 论文附录将延迟量化为 `ceil(latency ×20)` 个控制周期；发布代码的载体 preview 路线按精确延迟秒数推进 MuJoCo 子步，并锁住机器人关节。60ms 在两者中分别对应100ms和60ms，实验身份须注明选择。默认执行预算600步只统计控制动作，同步等待另计物理时间。
@@ -144,7 +146,7 @@ python -m coexecution.libero_dynamic evaluate-pir2 \
 
 πR² 的量化对照仍加载同一已有πR² checkpoint。paired服务设置 `--inference-precision w8a8 --quantization-scope all`，评测设置 `--precision w8a8`，并使用独立输出目录。默认原生对照保持承诺策略、场景和初态一致，每种精度使用各自真实请求耗时；启动等待也各自实测，因此启动后世界状态可以不同，并会记录新的观测指纹。需要单独隔离动作数值变化时才显式采用fixed控制。不能沿用默认Flow4的整轮延迟代替πR²阶段耗时。RPC身份中的 `inference_optimization.coverage` 记录实际转换的VLM和动作侧模块。πR²可以使用分DiT CUDA Graph；整段 `--action-cuda-graph` 和 `--group-conditioning` 属于Flow路径，服务会拒绝将它们用于πR²。
 
-初始化沿用同一任务、轨迹、速度、seed0/init0 和40个真实 pre-policy 步。默认每场景预热8轮；responsive 调度逐轮覆盖 d=1..5，`--fixed-delay d` 只预热该 d。每次预热执行真实 bootstrap→S2→S1，世界时间保持不变，记录均标为 warmup。`--warmup-requests 0` 可用于明确不预热的诊断。正式开始时重新 bootstrap/reset seed；启动的真实 VLM1/DiT4 按该次实测耗时（fixed模式按指定参数）只冻结机器人并推进移动世界，随后强制读取新状态。bootstrap 图像保留原 capture，不能将它改写为启动等待后的新时间。
+初始化沿用同一任务、轨迹、速度、所选seed（默认0）/init0 和40个真实 pre-policy 步。默认每场景预热8轮；responsive 调度逐轮覆盖 d=1..5，`--fixed-delay d` 只预热该 d。每次预热执行真实 bootstrap→S2→S1，世界时间保持不变，记录均标为 warmup。`--warmup-requests 0` 可用于明确不预热的诊断。正式开始时重新 bootstrap/reset seed；启动的真实 VLM1/DiT4 按该次实测耗时（fixed模式按指定参数）只冻结机器人并推进移动世界，随后强制读取新状态。bootstrap 图像保留原 capture，不能将它改写为启动等待后的新时间。
 
 之后每50ms执行一个真实动作，物体持续运动；S1/S2 等待与这些物理步重叠，不再额外增加 hold。S1 使用已发布的 S2 特征和当前状态，正常1NFE，全 H40 缓冲失效时恢复5NFE；native模式直接测量本次恢复调用，fixed模式才使用独立的 `recovery-latency-seconds`。每次先承诺 `[r,r+d)` 前缀，输出只属于原始 `[r+d,r+2d)`；过期动作原位丢弃，已承诺动作受保护，队列耗尽执行零位移并保持夹爪的 fallback，仍推进真实物理。
 
