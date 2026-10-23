@@ -9,9 +9,175 @@ block to the requested duration. No free object or task joint is held by it.
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 
 import numpy as np
+
+
+def scene_drive_metadata(options):
+    """Declare the external-drive intervention separately from timing/precision."""
+    mode = getattr(options, "scene_drive", "moving")
+    if mode not in ("moving", "frozen"):
+        raise ValueError("scene_drive must be moving or frozen")
+    return {
+        "scene_drive": mode,
+        "scene_drive_scope": "source_driver" if mode == "moving" else "owned_control",
+    }
+
+
+def _joint_snapshot(sim):
+    qpos = np.array(sim.data.qpos, copy=True)
+    qvel = np.array(sim.data.qvel, copy=True)
+    if not np.isfinite(qpos).all() or not np.isfinite(qvel).all():
+        raise ValueError("Frozen-drive capture requires finite physical state")
+    return {
+        "qpos_sha256": hashlib.sha256(qpos.tobytes()).hexdigest(),
+        "qvel_sha256": hashlib.sha256(qvel.tobytes()).hexdigest(),
+        "qpos_shape": list(qpos.shape),
+        "qvel_shape": list(qvel.shape),
+        "qpos_dtype": str(qpos.dtype),
+        "qvel_dtype": str(qvel.dtype),
+        "physics_time_s": float(sim.data.time),
+    }
+
+
+def freeze_preview_states(env, states, *, phase_s):
+    """Return detached constant-path carrier states without writing physics.
+
+    The pinned preview driver treats a single waypoint as a constant offset.
+    Its existing action and exact-duration hold loops consequently prescribe
+    the captured carrier positions with zero carrier velocity. Free targets
+    retain their actual qpos/qvel and remain subject to contact and gravity.
+    """
+    if (
+        type(phase_s) not in (int, float)
+        or not math.isfinite(phase_s)
+        or phase_s < 0
+        or not isinstance(states, list)
+        or not states
+    ):
+        raise ValueError("Frozen drive requires preview states and a finite phase")
+    sim, cloned, carriers = env.sim, [], []
+    before = _joint_snapshot(sim)
+    if not math.isfinite(before["physics_time_s"]) or before["physics_time_s"] < 0:
+        raise ValueError("Frozen-drive capture requires a finite physics time")
+    seen_bodies, seen_joints, seen_targets = set(), set(), set()
+    for state in states:
+        platform = state.get("platform") or {}
+        body = platform.get("body_name")
+        target = state.get("joint")
+        motion = state.get("motion") or {}
+        speed = motion.get("alpha_mps")
+        if (
+            state.get("is_joint") is not False
+            or state.get("is_body_yaw", False)
+            or state.get("is_body_translation", False)
+            or state.get("carrier_type")
+            not in (
+                "physical_conveyor_patch",
+                "physical_platform",
+                "freejoint_platform",
+            )
+            or platform.get("kinematic_mode") != "slide_joints"
+            or not isinstance(body, str)
+            or not body.startswith("libero_dynamic_preview_platform_")
+            or body in seen_bodies
+            or not isinstance(target, str)
+            or target.startswith(("robot0_", "gripper0_"))
+            or target in seen_targets
+            or type(speed) not in (int, float)
+            or not math.isfinite(speed)
+            or speed <= 0
+        ):
+            raise ValueError("Frozen drive supports physical slide-joint carriers only")
+        names = platform.get("joint_names")
+        if not isinstance(names, dict) or set(names) != set("xyz"):
+            raise ValueError("Frozen carrier requires explicit x/y/z slide joints")
+        try:
+            body_id = int(sim.model.body_name2id(body))
+            target_id = int(sim.model.joint_name2id(target))
+            if int(sim.model.jnt_type[target_id]) != 0:
+                raise ValueError("Frozen-drive target must remain a free joint")
+            positions, velocities = [], []
+            for axis in "xyz":
+                name = names[axis]
+                if name != f"{body}_{axis}" or name in seen_joints:
+                    raise ValueError("Frozen carrier joint ownership is ambiguous")
+                joint_id = int(sim.model.joint_name2id(name))
+                if (
+                    int(sim.model.jnt_type[joint_id]) != 2
+                    or int(sim.model.jnt_bodyid[joint_id]) != body_id
+                ):
+                    raise ValueError(
+                        "Frozen carrier joints must be its own slide joints"
+                    )
+                positions.append(float(sim.data.get_joint_qpos(name)))
+                velocities.append(float(sim.data.get_joint_qvel(name)))
+            qpos = np.array(sim.data.get_joint_qpos(target), dtype=float, copy=True)
+            qvel = np.array(sim.data.get_joint_qvel(target), dtype=float, copy=True)
+        except (KeyError, IndexError, TypeError, AttributeError) as error:
+            raise ValueError("Frozen carrier state cannot be resolved") from error
+        if (
+            qpos.shape != (7,)
+            or qvel.shape != (6,)
+            or not all(
+                np.isfinite(v).all() for v in (positions, velocities, qpos, qvel)
+            )
+        ):
+            raise ValueError("Frozen carrier/target state must be finite and complete")
+        seen_bodies.add(body)
+        seen_targets.add(target)
+        seen_joints.update(names.values())
+        effective_motion = {
+            "type": "zigzag_waypoints",
+            "trajectory": "zigzag_waypoints",
+            "waypoints_xyz": [[0.0, 0.0, 0.0]],
+            "alpha_mps": float(speed),
+            "loop": False,
+        }
+        candidate = copy.deepcopy(state)
+        candidate.update(
+            motion=effective_motion,
+            base_qpos=qpos,
+            platform_base_pos=np.array(positions, dtype=float),
+            object_base_xy=qpos[:2].copy(),
+            object_base_z=float(qpos[2]),
+            intended_base_xy=qpos[:2].copy(),
+            object_to_platform_xy=qpos[:2] - np.asarray(positions[:2]),
+            last_applied_offset=np.zeros(3),
+            last_offset=np.zeros(3),
+        )
+        cloned.append(candidate)
+        carriers.append(
+            {
+                "target_name": state.get("name"),
+                "target_joint": target,
+                "target_qpos": qpos.tolist(),
+                "target_qvel": qvel.tolist(),
+                "carrier_body_name": body,
+                "carrier_joint_names": dict(names),
+                "carrier_qpos": positions,
+                "carrier_qvel": velocities,
+                "original_motion": copy.deepcopy(motion),
+                "effective_motion": copy.deepcopy(effective_motion),
+            }
+        )
+    after = _joint_snapshot(sim)
+    if before != after:
+        raise RuntimeError("Frozen-drive capture changed physical state")
+    return cloned, {
+        "schema": "pir2.libero_dynamic.drive_freeze.v1",
+        "backend": "owned_constant_carrier_path",
+        "phase_s": float(phase_s),
+        "physics_time_s": before["physics_time_s"],
+        "freeze_stage": "after_40_pre_policy_steps",
+        "target_velocity_policy": "preserve",
+        "capture_no_state_mutation": True,
+        "capture_state_before": before,
+        "capture_state_after": after,
+        "carriers": carriers,
+    }
 
 
 class NativeFixtureTiming:

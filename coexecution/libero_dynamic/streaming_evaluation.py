@@ -29,6 +29,7 @@ from .evaluation import (
     add_scene_arguments,
     observation_fingerprint,
     prepare_conditions,
+    scene_drive_metadata,
     seed_metadata,
     speed_metadata,
 )
@@ -97,6 +98,7 @@ def validate_options(options):
     if type(options.warmup_requests) is not int or options.warmup_requests < 0:
         raise ValueError("warmup_requests must be nonnegative")
     seed_metadata(options)
+    scene_drive_metadata(options)
     if options.fixed_delay is not None and options.fixed_delay not in range(1, 6):
         raise ValueError("Fixed delay must be in 1..5")
     if (
@@ -517,6 +519,8 @@ def make_streaming_episode_type(source, options):
                 "rpc_records": self.rpc.records,
                 "action_attempts": attempts,
                 "motion_events": self.motion_events,
+                **scene_drive_metadata(options),
+                "drive_freeze": self.drive_freeze,
                 "observation_registry": self.observed_objects,
                 "latency_backend": self.latency_backend,
                 "fixture_timing": None
@@ -572,6 +576,7 @@ def make_streaming_episode_type(source, options):
                 "precision": options.precision,
                 **speed_metadata(options),
                 **seed_metadata(options),
+                **scene_drive_metadata(options),
                 **timing,
                 "resource_model": "independent_stage_service",
                 "compute_coupling": "serialized_gpu_simulation",
@@ -584,6 +589,7 @@ def make_streaming_episode_type(source, options):
                 "physical_started_s": start_physics,
                 "physical_completed_s": end_physics,
                 "setup_counts": setup_counts,
+                "drive_freeze": self.drive_freeze,
                 "warmup_rounds": options.warmup_requests,
                 "logical_epoch_s": None if controller is None else controller.epoch_s,
                 "video_frame_count": min(videos.frame_counts),
@@ -629,12 +635,17 @@ def evaluate_streaming(options):
     evaluation = {
         "schema": "pir2.libero_dynamic.streaming_evaluation.v1",
         "status": "starting",
-        "configuration": {**vars(options), **seed_metadata(options)},
+        "configuration": {
+            **vars(options),
+            **seed_metadata(options),
+            **scene_drive_metadata(options),
+        },
         "upstream": inventory["upstream"],
         "conditions": conditions,
         "protocol": "pir2_dynamic",
         **speed_metadata(options),
         **seed_metadata(options),
+        **scene_drive_metadata(options),
         "phase_contract": inventory["phase_contract"],
         **timing,
         "resource_model": "independent_stage_service",
@@ -697,7 +708,12 @@ def evaluate_streaming(options):
                     condition_id=conditions[index]["condition_id"],
                     upstream=inventory["upstream"],
                     **seed_metadata(options),
+                    **scene_drive_metadata(options),
                 )
+                if "parent_dynamic_condition_id" in conditions[index]:
+                    result["parent_dynamic_condition_id"] = conditions[index][
+                        "parent_dynamic_condition_id"
+                    ]
                 if "template_condition_id" in conditions[index]:
                     result["template_condition_id"] = conditions[index][
                         "template_condition_id"
@@ -726,6 +742,7 @@ def evaluate_streaming(options):
                         "successes": sum(row["success"] for row in results),
                         **timing,
                         **seed_metadata(options),
+                        **scene_drive_metadata(options),
                     },
                 )
                 if interrupted is not None:
@@ -757,6 +774,7 @@ def evaluate_streaming(options):
                 "status": "failed",
                 **timing,
                 **seed_metadata(options),
+                **scene_drive_metadata(options),
                 "protocol": "pir2_dynamic",
                 "conditions_completed": len(results),
                 "successes": sum(row["success"] for row in results),

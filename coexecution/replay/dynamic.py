@@ -396,6 +396,231 @@ def _seed_fields(manifest, config):
     return {**fields, "seed_scope": config["seed_scope"]}
 
 
+def _drive_fields(manifest, config, audit):
+    """Keep the external-drive intervention separate from model/physics timing."""
+    mode = config.get("scene_drive", manifest.get("scene_drive", "moving"))
+    if mode not in ("moving", "frozen"):
+        raise ValueError("Unknown scene drive in replay")
+    scope = "source_driver" if mode == "moving" else "owned_control"
+    for record in (manifest, config, audit):
+        if (
+            record.get("scene_drive", mode) != mode
+            or record.get("scene_drive_scope", scope) != scope
+        ):
+            raise ValueError("Scene drive declaration disagrees with its evidence")
+    receipt = manifest.get("drive_freeze")
+    if audit.get("drive_freeze") != receipt:
+        raise ValueError("Scene drive freeze receipt disagrees with its audit")
+    freezes = [
+        r for r in audit.get("motion_events", []) if r.get("kind") == "drive_frozen"
+    ]
+    if mode == "moving":
+        if receipt is not None or freezes:
+            raise ValueError("Moving scene drive cannot contain a freeze receipt")
+    else:
+        parent = manifest.get("parent_dynamic_condition_id")
+        if (
+            not isinstance(parent, str)
+            or not parent
+            or manifest.get("condition_id") != parent + "__drive_frozen"
+        ):
+            raise ValueError("Frozen scene drive requires its parent dynamic condition")
+        if receipt is None:
+            recorded_physics = any(
+                r.get("kind") in ("hold_started", "hold_completed", "action_completed")
+                for r in audit.get("motion_events", [])
+            )
+            if manifest.get("status") == "ok" or recorded_physics or freezes:
+                raise ValueError(
+                    "Frozen scene drive requires a successful freeze receipt"
+                )
+        else:
+            _validate_drive_freeze(receipt)
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("capture_no_state_mutation") is not True
+            ):
+                raise ValueError(
+                    "Scene drive freeze must preserve captured physical state"
+                )
+            before, after = (
+                receipt.get("capture_state_before"),
+                receipt.get("capture_state_after"),
+            )
+            if not before or before != after or not receipt.get("carriers"):
+                raise ValueError(
+                    "Scene drive freeze state fingerprints are missing or differ"
+                )
+            if len(freezes) != 1:
+                raise ValueError("Scene drive freeze requires one recorded activation")
+            event = freezes[0]
+            if (
+                event.get("scene_drive") != "frozen"
+                or event.get("drive_freeze") != receipt
+                or any(
+                    row.get("scene_drive") != "frozen"
+                    for row in audit.get("motion_events", [])
+                    if row.get("kind")
+                    in (
+                        "initial_observation",
+                        "hold_started",
+                        "hold_completed",
+                        "action_completed",
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Scene drive freeze activation or physical phases disagree"
+                )
+            if _number(event.get("rollout_sim_time_s")) != 0 or any(
+                not math.isclose(
+                    _number(event.get(event_key)),
+                    _number(receipt.get(receipt_key)),
+                    abs_tol=1e-8,
+                    rel_tol=0,
+                )
+                for event_key, receipt_key in (
+                    ("physics_sim_time_s", "physics_time_s"),
+                    ("motion_phase_s", "phase_s"),
+                )
+            ):
+                raise ValueError(
+                    "Scene drive freeze must begin at the matched initial scene"
+                )
+    return {
+        "scene_drive": mode,
+        "scene_drive_scope": scope,
+        "drive_freeze": receipt,
+        "parent_dynamic_condition_id": manifest.get("parent_dynamic_condition_id"),
+    }
+
+
+def _validate_drive_freeze(receipt):
+    """Validate the new owned-control contract before labeling a scene frozen."""
+    declared = {
+        "schema": "pir2.libero_dynamic.drive_freeze.v1",
+        "backend": "owned_constant_carrier_path",
+        "freeze_stage": "after_40_pre_policy_steps",
+        "target_velocity_policy": "preserve",
+        "capture_no_state_mutation": True,
+    }
+    if not isinstance(receipt, dict) or any(
+        receipt.get(k) != v for k, v in declared.items()
+    ):
+        raise ValueError(
+            "Scene drive freeze receipt violates the declared control contract"
+        )
+
+    def vector(value, length):
+        return (
+            isinstance(value, list)
+            and len(value) == length
+            and all(type(v) in (int, float) and math.isfinite(v) for v in value)
+        )
+
+    def digest_value(value):
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value)
+        )
+
+    before, after = (
+        receipt.get("capture_state_before"),
+        receipt.get("capture_state_after"),
+    )
+    if not isinstance(before, dict) or before != after:
+        raise ValueError(
+            "Scene drive freeze needs unchanged physical state fingerprints"
+        )
+    for key in ("qpos", "qvel"):
+        shape = before.get(key + "_shape")
+        if (
+            not digest_value(before.get(key + "_sha256"))
+            or not isinstance(shape, list)
+            or len(shape) != 1
+            or type(shape[0]) is not int
+            or shape[0] <= 0
+            or before.get(key + "_dtype") not in ("float32", "float64")
+        ):
+            raise ValueError("Scene drive freeze fingerprint shape/dtype is incomplete")
+    if not math.isclose(
+        _number(before.get("physics_time_s")),
+        _number(receipt.get("physics_time_s")),
+        rel_tol=0,
+        abs_tol=1e-8,
+    ):
+        raise ValueError("Scene drive freeze capture time disagrees")
+    carriers = receipt.get("carriers")
+    if not isinstance(carriers, list) or not carriers:
+        raise ValueError("Scene drive freeze requires captured carriers")
+    bodies, joints, targets = set(), set(), set()
+    for carrier in carriers:
+        if not isinstance(carrier, dict):
+            raise TypeError("Scene drive freeze carrier state is invalid")
+        body, target = carrier.get("carrier_body_name"), carrier.get("target_joint")
+        names = carrier.get("carrier_joint_names")
+        if (
+            not isinstance(body, str)
+            or not body.startswith("libero_dynamic_preview_platform_")
+            or body in bodies
+            or not isinstance(target, str)
+            or not target
+            or target.startswith(("robot0_", "gripper0_"))
+            or target in targets
+            or not isinstance(carrier.get("target_name"), str)
+            or not carrier["target_name"]
+            or not isinstance(names, dict)
+            or set(names) != set("xyz")
+            or any(
+                names[axis] != f"{body}_{axis}" or names[axis] in joints
+                for axis in "xyz"
+            )
+            or target in names.values()
+            or any(
+                not vector(carrier.get(key), length)
+                for key, length in (
+                    ("carrier_qpos", 3),
+                    ("carrier_qvel", 3),
+                    ("target_qpos", 7),
+                    ("target_qvel", 6),
+                )
+            )
+        ):
+            raise ValueError(
+                "Scene drive freeze needs complete, independent carrier/target state"
+            )
+        bodies.add(body)
+        targets.add(target)
+        joints.update(names.values())
+        original, effective = (
+            carrier.get("original_motion"),
+            carrier.get("effective_motion"),
+        )
+        if not isinstance(original, dict) or not isinstance(effective, dict):
+            raise TypeError("Scene drive freeze needs original and effective paths")
+        speed = effective.get("alpha_mps")
+        points = effective.get("waypoints_xyz")
+        if (
+            set(effective)
+            != {"type", "trajectory", "waypoints_xyz", "alpha_mps", "loop"}
+            or effective.get("type") != "zigzag_waypoints"
+            or effective.get("trajectory") != "zigzag_waypoints"
+            or effective.get("loop") is not False
+            or type(speed) not in (int, float)
+            or not math.isfinite(speed)
+            or speed <= 0
+            or original.get("alpha_mps") != speed
+            or not isinstance(points, list)
+            or len(points) != 1
+            or not vector(points[0], 3)
+            or any(value != 0 for value in points[0])
+        ):
+            raise ValueError(
+                "Scene drive freeze effective path must be a single constant zero offset"
+            )
+
+
 def _frames(audit, episode_id, duration, events):
     frames = []
     previous_sim = previous_media = -1.0
@@ -574,6 +799,7 @@ def _episode(root, manifest, config, media, run_id):
             )
         },
         **_seed_fields(manifest, config),
+        **_drive_fields(manifest, config, audit),
         "duration_s": duration,
         "clock": "rollout_sim_time_s",
         "control_freq": freq,

@@ -53,7 +53,7 @@ window.DynamicReplayView = (() => {
           ? "任务未成功"
           : "结果未知";
   const conditionLabel = (e) =>
-    `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${fmt(e.speed_mps, 3)} m/s${e.speed_scope === "custom" ? "（自定义物体速度）" : ""} · seed ${e.seed ?? "—"}${e.seed_scope === "custom" ? "（自定义）" : ""}`;
+    `${e.suite} / task ${e.task_id} · ${e.level} / traj ${e.traj_index} · ${D.motionLabel(e)} · seed ${e.seed ?? "—"}${e.seed_scope === "custom" ? "（自定义）" : ""}`;
   const streaming = (e) => e.protocol === "pir2_dynamic";
   const timingLabel = D.timingLabel;
   const runLabel = ({ run, episode: e }) =>
@@ -78,7 +78,7 @@ window.DynamicReplayView = (() => {
       : e.kind === "s2"
         ? `观测 tick ${e.source.source_tick}`
         : e.kind === "bootstrap_hold"
-          ? "启动 · 物体持续运动"
+          ? "启动 · 物理推进"
           : e.kind === "startup_barrier"
             ? "调用已完成 · 等待共同起点"
             : e.producer_kind === "request"
@@ -216,7 +216,12 @@ window.DynamicReplayView = (() => {
             ["action", "动作执行 / 启动等待"],
           ]
         : [
-            ["inference_hold", "推理等待 · 物体运动"],
+            [
+              "inference_hold",
+              e.scene_drive === "frozen"
+                ? "推理等待 · 外驱冻结"
+                : "推理等待 · 物体运动",
+            ],
             ["action", "动作执行 · 物理推进"],
           ];
       for (const [kind, label] of lanes) {
@@ -305,7 +310,7 @@ window.DynamicReplayView = (() => {
           )
           .join(
             "",
-          )}</tbody></table><p>物体位姿来自物理记录；推理等待期间机器人保持，目标继续运动。source_tick 只计已执行动作，排除等待子步。</p></div>`;
+          )}</tbody></table><p>位姿来自物理记录；推理等待时机器人保持。外驱冻结对照中的自由物体仍参与物理。source_tick 只计已执行动作，排除等待子步。</p></div>`;
       })
       .join("");
   }
@@ -429,7 +434,7 @@ window.DynamicReplayView = (() => {
     $("evidence-note").textContent =
       "主轴：物理仿真时间。推理：真实模型调用，各配置标明逐请求实测或固定延迟。GPU 推理与物理计算实际串行；πR² 的 S1/S2 重叠表示逻辑调度，不能作为真实墙钟并发性能。模型使用本项目已有 GR00T 权重。";
     $("timeline-note").textContent =
-      "主轴为物理仿真时间，GPU / 物理实际串行。Bootstrap hold 为启动调用等待；Startup barrier 为调用完成后等待共同起点，两段期间物体持续运动，S1/S2 后续时长不对齐。视频帧率与每步50ms的物理步长分别计数；回合平均动作频率包含启动和推理等待。点击 S1 关联 S2，点击动作关联实际生产请求。";
+      "主轴为物理仿真时间，GPU / 物理实际串行。Bootstrap hold 为启动调用等待；Startup barrier 为等待共同起点，两段都推进物理，S1/S2 后续时长不对齐。外驱冻结是保留动态布局的独立对照，自由物体仍参与物理。视频帧率与每步50ms的物理步长分别计数；回合平均动作频率包含等待。点击 S1 或动作追踪实际来源。";
     document.querySelector(".timeline-section h2").textContent =
       "LIBERO-Dynamic · 物理时间与动作来源";
     $("curve-title").textContent = "真实 VLM → DiT · 独立 Wall 时间";

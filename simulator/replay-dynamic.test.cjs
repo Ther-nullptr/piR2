@@ -323,6 +323,14 @@ test("average action rate includes inference and startup holds, not video frames
   assert.equal(D.averageActionHz({ steps: 100, duration_s: null }), null);
 });
 
+test("frozen-drive controls name parent speed and never claim continuing external motion", () => {
+  const e = { scene_drive: "frozen", speed_mps: 0.001, status: "ok" };
+  assert.match(D.motionLabel(e), /外驱冻结.*初始化.*0\.001/);
+  for (const kind of ["inference_hold", "bootstrap_hold", "startup_barrier"])
+    assert.match(D.phaseLabel({ event: { kind } }, e), /外驱冻结/);
+  assert.match(D.motionLabel({ speed_mps: 0.03 }), /0\.030 m\/s/);
+});
+
 test("S1 state tick and S2 image tick have distinct labels and RPC boundary", () => {
   assert.equal(
     D.observationLabel({ lane: "s1", request_tick: 9, feature_source_tick: 3 }),

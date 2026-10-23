@@ -1116,10 +1116,11 @@ def test_both_protocols_reject_invalid_seed_or_unsupported_initial_state(
         validate(options)
 
 
+@pytest.mark.parametrize("scene_drive", ["moving", "frozen"])
 @pytest.mark.parametrize("custom_speed", [False, True])
 @pytest.mark.parametrize("seed", [0, 8000])
 def test_prepared_seed_conditions_preserve_inventory_and_speed_template(
-    tmp_path, monkeypatch, custom_speed, seed
+    tmp_path, monkeypatch, custom_speed, seed, scene_drive
 ):
     options = native_options(
         tmp_path,
@@ -1131,6 +1132,8 @@ def test_prepared_seed_conditions_preserve_inventory_and_speed_template(
         "0",
         "--seed",
         str(seed),
+        "--scene-drive",
+        scene_drive,
         *(["--speed-mps", ".015", "--custom-speed"] if custom_speed else []),
     )
     inventory = {
@@ -1159,7 +1162,17 @@ def test_prepared_seed_conditions_preserve_inventory_and_speed_template(
     returned_inventory, conditions = ev.prepare_conditions(options)
     condition = conditions[0]
     base = "task0-l1-traj0__custom_v0p015" if custom_speed else "task0-l1-traj0__s006"
-    assert condition["condition_id"] == base + (f"__seed{seed}" if seed else "")
+    moving_id = base + (f"__seed{seed}" if seed else "")
+    assert condition["condition_id"] == moving_id + (
+        "__drive_frozen" if scene_drive == "frozen" else ""
+    )
+    assert condition["scene_drive"] == scene_drive
+    assert condition["scene_drive_scope"] == (
+        "owned_control" if scene_drive == "frozen" else "source_driver"
+    )
+    assert condition.get("parent_dynamic_condition_id") == (
+        moving_id if scene_drive == "frozen" else None
+    )
     assert condition["seed"] == seed and condition["init_state_id"] == 0
     assert condition["seed_scope"] == ("custom" if seed else "default")
     if custom_speed or seed:
@@ -1248,12 +1261,22 @@ def test_native_requests_apply_distinct_unrounded_holds_after_unpaid_warmup(
     assert policy.calls[-1][0] == "close"
 
 
+@pytest.mark.parametrize("scene_drive", ["moving", "frozen"])
 @pytest.mark.parametrize("seed", [0, 8000])
-def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch, seed):
+def test_native_batch_summary_has_no_scalar_calibration(
+    tmp_path, monkeypatch, seed, scene_drive
+):
     from coexecution.libero_dynamic import policy
 
-    options = native_options(tmp_path, "--no-save-videos", "--seed", str(seed))
+    options = native_options(
+        tmp_path, "--no-save-videos", "--seed", str(seed), "--scene-drive", scene_drive
+    )
     conditions = [{"item_id": "item0", "condition_id": "condition0"}]
+    if scene_drive == "frozen":
+        conditions[0].update(
+            condition_id="condition0__drive_frozen",
+            parent_dynamic_condition_id="condition0",
+        )
     if seed:
         conditions[0]["template_condition_id"] = "official-template"
     monkeypatch.setattr(
@@ -1309,3 +1332,10 @@ def test_native_batch_summary_has_no_scalar_calibration(tmp_path, monkeypatch, s
     for record in (result, evaluation, evaluation["configuration"], manifest):
         assert record["seed"] == seed and record["init_state_id"] == 0
         assert record["seed_scope"] == ("custom" if seed else "default")
+        assert record["scene_drive"] == scene_drive
+        assert record["scene_drive_scope"] == (
+            "owned_control" if scene_drive == "frozen" else "source_driver"
+        )
+    assert manifest.get("parent_dynamic_condition_id") == (
+        "condition0" if scene_drive == "frozen" else None
+    )

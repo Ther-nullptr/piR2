@@ -25,6 +25,7 @@ import numpy as np
 
 from .catalog import LEVELS, SPEEDS_MPS, SUITES, build_inventory
 from .physical import make_physical_episode_type
+from .world import scene_drive_metadata
 
 TIMING_RULES = ("release_continuous_sync", "paper_quantized_sync")
 NATIVE_LATENCY_BOUNDARY = (
@@ -558,6 +559,12 @@ def add_scene_arguments(parser):
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init-state-id", type=int, default=0)
+    parser.add_argument(
+        "--scene-drive",
+        choices=("moving", "frozen"),
+        default="moving",
+        help="Keep source motion, or freeze external slide-joint carrier paths after the same 40 pre-policy steps",
+    )
     parser.add_argument("--camera-size", type=int, default=256)
     parser.add_argument("--video-fps", type=float, default=60)
     parser.add_argument(
@@ -596,6 +603,7 @@ def _validate_options(args):
     if not 1 <= args.chunk_steps <= 16:
         raise ValueError("Default GR00T uses native decoded H16; choose prefix 1..16")
     seed_metadata(args)
+    scene_drive_metadata(args)
     if not 1 <= args.rpc_timeout_seconds <= (2**31 - 1) // 1000:
         raise ValueError("RPC timeout must fit positive int32 milliseconds")
     if not 1 <= args.model_port <= 65535:
@@ -949,6 +957,8 @@ def make_episode_type(source, options, session):
                         "records": self.policy.records,
                         "chunks": self.chunk_events,
                         "motion_events": self.motion_events,
+                        **scene_drive_metadata(options),
+                        "drive_freeze": self.drive_freeze,
                         "observation_registry": self.observed_objects,
                         "latency_backend": self.latency_backend,
                         "fixture_timing": None
@@ -976,6 +986,8 @@ def make_episode_type(source, options, session):
                     **latency_metadata(options),
                     **speed_metadata(options),
                     **seed_metadata(options),
+                    **scene_drive_metadata(options),
+                    "drive_freeze": self.drive_freeze,
                     "policy_identity": self.policy.identity,
                     "raw_calibration_latency_s": None
                     if session["calibration"] is None
@@ -1011,7 +1023,11 @@ def make_episode_type(source, options, session):
                     if self.fixture_timing is None
                     else self.fixture_timing.driver_evidence,
                     "world_contract": (
-                        "Physical carriers move throughout controls and robot-held inference latency. "
+                        "Owned constant carrier paths preserve the captured layout; free targets retain contact and gravity during actions and inference holds. "
+                        if self.drive_freeze is not None
+                        else "Requested external-drive freeze was not installed; see the recorded failure. "
+                        if self.drive_mode == "frozen"
+                        else "Physical carriers move throughout controls and robot-held inference latency. "
                         if self.use_preview
                         else "Source-native fixture body controls; owned exact-duration robot-held latency, "
                         "with final 10 ms fixture update block shortened to the actual remainder. "
@@ -1052,6 +1068,7 @@ def make_episode_type(source, options, session):
 def prepare_conditions(options):
     """Verify clean pinned source and resolve shared physical condition coverage."""
     initialization = seed_metadata(options)
+    drive = scene_drive_metadata(options)
     options.upstream = options.upstream.expanduser().resolve()
     options.output = options.output.expanduser().resolve()
     options.expected_checkpoint = options.expected_checkpoint.expanduser().resolve()
@@ -1087,9 +1104,13 @@ def prepare_conditions(options):
     )
     for condition in conditions:
         condition.update(initialization)
+        condition.update(drive)
         if options.seed != 0:
             condition.setdefault("template_condition_id", condition["condition_id"])
             condition["condition_id"] += f"__seed{options.seed}"
+        if drive["scene_drive"] == "frozen":
+            condition["parent_dynamic_condition_id"] = condition["condition_id"]
+            condition["condition_id"] += "__drive_frozen"
     return inventory, conditions
 
 
@@ -1120,12 +1141,17 @@ def evaluate_default(options):
         {
             "schema": "pir2.libero_dynamic.default.v1",
             "status": "starting",
-            "configuration": {**vars(options), **seed_metadata(options)},
+            "configuration": {
+                **vars(options),
+                **seed_metadata(options),
+                **scene_drive_metadata(options),
+            },
             "upstream": inventory["upstream"],
             "conditions": conditions,
             "protocol": "default_vla_flow4",
             **speed_metadata(options),
             **seed_metadata(options),
+            **scene_drive_metadata(options),
             "phase_contract": inventory["phase_contract"],
             **latency_metadata(options),
             "calibration_policy": None
@@ -1162,6 +1188,11 @@ def evaluate_default(options):
             result = episode_type(item, args, policy=policy).run()
             result["condition_id"] = conditions[index]["condition_id"]
             result.update(seed_metadata(options))
+            result.update(scene_drive_metadata(options))
+            if "parent_dynamic_condition_id" in conditions[index]:
+                result["parent_dynamic_condition_id"] = conditions[index][
+                    "parent_dynamic_condition_id"
+                ]
             if "template_condition_id" in conditions[index]:
                 result["template_condition_id"] = conditions[index][
                     "template_condition_id"
@@ -1178,6 +1209,7 @@ def evaluate_default(options):
                     **calibration_summary(session["calibration"]),
                     **latency_metadata(options),
                     **seed_metadata(options),
+                    **scene_drive_metadata(options),
                 },
             )
             print(
@@ -1201,6 +1233,7 @@ def evaluate_default(options):
             **calibration_summary(session["calibration"]),
             **latency_metadata(options),
             **seed_metadata(options),
+            **scene_drive_metadata(options),
             "raw_calibration_latency_s": None
             if options.native_latency
             else session["calibration"]["raw_latency_s"],
@@ -1222,6 +1255,7 @@ def evaluate_default(options):
                 "completed_episodes": len(results),
                 "calibration": session["calibration"],
                 **seed_metadata(options),
+                **scene_drive_metadata(options),
             },
         )
         raise

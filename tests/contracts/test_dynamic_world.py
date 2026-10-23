@@ -1,12 +1,328 @@
 """Physical timing and read-only object registries, without a simulator or model."""
 
+import ast
 import copy
+import hashlib
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from coexecution.libero_dynamic import world
+
+
+def test_scene_drive_metadata_defaults_and_rejects_unknown_control():
+    assert world.scene_drive_metadata(SimpleNamespace()) == {
+        "scene_drive": "moving",
+        "scene_drive_scope": "source_driver",
+    }
+    for value in ("static", None, True, []):
+        with pytest.raises(ValueError, match="scene_drive"):
+            world.scene_drive_metadata(SimpleNamespace(scene_drive=value))
+
+
+class CarrierEnv:
+    """Joint-addressed host double; every physical write is observable."""
+
+    def __init__(self):
+        bodies = {"pot0_main": 1, "pot1_main": 2, "robot0_link": 5}
+        names = [
+            "pot0_joint",
+            *[f"libero_dynamic_preview_platform_0_pot0_{a}" for a in "xyz"],
+            "pot1_joint",
+            *[f"libero_dynamic_preview_platform_1_pot1_{a}" for a in "xyz"],
+            "robot0_joint",
+        ]
+        bodies.update(
+            {
+                "libero_dynamic_preview_platform_0_pot0": 3,
+                "libero_dynamic_preview_platform_1_pot1": 4,
+            }
+        )
+        model = SimpleNamespace(
+            joint_name2id=names.index,
+            body_name2id=bodies.__getitem__,
+            jnt_type=np.array([0, 2, 2, 2, 0, 2, 2, 2, 3]),
+            jnt_bodyid=np.array([1, 3, 3, 3, 2, 4, 4, 4, 5]),
+            jnt_qposadr=np.array([0, 7, 8, 9, 10, 17, 18, 19, 20]),
+            jnt_dofadr=np.array([0, 6, 7, 8, 9, 15, 16, 17, 18]),
+        )
+        qpos = np.array(
+            [
+                0.1,
+                0.2,
+                0.9,
+                1,
+                0,
+                0,
+                0,
+                0.06,
+                0.18,
+                0.83,
+                0.5,
+                0.2,
+                0.9,
+                1,
+                0,
+                0,
+                0,
+                0.46,
+                0.18,
+                0.83,
+                0.7,
+            ]
+        )
+        qvel = np.array(
+            [
+                0.001,
+                -0.002,
+                0,
+                0.03,
+                0,
+                0,
+                0.001,
+                -0.002,
+                0,
+                0.001,
+                -0.002,
+                0,
+                0.03,
+                0,
+                0,
+                0.001,
+                -0.002,
+                0,
+                0.2,
+            ]
+        )
+        self.writes = []
+        data = SimpleNamespace(time=4.5, qpos=qpos, qvel=qvel)
+
+        def read(name, velocity=False):
+            index = names.index(name)
+            address = (model.jnt_dofadr if velocity else model.jnt_qposadr)[index]
+            count = (6 if velocity else 7) if model.jnt_type[index] == 0 else 1
+            values = data.qvel if velocity else data.qpos
+            return (
+                values[address : address + count]
+                if count > 1
+                else float(values[address])
+            )
+
+        def write(name, value, velocity=False):
+            index = names.index(name)
+            address = (model.jnt_dofadr if velocity else model.jnt_qposadr)[index]
+            values = data.qvel if velocity else data.qpos
+            flat = np.asarray(value).reshape(-1)
+            values[address : address + len(flat)] = flat
+            self.writes.append((name, "qvel" if velocity else "qpos"))
+
+        data.get_joint_qpos = lambda name: read(name)
+        data.get_joint_qvel = lambda name: read(name, True)
+        data.set_joint_qpos = lambda name, value: write(name, value)
+        data.set_joint_qvel = lambda name, value: write(name, value, True)
+        self.sim = SimpleNamespace(model=model, data=data, forward=lambda: None)
+
+    def states(self):
+        return [
+            {
+                "name": f"pot{i}",
+                "joint": f"pot{i}_joint",
+                "target_body_name": f"pot{i}_main",
+                "is_joint": False,
+                "is_body_yaw": False,
+                "is_body_translation": False,
+                "carrier_type": "physical_conveyor_patch",
+                "platform": {
+                    "body_name": f"libero_dynamic_preview_platform_{i}_pot{i}",
+                    "kinematic_mode": "slide_joints",
+                    "joint_names": {
+                        a: f"libero_dynamic_preview_platform_{i}_pot{i}_{a}"
+                        for a in "xyz"
+                    },
+                },
+                "motion": {
+                    "type": "zigzag_waypoints",
+                    "waypoints_xyz": [[0, 0, 0], [0.1, 0.2, 0]],
+                    "alpha_mps": 0.001,
+                    "loop": True,
+                },
+                "base_qpos": np.array([0, 0, 0.8, 1, 0, 0, 0]),
+                "platform_base_pos": np.zeros(3),
+                "object_base_xy": np.zeros(2),
+                "object_to_platform_xy": np.zeros(2),
+                "contact_events": 0,
+                "collision_keys": set(),
+            }
+            for i in range(2)
+        ]
+
+
+def test_frozen_drive_captures_actual_anchors_without_physical_mutation():
+    env = CarrierEnv()
+    states = env.states()
+    original = copy.deepcopy(states)
+    qpos, qvel = env.sim.data.qpos.copy(), env.sim.data.qvel.copy()
+    frozen, receipt = world.freeze_preview_states(env, states, phase_s=2.0)
+    assert env.writes == []
+    np.testing.assert_array_equal(env.sim.data.qpos, qpos)
+    np.testing.assert_array_equal(env.sim.data.qvel, qvel)
+    assert env.sim.data.time == 4.5
+    assert receipt["capture_no_state_mutation"] is True
+    assert receipt["capture_state_before"] == receipt["capture_state_after"]
+    assert receipt["phase_s"] == 2.0 and receipt["physics_time_s"] == 4.5
+    for index, state in enumerate(frozen):
+        carrier = receipt["carriers"][index]
+        np.testing.assert_array_equal(
+            state["base_qpos"], env.sim.data.get_joint_qpos(state["joint"])
+        )
+        np.testing.assert_array_equal(
+            state["platform_base_pos"], [0.06 + 0.4 * index, 0.18, 0.83]
+        )
+        assert state["motion"]["waypoints_xyz"] == [[0.0, 0.0, 0.0]]
+        assert state["motion"]["alpha_mps"] == 0.001
+        assert (
+            carrier["target_qvel"]
+            == env.sim.data.get_joint_qvel(state["joint"]).tolist()
+        )
+        assert carrier["original_motion"] == original[index]["motion"]
+    frozen[0]["motion"]["waypoints_xyz"][0][0] = 10
+    assert states[0]["motion"] == original[0]["motion"]
+    np.testing.assert_array_equal(states[0]["base_qpos"], original[0]["base_qpos"])
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda s, e: s[1].update(is_joint=True),
+        lambda s, e: s[1].update(is_body_yaw=True),
+        lambda s, e: s[1].update(carrier_type="direct_qpos"),
+        lambda s, e: s[1].update(carrier_type="surface_velocity"),
+        lambda s, e: s[1]["platform"].update(kinematic_mode="mocap"),
+        lambda s, e: s[1]["platform"].update(kinematic_mode="freejoint"),
+        lambda s, e: s[1]["platform"].update(body_name="robot0_link"),
+        lambda s, e: s[1]["platform"]["joint_names"].update(x="robot0_joint"),
+        lambda s, e: s[1]["motion"].update(alpha_mps=0),
+        lambda s, e: e.sim.model.jnt_bodyid.__setitem__(5, 1),
+        lambda s, e: e.sim.model.jnt_type.__setitem__(5, 3),
+        lambda s, e: s.__setitem__(1, copy.deepcopy(s[0])),
+    ],
+)
+def test_frozen_drive_rejects_mixed_unsupported_states_atomically(mutate):
+    env = CarrierEnv()
+    states = env.states()
+    mutate(states, env)
+    old_motion = copy.deepcopy(states[0]["motion"])
+    qpos, qvel = env.sim.data.qpos.copy(), env.sim.data.qvel.copy()
+    with pytest.raises(ValueError):
+        world.freeze_preview_states(env, states, phase_s=2.0)
+    assert env.writes == [] and states[0]["motion"] == old_motion
+    np.testing.assert_array_equal(env.sim.data.qpos, qpos)
+    np.testing.assert_array_equal(env.sim.data.qvel, qvel)
+
+
+def test_constant_drive_uses_pinned_source_without_constraining_free_targets():
+    path = (
+        Path(os.environ.get("LIBERO_DYNAMIC_SOURCE", "third_party/libero_dynamic"))
+        / "scripts/render_dynamic_config_previews.py"
+    )
+    if not path.is_file():
+        pytest.skip("Pinned dynamic source is not installed; set LIBERO_DYNAMIC_SOURCE")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+        "25eff7b0f20d77064196b9b9e597b68d3013d35d9a9b78f0659285c2da4ceb76"
+    )
+    names = {
+        "polyline_offset",
+        "movable_offset",
+        "motion_velocity",
+        "set_platform_state",
+        "move_physical_platform_preview",
+    }
+    functions = [
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert {f.name for f in functions} == names
+    tree = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            *functions,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(tree)
+    scope = {"np": np, "has_platform_contact": lambda *a: (False, [])}
+    exec(compile(tree, str(path), "exec"), scope)  # noqa: S102 -- hash-pinned driver functions, without module imports
+    env = CarrierEnv()
+    frozen, _ = world.freeze_preview_states(env, env.states(), phase_s=2.0)
+    # A robot has now displaced the free object. The external-drive adapter must
+    # leave it there, not drag it back to the recorded anchor.
+    env.sim.data.qpos[0] += 0.2
+    moved = env.sim.data.get_joint_qpos("pot0_joint").copy()
+    for elapsed in [2, 2.001, 5, 1000]:
+        np.testing.assert_array_equal(
+            scope["movable_offset"](frozen[0]["motion"], elapsed), np.zeros(3)
+        )
+        np.testing.assert_array_equal(
+            scope["motion_velocity"](frozen[0]["motion"], elapsed, 0.002), np.zeros(3)
+        )
+        scope["move_physical_platform_preview"](env, frozen[0], elapsed, 0.002)
+        np.testing.assert_array_equal(env.sim.data.get_joint_qpos("pot0_joint"), moved)
+        assert all(
+            name.startswith("libero_dynamic_preview_platform_")
+            for name, _ in env.writes
+        )
+
+
+@pytest.mark.parametrize("presteps", [39, 40])
+def test_shared_episode_freezes_only_after_complete_source_setup(presteps):
+    from coexecution.libero_dynamic.physical import make_physical_episode_type
+
+    env = CarrierEnv()
+    original = env.states()
+
+    class Base:
+        def __init__(self, item, args, worker_slot):
+            self.item = item
+            self.use_preview = True
+            self.preview_elapsed = 2.0
+            self.preview_states = original
+
+        def _setup_world(self, passed_env, initial):
+            assert passed_env is env
+            assert self.preview_states is original
+            assert len(self.preview_states[0]["motion"]["waypoints_xyz"]) == 2
+            return {"raw": "unchanged"}, 80, 10, presteps, []
+
+    source = SimpleNamespace(
+        runtime=SimpleNamespace(
+            RealtimeEpisode=Base,
+            _target_entries=lambda *a: [],
+            _object_pose=lambda env, name, entry: {"name": name},
+        )
+    )
+    options = SimpleNamespace(scene_drive="frozen", video_fps=60, save_videos=False)
+    episode = make_physical_episode_type(source, options)({}, SimpleNamespace())
+    if presteps != 40:
+        with pytest.raises(ValueError, match="40"):
+            episode._setup_world(env, None)
+        assert episode.drive_freeze is None
+        assert episode.preview_states is original
+    else:
+        result = episode._setup_world(env, None)
+        assert result[0] == {"raw": "unchanged"}
+        assert episode.preview_states is not original
+        assert env.dynamic_multi_target_states is episode.preview_states
+        assert episode.drive_freeze["phase_s"] == 2.0
+        assert episode.drive_freeze["capture_no_state_mutation"]
+        assert all(e["scene_drive"] == "frozen" for e in episode.motion_events)
+        assert any(e["kind"] == "drive_frozen" for e in episode.motion_events)
+    assert env.writes == []
 
 
 class FixtureEnv:
